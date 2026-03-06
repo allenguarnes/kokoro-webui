@@ -139,3 +139,8 @@ Full reference: [docs/API.md](docs/API.md)
 - Omitting the suffix implies `0.0` pitch shift, so `af_heart` uses the raw voice with no post-processing
 - Supported `response_format` values are currently `wav` and `opus`
 - `speed` is accepted in the OpenAI-style request, but Kokoro currently supports `0.5` through `1.8`
+
+## License
+
+- Project license: Apache-2.0 ([LICENSE](LICENSE))
+- Third-party and model/runtime licensing notes: [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)
