@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Kokoro WebUI</title>
+        <link rel="icon" href="/favicon.ico" sizes="any" />
+        <link rel="stylesheet" href="/static/styles.css" />
+    </head>
+    <body>
+        <div class="scene">
+            <div class="orb orb-a"></div>
+            <div class="orb orb-b"></div>
+            <div class="grid"></div>
+        </div>
+
+        <main class="shell">
+            <section class="topbar panel">
+                <div class="topbar-title">
+                    <p class="eyebrow">
+                        <span class="icon icon-heart" aria-hidden="true"></span>
+                        Kokoro Speech Server
+                    </p>
+                    <p class="lede">
+                        Stream sentence-safe chunks, inspect throughput, and
+                        tune transport quality.
+                    </p>
+                </div>
+                <div class="topbar-meta">
+                    <button
+                        id="systemStatus"
+                        type="button"
+                        class="status-widget status-widget-warn"
+                        title="Runtime: checking. WebSocket: unknown."
+                        aria-label="Runtime: checking. WebSocket: unknown."
+                    >
+                        <span
+                            class="icon icon-system"
+                            aria-hidden="true"
+                        ></span>
+                    </button>
+                    <button
+                        id="themeToggle"
+                        type="button"
+                        class="button-ghost button-top button-icon"
+                        aria-label="Toggle theme"
+                        title="Toggle theme"
+                    >
+                        <span class="icon icon-theme" aria-hidden="true"></span>
+                    </button>
+                </div>
+            </section>
+
+            <section class="panel panel-form">
+                <form id="ttsForm">
+                    <div class="seed-block">
+                        <p class="panel-label">
+                            <span
+                                class="icon icon-spark"
+                                aria-hidden="true"
+                            ></span>
+                            Sample Scripts
+                        </p>
+                        <div class="chips">
+                            <button
+                                class="chip"
+                                type="button"
+                                data-text="Good evening. Your local Kokoro node is online and ready to speak."
+                            >
+                                System Voice
+                            </button>
+                            <button
+                                class="chip"
+                                type="button"
+                                data-text="This interface turns text into speech, then immediately routes the waveform into playback."
+                            >
+                                Product Demo
+                            </button>
+                            <button
+                                class="chip"
+                                type="button"
+                                data-text="Every tool leaves a signature. This one sounds warm, restrained, and direct."
+                            >
+                                Editorial Line
+                            </button>
+                            <button
+                                class="chip"
+                                type="button"
+                                data-text="Good evening, and welcome. Tonight I want to speak about calm systems, patient work, and the quiet value of doing things well. We live in a time that rewards speed, noise, and constant reaction, yet some of the best results still come from a slower rhythm. A well-built tool does not need to shout. It should respond clearly, recover gracefully, and stay understandable even when the task becomes large. That is true for software, and it is also true for teams. When people trust the system around them, they make better decisions. They waste less effort on confusion and spend more time on craft. So if you are testing this voice pipeline, listen for continuity. Listen for stable pacing, natural pauses, and clean sentence boundaries. If each section arrives on time, sounds coherent, and leaves just enough space before the next one begins, then the system is doing exactly what it should."
+                            >
+                                Speech
+                            </button>
+                        </div>
+                    </div>
+
+                    <label class="field field-text">
+                        <span>Script</span>
+                        <textarea
+                            id="text"
+                            name="text"
+                            rows="9"
+                            maxlength="2500"
+                            placeholder="Type the line you want Kokoro to speak..."
+                            required
+                        >
+The future sounds calmer when it is rendered locally.</textarea
+                        >
+                    </label>
+
+                    <div class="controls">
+                        <label class="field">
+                            <span>Voice</span>
+                            <select id="voice" name="voice">
+                                <option value="af_sarah">af_sarah</option>
+                            </select>
+                        </label>
+
+                        <label class="field">
+                            <span>Language</span>
+                            <select id="lang" name="lang">
+                                <option value="en-us">English (US)</option>
+                                <option value="en-gb">English (UK)</option>
+                                <option value="fr-fr">French</option>
+                                <option value="ja">Japanese</option>
+                                <option value="ko">Korean</option>
+                                <option value="cmn">Mandarin</option>
+                            </select>
+                        </label>
+
+                        <label class="field">
+                            <span>Transport</span>
+                            <select id="transport" name="transport">
+                                <option value="ndjson">NDJSON</option>
+                                <option value="ws">WebSocket</option>
+                            </select>
+                        </label>
+
+                        <label class="field">
+                            <span>Format</span>
+                            <select id="format" name="format">
+                                <option value="wav">WAV</option>
+                                <option value="opus">Opus</option>
+                            </select>
+                        </label>
+
+                        <label class="field">
+                            <span id="formatQualityLabel">WAV Sample Rate</span>
+                            <select id="formatQuality" name="formatQuality">
+                                <option value="native" selected>Native</option>
+                                <option value="16000">16,000 Hz</option>
+                                <option value="22050">22,050 Hz</option>
+                                <option value="24000">24,000 Hz</option>
+                                <option value="44100">44,100 Hz</option>
+                                <option value="48000">48,000 Hz</option>
+                            </select>
+                        </label>
+
+                        <label class="field field-speed">
+                            <span>Speed</span>
+                            <input
+                                id="speed"
+                                name="speed"
+                                type="range"
+                                min="0.5"
+                                max="1.8"
+                                step="0.05"
+                                value="1"
+                            />
+                            <output id="speedValue" for="speed">1.00x</output>
+                        </label>
+
+                        <label class="field">
+                            <span>Chunk Target</span>
+                            <input
+                                id="chunkTarget"
+                                name="chunkTarget"
+                                type="number"
+                                min="80"
+                                max="2000"
+                                step="20"
+                                value="360"
+                            />
+                        </label>
+
+                        <label class="field field-pause">
+                            <span>Pause ms</span>
+                            <input
+                                id="pauseMs"
+                                name="pauseMs"
+                                type="number"
+                                min="0"
+                                max="2000"
+                                step="10"
+                                value="0"
+                            />
+                            <output id="pauseMode" for="pauseMs"
+                                >0 = auto</output
+                            >
+                        </label>
+                    </div>
+
+                    <div class="actions">
+                        <button id="submitButton" type="submit">
+                            <span
+                                class="icon icon-play icon-play-button"
+                                aria-hidden="true"
+                            ></span>
+                            <span class="button-label">Play</span>
+                        </button>
+                        <button
+                            id="stopButton"
+                            type="button"
+                            class="button-ghost"
+                        >
+                            <span
+                                class="icon icon-stop"
+                                aria-hidden="true"
+                            ></span>
+                            Stop
+                        </button>
+                    </div>
+                </form>
+            </section>
+
+            <section class="panel panel-side">
+                <div class="status-block">
+                    <p class="panel-label">
+                        <span class="icon icon-wave" aria-hidden="true"></span>
+                        Queue Monitor
+                    </p>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <span class="stat-name">Synthesis</span>
+                            <strong id="genTime">--</strong>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-name">Characters</span>
+                            <strong id="charCount">0</strong>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-name">Words</span>
+                            <strong id="wordCount">0</strong>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-name">Audio</span>
+                            <strong id="audioDuration">--</strong>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-name">File Size</span>
+                            <strong id="fileSize">--</strong>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-name">Chunks</span>
+                            <strong id="chunkProgress">0 / 0</strong>
+                        </div>
+                    </div>
+                    <div class="queue-progress">
+                        <div class="queue-progress-head">
+                            <span class="panel-label">Chunk Progress</span>
+                            <span id="streamMode" class="mini">NDJSON</span>
+                        </div>
+                        <progress id="chunkBar" value="0" max="1"></progress>
+                    </div>
+                </div>
+
+                <div class="status-block">
+                    <p class="panel-label">
+                        <span class="icon icon-info" aria-hidden="true"></span>
+                        Status
+                    </p>
+                    <p
+                        id="statusText"
+                        class="status"
+                        role="status"
+                        aria-live="polite"
+                    >
+                        Idle
+                    </p>
+                    <p id="errorText" class="error" hidden></p>
+                </div>
+
+                <div class="status-block">
+                    <p class="panel-label">
+                        <span class="icon icon-play" aria-hidden="true"></span>
+                        Playback
+                    </p>
+                    <div class="playback-row">
+                        <audio id="player" controls preload="none"></audio>
+                        <button
+                            id="exportButton"
+                            type="button"
+                            class="playback-action"
+                            aria-label="Export audio"
+                            title="Export audio"
+                            disabled
+                        >
+                            <span
+                                class="icon icon-export"
+                                aria-hidden="true"
+                            ></span>
+                            <span class="sr-only button-label"
+                                >Export Audio</span
+                            >
+                        </button>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <script src="/static/app.js" defer></script>
+    </body>
+</html>
