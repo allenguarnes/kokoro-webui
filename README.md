@@ -14,16 +14,45 @@ Small local WebUI for Kokoro TTS with automatic playback after synthesis.
 - `static/`: frontend assets
 - `models/`: put Kokoro model files here
 
-## Setup
+## Prerequisites and Setup
 
-1. Use Python 3.12 or 3.13.
-2. Install dependencies:
+### Required
+
+- Python 3.12 or 3.13
+- `uv` package manager
+- Kokoro model assets:
+  - `models/kokoro-v1.0.onnx`
+  - `models/voices-v1.0.bin`
+
+### Optional Runtime Tools
+
+- `ffmpeg`
+  - Needed for `opus` output encoding.
+  - Without it:
+    - `wav` synthesis still works.
+    - `opus` requests fail with HTTP 400 (`ffmpeg is required for Opus output but is not installed.`).
+- `ffmpeg` build with `rubberband` filter
+  - Needed for backend pitch shifting (`pitch != 0`).
+  - Without it:
+    - Pitch shifting is reported unavailable in `/api/health` (`pitch_shifting: false`).
+    - Web UI pitch control is disabled automatically.
+    - Requests with non-zero pitch fail with HTTP 400.
+    - Pitch `0` remains a no-op and works normally.
+- WebSocket transport runtime (`websockets` or `wsproto`)
+  - Needed for `/ws/speak-stream`.
+  - Without it:
+    - NDJSON streaming (`/api/speak-stream`) and non-streaming endpoints continue to work.
+    - `/api/health` reports `websocket_streaming: false`, and the UI disables WebSocket transport.
+
+### Setup Steps
+
+1. Install dependencies:
 
 ```bash
 uv sync
 ```
 
-3. Download the Kokoro ONNX model and voices bundle, then place them here:
+2. Download the Kokoro ONNX model and voices bundle, then place them here:
 
    Source: [model-files-v1.0 release](https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.0)
 
@@ -32,13 +61,13 @@ models/kokoro-v1.0.onnx
 models/voices-v1.0.bin
 ```
 
-4. Start the app:
+3. Start the app:
 
 ```bash
-KOKORO_RELOAD=1 uv run python -m app.main
+uv run python -m app.main
 ```
 
-5. Open `http://127.0.0.1:8000`.
+4. Open `http://127.0.0.1:8000`.
 
 ### Network Binding
 
@@ -46,7 +75,7 @@ Server bind settings come from environment variables:
 
 - `KOKORO_HOST` (default: `127.0.0.1`)
 - `KOKORO_PORT` (default: `8000`)
-- `KOKORO_RELOAD` (`1/true/yes/on` to enable reload)
+- `KOKORO_RELOAD` (default: disabled; enable only for development with `1/true/yes/on`)
 
 The app also auto-loads a local `.env` file (if present) before reading these values.
 
@@ -54,13 +83,16 @@ Examples:
 
 ```bash
 # Localhost only (default behavior)
-KOKORO_HOST=127.0.0.1 KOKORO_PORT=8000 KOKORO_RELOAD=1 uv run python -m app.main
+KOKORO_HOST=127.0.0.1 KOKORO_PORT=8000 uv run python -m app.main
 
 # Bind all interfaces (use firewall restrictions in untrusted networks)
 KOKORO_HOST=0.0.0.0 KOKORO_PORT=8000 uv run python -m app.main
 
 # Bind directly to your Tailscale interface IP
 KOKORO_HOST=100.x.y.z KOKORO_PORT=8000 uv run python -m app.main
+
+# Development hot-reload only
+KOKORO_RELOAD=1 uv run python -m app.main
 ```
 
 Example `.env`:
@@ -68,7 +100,7 @@ Example `.env`:
 ```dotenv
 KOKORO_HOST=100.x.y.z
 KOKORO_PORT=8000
-KOKORO_RELOAD=1
+KOKORO_RELOAD=0
 ```
 
 ## Notes
