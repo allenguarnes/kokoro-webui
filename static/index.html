@@ -19,14 +19,17 @@
                 <div class="topbar-title">
                     <p class="eyebrow">
                         <span class="icon icon-heart" aria-hidden="true"></span>
-                        Kokoro Speech Server
-                    </p>
-                    <p class="lede">
-                        Stream sentence-safe chunks, inspect throughput, and
-                        tune transport quality.
+                        Kokoro WebUI
                     </p>
                 </div>
                 <div class="topbar-meta">
+                    <label class="field field-topbar-transport">
+                        <span>Transport</span>
+                        <select id="transport" name="transport">
+                            <option value="ndjson">NDJSON</option>
+                            <option value="ws">WebSocket</option>
+                        </select>
+                    </label>
                     <button
                         id="systemStatus"
                         type="button"
@@ -124,14 +127,6 @@ The future sounds calmer when it is rendered locally.</textarea
                                 <option value="ja">Japanese</option>
                                 <option value="ko">Korean</option>
                                 <option value="cmn">Mandarin</option>
-                            </select>
-                        </label>
-
-                        <label class="field">
-                            <span>Transport</span>
-                            <select id="transport" name="transport">
-                                <option value="ndjson">NDJSON</option>
-                                <option value="ws">WebSocket</option>
                             </select>
                         </label>
 
@@ -318,6 +313,177 @@ The future sounds calmer when it is rendered locally.</textarea
                         </button>
                     </div>
                 </div>
+            </section>
+
+            <section class="panel panel-api">
+                <details class="api-disclosure">
+                    <summary>
+                        <span class="panel-label">
+                            <span
+                                class="icon icon-info"
+                                aria-hidden="true"
+                            ></span>
+                            API Documentation
+                        </span>
+                        <span class="mini"
+                            >Expand for native and OpenAI-compatible
+                            endpoints</span
+                        >
+                    </summary>
+
+                    <div class="api-content">
+                        <div class="api-block">
+                            <p class="panel-label">Native Endpoints</p>
+                            <div class="api-endpoints">
+                                <button
+                                    type="button"
+                                    class="api-endpoint is-active"
+                                    data-api-example="native-health"
+                                >
+                                    <code
+                                        ><span class="api-method">GET</span
+                                        ><span class="api-route"
+                                            >/api/health</span
+                                        ></code
+                                    >
+                                    <span>runtime status</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    class="api-endpoint"
+                                    data-api-example="native-speak"
+                                >
+                                    <code
+                                        ><span class="api-method">POST</span
+                                        ><span class="api-route"
+                                            >/api/speak</span
+                                        ></code
+                                    >
+                                    <span>single audio render</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    class="api-endpoint"
+                                    data-api-example="native-chunk-plan"
+                                >
+                                    <code
+                                        ><span class="api-method">POST</span
+                                        ><span class="api-route"
+                                            >/api/chunk-plan</span
+                                        ></code
+                                    >
+                                    <span>chunk metadata</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    class="api-endpoint"
+                                    data-api-example="native-speak-stream"
+                                >
+                                    <code
+                                        ><span class="api-method">POST</span
+                                        ><span class="api-route"
+                                            >/api/speak-stream</span
+                                        ></code
+                                    >
+                                    <span>NDJSON streaming</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    class="api-endpoint"
+                                    data-api-example="native-ws-speak-stream"
+                                >
+                                    <code
+                                        ><span class="api-method">WS</span
+                                        ><span class="api-route"
+                                            >/ws/speak-stream</span
+                                        ></code
+                                    >
+                                    <span>WebSocket streaming</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="api-block">
+                            <p class="panel-label">OpenAI-Compatible</p>
+                            <div class="api-endpoints">
+                                <button
+                                    type="button"
+                                    class="api-endpoint"
+                                    data-api-example="openai-models"
+                                >
+                                    <code
+                                        ><span class="api-method">GET</span
+                                        ><span class="api-route"
+                                            >/v1/models</span
+                                        ></code
+                                    >
+                                    <span>model list</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    class="api-endpoint"
+                                    data-api-example="openai-model-kokoro"
+                                >
+                                    <code
+                                        ><span class="api-method">GET</span
+                                        ><span class="api-route"
+                                            >/v1/models/kokoro</span
+                                        ></code
+                                    >
+                                    <span>model metadata</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    class="api-endpoint"
+                                    data-api-example="openai-audio-speech"
+                                >
+                                    <code
+                                        ><span class="api-method">POST</span
+                                        ><span class="api-route"
+                                            >/v1/audio/speech</span
+                                        ></code
+                                    >
+                                    <span>speech output</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="api-block api-code">
+                            <p class="panel-label">Example Request</p>
+                            <p id="apiExampleTitle" class="api-example-title">
+                                <span class="api-method">GET</span>
+                                <span class="api-route">/api/health</span>
+                            </p>
+                            <pre><code id="apiExampleCode">curl http://127.0.0.1:8000/api/health</code></pre>
+                        </div>
+                    </div>
+                    <div class="api-docs-footer">
+                        <a
+                            class="api-doc-link"
+                            href="https://github.com/allenguarnes/kokoro-webui/blob/main/docs/API.md"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                        >
+                            <svg
+                                class="api-doc-icon"
+                                xmlns="http://www.w3.org/2000/svg"
+                                viewBox="0 0 24 24"
+                                aria-hidden="true"
+                                focusable="false"
+                            >
+                                <path
+                                    fill="none"
+                                    stroke="currentColor"
+                                    stroke-linecap="round"
+                                    stroke-linejoin="round"
+                                    stroke-width="2"
+                                    d="M12 7v14m4-9h2m-2-4h2M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4a4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3a3 3 0 0 0-3-3zm3-6h2M6 8h2"
+                                />
+                            </svg>
+                            <span>Full API Documentation</span>
+                        </a>
+                    </div>
+                </details>
             </section>
         </main>
 

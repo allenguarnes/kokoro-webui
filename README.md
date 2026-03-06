@@ -25,6 +25,8 @@ uv sync
 
 3. Download the Kokoro ONNX model and voices bundle, then place them here:
 
+   Source: [model-files-v1.0 release](https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.0)
+
 ```text
 models/kokoro-v1.0.onnx
 models/voices-v1.0.bin
@@ -33,10 +35,41 @@ models/voices-v1.0.bin
 4. Start the app:
 
 ```bash
-uv run uvicorn app.main:app --reload
+KOKORO_RELOAD=1 uv run python -m app.main
 ```
 
 5. Open `http://127.0.0.1:8000`.
+
+### Network Binding
+
+Server bind settings come from environment variables:
+
+- `KOKORO_HOST` (default: `127.0.0.1`)
+- `KOKORO_PORT` (default: `8000`)
+- `KOKORO_RELOAD` (`1/true/yes/on` to enable reload)
+
+The app also auto-loads a local `.env` file (if present) before reading these values.
+
+Examples:
+
+```bash
+# Localhost only (default behavior)
+KOKORO_HOST=127.0.0.1 KOKORO_PORT=8000 KOKORO_RELOAD=1 uv run python -m app.main
+
+# Bind all interfaces (use firewall restrictions in untrusted networks)
+KOKORO_HOST=0.0.0.0 KOKORO_PORT=8000 uv run python -m app.main
+
+# Bind directly to your Tailscale interface IP
+KOKORO_HOST=100.x.y.z KOKORO_PORT=8000 uv run python -m app.main
+```
+
+Example `.env`:
+
+```dotenv
+KOKORO_HOST=100.x.y.z
+KOKORO_PORT=8000
+KOKORO_RELOAD=1
+```
 
 ## Notes
 

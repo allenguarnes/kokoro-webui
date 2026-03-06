@@ -25,6 +25,7 @@ dist/
 # Local environment files
 .env
 .env.*
+!.env.example
 .python-version
 
 # Logs and temp files
