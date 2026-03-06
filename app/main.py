@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import importlib.util
 import io
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -38,9 +39,10 @@ MODELS_DIR = ROOT / "models"
 MODEL_PATH = Path(os.getenv("KOKORO_MODEL_PATH", MODELS_DIR / "kokoro-v1.0.onnx"))
 VOICES_PATH = Path(os.getenv("KOKORO_VOICES_PATH", MODELS_DIR / "voices-v1.0.bin"))
 
-DEFAULT_VOICES = ["af_sarah"]
+DEFAULT_VOICES = ["af_heart"]
 OPUS_BITRATES: list[str] = ["16k", "24k", "32k", "48k"]
 WAV_SAMPLE_RATES: list[str] = ["native", "16000", "22050", "24000", "44100", "48000"]
+MAX_PITCH_SHIFT_SEMITONES = 6.0
 OPENAI_COMPAT_MODEL = "kokoro"
 OPENAI_COMPAT_OWNER = "kokoro-webui"
 
@@ -118,8 +120,13 @@ class OpenAISpeechRequest(BaseModel):
 
 class SynthesisRequest(BaseModel):
     text: str = Field(min_length=1, max_length=2500)
-    voice: str = Field(default="af_sarah", min_length=1, max_length=64)
+    voice: str = Field(default="af_heart", min_length=1, max_length=64)
     speed: float = Field(default=1.0, ge=0.5, le=1.8)
+    pitch: float = Field(
+        default=0.0,
+        ge=-MAX_PITCH_SHIFT_SEMITONES,
+        le=MAX_PITCH_SHIFT_SEMITONES,
+    )
     lang: Literal["en-us", "en-gb", "fr-fr", "ja", "ko", "cmn"] = "en-us"
     format: Literal["wav", "opus"] = "wav"
     opus_bitrate: Literal["16k", "24k", "32k", "48k"] = "32k"
@@ -270,6 +277,20 @@ def encode_opus(samples: np.ndarray, sample_rate: int, bitrate: str) -> bytes:
     return result.stdout
 
 
+@lru_cache(maxsize=1)
+def ffmpeg_supports_rubberband() -> bool:
+    if shutil.which("ffmpeg") is None:
+        return False
+
+    result = subprocess.run(
+        ["ffmpeg", "-filters"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    return result.returncode == 0 and " rubberband " in result.stdout
+
+
 def resample_linear(
     samples: np.ndarray, source_rate: int, target_rate: int
 ) -> np.ndarray:
@@ -293,6 +314,58 @@ def resample_linear(
     return resampled.astype(np.float32, copy=False)
 
 
+def pitch_shift_samples(
+    samples: np.ndarray, sample_rate: int, pitch_semitones: float
+) -> np.ndarray:
+    if pitch_semitones == 0:
+        return np.asarray(samples, dtype=np.float32).reshape(-1)
+    if not ffmpeg_supports_rubberband():
+        raise RuntimeError(
+            "Backend pitch shifting requires ffmpeg with the rubberband filter."
+        )
+
+    pcm = np.asarray(samples, dtype=np.float32).reshape(-1)
+    pitch_ratio = 2 ** (pitch_semitones / 12)
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "f32le",
+        "-ar",
+        str(sample_rate),
+        "-ac",
+        "1",
+        "-i",
+        "pipe:0",
+        "-af",
+        f"rubberband=pitch={pitch_ratio:.8f}",
+        "-ar",
+        str(sample_rate),
+        "-ac",
+        "1",
+        "-f",
+        "f32le",
+        "pipe:1",
+    ]
+    result = subprocess.run(
+        command,
+        input=pcm.tobytes(),
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"Pitch shifting failed: {error or 'ffmpeg exited non-zero.'}"
+        )
+
+    shifted = np.frombuffer(result.stdout, dtype=np.float32)
+    if shifted.size == 0:
+        raise RuntimeError("Pitch shifting failed: ffmpeg returned empty audio.")
+    return np.clip(shifted, -1.0, 1.0).astype(np.float32, copy=False)
+
+
 def synthesize_chunk(payload: SynthesisRequest, text: str) -> RenderedChunk:
     tts = get_tts()
     samples, sample_rate = tts.create(
@@ -301,6 +374,7 @@ def synthesize_chunk(payload: SynthesisRequest, text: str) -> RenderedChunk:
         speed=payload.speed,
         lang=payload.lang,
     )
+    samples = pitch_shift_samples(samples, sample_rate, payload.pitch)
 
     if payload.format == "opus":
         audio_bytes = encode_opus(samples, sample_rate, payload.opus_bitrate)
@@ -365,17 +439,39 @@ def resolve_openai_voice_id(voice: str | OpenAIVoiceRef) -> str:
     return voice.strip()
 
 
+def parse_openai_voice_and_pitch(voice: str) -> tuple[str, float]:
+    trimmed = voice.strip()
+    match = re.fullmatch(
+        r"(?P<voice>[A-Za-z0-9_]+?)(?P<pitch>[+-](?:\d+(?:\.\d+)?|\.\d+))?",
+        trimmed,
+    )
+    if not match:
+        raise ValueError(
+            "voice must be a Kokoro voice id or a voice id suffixed like af_heart+2.0."
+        )
+
+    voice_id = match.group("voice")
+    pitch_token = match.group("pitch")
+    pitch = float(pitch_token) if pitch_token is not None else 0.0
+    if pitch < -MAX_PITCH_SHIFT_SEMITONES or pitch > MAX_PITCH_SHIFT_SEMITONES:
+        raise ValueError(
+            f"voice pitch suffix must be between {-MAX_PITCH_SHIFT_SEMITONES:.1f} and +{MAX_PITCH_SHIFT_SEMITONES:.1f} semitones."
+        )
+    return voice_id, pitch
+
+
 def build_openai_synthesis_request(payload: OpenAISpeechRequest) -> SynthesisRequest:
     if payload.stream_format == "sse":
         raise ValueError("stream_format 'sse' is not supported by this server.")
     if payload.speed < 0.5 or payload.speed > 1.8:
         raise ValueError("speed must be between 0.5 and 1.8 for Kokoro.")
 
-    voice = resolve_openai_voice_id(payload.voice)
+    voice, pitch = parse_openai_voice_and_pitch(resolve_openai_voice_id(payload.voice))
     return SynthesisRequest(
         text=payload.input,
         voice=voice,
         speed=payload.speed,
+        pitch=pitch,
         format=payload.response_format,
     )
 
@@ -420,6 +516,8 @@ async def health() -> JSONResponse:
             "formats": ["wav", "opus"],
             "opus_bitrates": OPUS_BITRATES,
             "wav_sample_rates": WAV_SAMPLE_RATES,
+            "pitch_shifting": ffmpeg_supports_rubberband(),
+            "max_pitch_semitones": MAX_PITCH_SHIFT_SEMITONES,
             "streaming": True,
             "websocket_streaming": websocket_runtime_available(),
         }
@@ -532,6 +630,7 @@ def build_chunk_event(
         "chunk_index": index,
         "total_chunks": total_chunks,
         "text": chunk,
+        "pitch": payload.pitch,
         "bytes": len(rendered["audio_bytes"]),
         "sample_rate": rendered["sample_rate"],
         "duration_sec": rendered["duration_sec"],
@@ -544,14 +643,33 @@ def build_chunk_event(
     }
 
 
+async def watch_websocket_disconnect(
+    websocket: WebSocket, disconnected: asyncio.Event
+) -> None:
+    try:
+        while not disconnected.is_set():
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                disconnected.set()
+                return
+    except WebSocketDisconnect:
+        disconnected.set()
+    except RuntimeError:
+        disconnected.set()
+
+
 @app.post("/api/speak-stream")
-async def speak_stream(payload: ChunkedSynthesisRequest) -> StreamingResponse:
+async def speak_stream(
+    payload: ChunkedSynthesisRequest, request: Request
+) -> StreamingResponse:
     chunks = split_text_into_chunks(payload.text, payload.target_chunk_chars)
     if not chunks:
         raise HTTPException(status_code=400, detail="Enter text before generating.")
 
     async def stream() -> AsyncIterator[bytes]:
         total_chunks = len(chunks)
+        if await request.is_disconnected():
+            return
         yield (
             json.dumps(
                 {
@@ -564,6 +682,7 @@ async def speak_stream(payload: ChunkedSynthesisRequest) -> StreamingResponse:
                     "wav_sample_rate": payload.wav_sample_rate
                     if payload.format == "wav"
                     else None,
+                    "pitch": payload.pitch,
                     "target_chunk_chars": payload.target_chunk_chars,
                 }
             )
@@ -571,9 +690,13 @@ async def speak_stream(payload: ChunkedSynthesisRequest) -> StreamingResponse:
         ).encode("utf-8")
 
         for index, chunk in enumerate(chunks):
+            if await request.is_disconnected():
+                return
             try:
                 event = build_chunk_event(payload, chunk, index, total_chunks)
             except Exception as exc:
+                if await request.is_disconnected():
+                    return
                 yield (
                     json.dumps(
                         {
@@ -588,6 +711,8 @@ async def speak_stream(payload: ChunkedSynthesisRequest) -> StreamingResponse:
 
             yield (json.dumps(event) + "\n").encode("utf-8")
 
+        if await request.is_disconnected():
+            return
         yield (
             json.dumps({"type": "done", "total_chunks": total_chunks}) + "\n"
         ).encode("utf-8")
@@ -598,6 +723,8 @@ async def speak_stream(payload: ChunkedSynthesisRequest) -> StreamingResponse:
 @app.websocket("/ws/speak-stream")
 async def ws_speak_stream(websocket: WebSocket) -> None:
     await websocket.accept()
+    disconnect_event = asyncio.Event()
+    disconnect_task: asyncio.Task[None] | None = None
     try:
         raw_payload = await websocket.receive_text()
         payload = ChunkedSynthesisRequest.model_validate_json(raw_payload)
@@ -608,6 +735,9 @@ async def ws_speak_stream(websocket: WebSocket) -> None:
             )
             return
 
+        disconnect_task = asyncio.create_task(
+            watch_websocket_disconnect(websocket, disconnect_event)
+        )
         total_chunks = len(chunks)
         await websocket.send_text(
             json.dumps(
@@ -621,15 +751,20 @@ async def ws_speak_stream(websocket: WebSocket) -> None:
                     "wav_sample_rate": payload.wav_sample_rate
                     if payload.format == "wav"
                     else None,
+                    "pitch": payload.pitch,
                     "target_chunk_chars": payload.target_chunk_chars,
                 }
             )
         )
 
         for index, chunk in enumerate(chunks):
+            if disconnect_event.is_set():
+                return
             try:
                 event = build_chunk_event(payload, chunk, index, total_chunks)
             except Exception as exc:
+                if disconnect_event.is_set():
+                    return
                 await websocket.send_text(
                     json.dumps(
                         {
@@ -640,16 +775,28 @@ async def ws_speak_stream(websocket: WebSocket) -> None:
                     )
                 )
                 return
+            if disconnect_event.is_set():
+                return
             await websocket.send_text(json.dumps(event))
 
+        if disconnect_event.is_set():
+            return
         await websocket.send_text(
             json.dumps({"type": "done", "total_chunks": total_chunks})
         )
     except WebSocketDisconnect:
         return
     except Exception as exc:
+        if disconnect_event.is_set():
+            return
         await websocket.send_text(json.dumps({"type": "error", "detail": str(exc)}))
     finally:
+        if disconnect_task is not None:
+            disconnect_task.cancel()
+            try:
+                await disconnect_task
+            except asyncio.CancelledError:
+                pass
         try:
             await websocket.close()
         except RuntimeError:

@@ -8,6 +8,8 @@ const formatQualityInput = document.getElementById("formatQuality");
 const formatQualityLabel = document.getElementById("formatQualityLabel");
 const speedInput = document.getElementById("speed");
 const speedValue = document.getElementById("speedValue");
+const pitchInput = document.getElementById("pitch");
+const pitchValue = document.getElementById("pitchValue");
 const chunkTargetInput = document.getElementById("chunkTarget");
 const pauseMsInput = document.getElementById("pauseMs");
 const pauseMode = document.getElementById("pauseMode");
@@ -49,6 +51,8 @@ let availableWavSampleRates = [
 ];
 let selectedOpusBitrate = "32k";
 let selectedWavSampleRate = "native";
+let pitchShiftingAvailable = true;
+let maxPitchSemitones = 6;
 
 function formatVoiceLabel(voice) {
   const [, rawName = voice] = String(voice).split("_", 2);
@@ -253,12 +257,44 @@ function buildSynthesisPayload() {
     text: textInput.value,
     voice: voiceInput.value,
     speed: Number(speedInput.value),
+    pitch: pitchShiftingAvailable ? Number(pitchInput.value) : 0,
     lang: langInput.value,
     format: formatInput.value,
     opus_bitrate: isOpus ? qualityValue : selectedOpusBitrate,
     wav_sample_rate: isOpus ? selectedWavSampleRate : qualityValue,
     target_chunk_chars: Number(chunkTargetInput.value),
   };
+}
+
+function getPitchSemitones() {
+  return Number(pitchInput.value);
+}
+
+function formatSignedSemitones(value) {
+  return `${value >= 0 ? "+" : ""}${value.toFixed(1)} st`;
+}
+
+function formatPitchValue() {
+  if (!pitchShiftingAvailable) {
+    return "Unavailable";
+  }
+  return formatSignedSemitones(getPitchSemitones());
+}
+
+function updatePitchControlAvailability() {
+  pitchInput.disabled = !pitchShiftingAvailable;
+  pitchInput.min = String(-maxPitchSemitones);
+  pitchInput.max = String(maxPitchSemitones);
+  if (!pitchShiftingAvailable) {
+    pitchInput.value = "0";
+  } else {
+    const clampedValue = Math.max(
+      -maxPitchSemitones,
+      Math.min(maxPitchSemitones, Number(pitchInput.value)),
+    );
+    pitchInput.value = String(clampedValue);
+  }
+  pitchValue.textContent = formatPitchValue();
 }
 
 function buildExportFilename(format) {
@@ -441,8 +477,13 @@ function resetPlaybackState() {
     currentObjectUrl = null;
   }
   player.pause();
+  player.currentTime = 0;
   player.removeAttribute("src");
   player.load();
+}
+
+function handlePageExit() {
+  resetPlaybackState();
 }
 
 function updateTextStats() {
@@ -557,7 +598,11 @@ async function readStreamIntoQueue(state, token) {
         state.totalChunks = message.total_chunks;
         chunkProgress.textContent = `0 / ${state.totalChunks}`;
         setStatus(
-          `Chunk plan ready with ${state.totalChunks} sentence-safe chunks.`,
+          `Chunk plan ready with ${state.totalChunks} sentence-safe chunks${
+            message.pitch !== 0
+              ? ` at ${formatSignedSemitones(Number(message.pitch))}`
+              : ""
+          }.`,
         );
       } else if (message.type === "chunk") {
         state.queue.push({
@@ -608,7 +653,11 @@ function readWebSocketIntoQueue(state, token) {
         state.totalChunks = message.total_chunks;
         chunkProgress.textContent = `0 / ${state.totalChunks}`;
         setStatus(
-          `Chunk plan ready with ${state.totalChunks} sentence-safe chunks.`,
+          `Chunk plan ready with ${state.totalChunks} sentence-safe chunks${
+            message.pitch !== 0
+              ? ` at ${formatSignedSemitones(Number(message.pitch))}`
+              : ""
+          }.`,
         );
       } else if (message.type === "chunk") {
         state.queue.push({
@@ -693,6 +742,10 @@ async function playQueueFromStream(state, token) {
         chunk.opus_bitrate
           ? ` @ ${chunk.opus_bitrate}`
           : formatWavRateLabel(chunk.sample_rate)
+      }${
+        getPitchSemitones() !== 0
+          ? ` at ${formatSignedSemitones(getPitchSemitones())}`
+          : ""
       }`,
     );
 
@@ -746,6 +799,14 @@ async function loadHealth() {
     if (transportInput.value === "ws" && !websocketEnabled) {
       transportInput.value = "ndjson";
     }
+    pitchShiftingAvailable = data.pitch_shifting !== false;
+    if (
+      Number.isFinite(data.max_pitch_semitones) &&
+      data.max_pitch_semitones > 0
+    ) {
+      maxPitchSemitones = data.max_pitch_semitones;
+    }
+    updatePitchControlAvailability();
     refreshCustomSelect(transportInput);
     streamMode.textContent =
       transportInput.value === "ws" ? "WebSocket" : "NDJSON";
@@ -874,6 +935,10 @@ speedInput.addEventListener("input", () => {
   speedValue.textContent = `${Number(speedInput.value).toFixed(2)}x`;
 });
 
+pitchInput.addEventListener("input", () => {
+  pitchValue.textContent = formatPitchValue();
+});
+
 pauseMsInput.addEventListener("input", updatePauseLabel);
 formatInput.addEventListener("change", updateFormatControlState);
 formatQualityInput.addEventListener("change", () => {
@@ -926,8 +991,11 @@ window.addEventListener("DOMContentLoaded", () => {
   initDisplayMode();
   updateTextStats();
   updatePauseLabel();
+  updatePitchControlAvailability();
   updateFormatControlState();
   streamMode.textContent =
     transportInput.value === "ws" ? "WebSocket" : "NDJSON";
   loadHealth();
 });
+window.addEventListener("pagehide", handlePageExit);
+window.addEventListener("beforeunload", handlePageExit);

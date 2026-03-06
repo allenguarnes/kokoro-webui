@@ -1,0 +1,439 @@
+# API Reference
+
+Base URL: `http://127.0.0.1:8000`
+
+This server exposes two API groups:
+
+- Native Kokoro WebUI routes under `/api/*` plus `ws://.../ws/*`
+- OpenAI-compatible routes under `/v1/*`
+
+## Overview
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/health` | Runtime capability and voice availability |
+| `POST` | `/api/speak` | Render one audio response |
+| `POST` | `/api/chunk-plan` | Return chunk metadata without audio |
+| `POST` | `/api/speak-stream` | Stream chunked audio over NDJSON |
+| `WS` | `/ws/speak-stream` | Stream chunked audio over WebSocket |
+| `GET` | `/v1/models` | OpenAI-compatible model list |
+| `GET` | `/v1/models/{model_id}` | OpenAI-compatible model metadata |
+| `POST` | `/v1/audio/speech` | OpenAI-compatible speech generation |
+
+## Common Native Fields
+
+These fields are shared across the native synthesis routes.
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `text` | string | yes | `1..2500` chars |
+| `voice` | string | no | Default: `af_heart` |
+| `speed` | number | no | Range: `0.5..1.8`, default `1.0` |
+| `pitch` | number | no | Range: `-6.0..6.0` semitones, default `0.0` |
+| `lang` | string | no | One of `en-us`, `en-gb`, `fr-fr`, `ja`, `ko`, `cmn` |
+| `format` | string | no | `wav` or `opus`, default `wav` |
+| `opus_bitrate` | string | no | One of `16k`, `24k`, `32k`, `48k` |
+| `wav_sample_rate` | string | no | One of `native`, `16000`, `22050`, `24000`, `44100`, `48000` |
+
+Notes:
+
+- `pitch: 0.0` is a no-op and skips backend pitch-shift processing.
+- Pitch shifting depends on `ffmpeg` with the `rubberband` filter.
+- `opus_bitrate` matters only when `format` is `opus`.
+- `wav_sample_rate` matters only when `format` is `wav`.
+
+## `GET /api/health`
+
+Returns runtime status and supported options.
+
+### Response
+
+```json
+{
+  "ok": true,
+  "missing": [],
+  "model_path": "/abs/path/models/kokoro-v1.0.onnx",
+  "voices_path": "/abs/path/models/voices-v1.0.bin",
+  "voices": ["af_heart", "af_sarah"],
+  "formats": ["wav", "opus"],
+  "opus_bitrates": ["16k", "24k", "32k", "48k"],
+  "wav_sample_rates": ["native", "16000", "22050", "24000", "44100", "48000"],
+  "pitch_shifting": true,
+  "max_pitch_semitones": 6.0,
+  "streaming": true,
+  "websocket_streaming": true
+}
+```
+
+### Field Notes
+
+| Field | Meaning |
+| --- | --- |
+| `ok` | `true` when runtime and model assets are available |
+| `missing` | Missing dependency or asset names |
+| `voices` | Available Kokoro voice IDs |
+| `pitch_shifting` | Whether backend pitch shift is available |
+| `websocket_streaming` | Whether the runtime can serve WebSocket streaming |
+
+## `POST /api/speak`
+
+Generates one audio response.
+
+### Request
+
+```json
+{
+  "text": "The future sounds calmer when it is rendered locally.",
+  "voice": "af_heart",
+  "speed": 1.0,
+  "pitch": -2.0,
+  "lang": "en-us",
+  "format": "wav",
+  "wav_sample_rate": "native"
+}
+```
+
+### Success Response
+
+Returns audio bytes directly.
+
+- `audio/wav` when `format` is `wav`
+- `audio/ogg` when `format` is `opus`
+
+### Response Headers
+
+| Header | Meaning |
+| --- | --- |
+| `Content-Disposition` | Inline filename |
+| `X-Audio-Bytes` | Encoded audio byte length |
+| `X-Audio-Format` | `wav` or `opus` |
+| `X-Sample-Rate` | Final sample rate |
+| `X-Audio-Duration` | Duration in seconds |
+| `X-Opus-Bitrate` | Populated for Opus responses |
+| `X-Wav-Sample-Rate` | Populated for WAV responses |
+
+### Error Response
+
+Status: `400`
+
+```json
+{
+  "detail": "Pitch shifting failed: ..."
+}
+```
+
+## `POST /api/chunk-plan`
+
+Returns how the server would split text before synthesis.
+
+### Request
+
+```json
+{
+  "text": "Good evening. This is a longer passage. It will be split by sentence boundaries.",
+  "target_chunk_chars": 360,
+  "include_text": false
+}
+```
+
+### Request Fields
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `text` | string | yes | `1..2500` chars |
+| `target_chunk_chars` | integer | no | Range: `80..2000`, default `360` |
+| `include_text` | boolean | no | Include chunk text in the response |
+
+### Response
+
+```json
+{
+  "chunks": [
+    {
+      "index": 0,
+      "char_count": 67,
+      "word_count": 12,
+      "sentence_count": 2
+    }
+  ],
+  "count": 1,
+  "lengths": [67],
+  "target_chunk_chars": 360
+}
+```
+
+If `include_text` is `true`, each chunk object also includes `text`.
+
+## `POST /api/speak-stream`
+
+Streams chunked synthesis over NDJSON.
+
+### Request
+
+Uses all native synthesis fields plus `target_chunk_chars`.
+
+```json
+{
+  "text": "Long text here.",
+  "voice": "af_heart",
+  "speed": 1.0,
+  "pitch": 2.0,
+  "lang": "en-us",
+  "format": "opus",
+  "opus_bitrate": "32k",
+  "target_chunk_chars": 360
+}
+```
+
+### Additional Field
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `target_chunk_chars` | integer | no | Range: `80..2000`, default `360` |
+
+### Response Type
+
+`application/x-ndjson`
+
+Each line is one JSON object with a `type`.
+
+### `meta` Message
+
+```json
+{
+  "type": "meta",
+  "total_chunks": 3,
+  "format": "opus",
+  "opus_bitrate": "32k",
+  "wav_sample_rate": null,
+  "pitch": 2.0,
+  "target_chunk_chars": 360
+}
+```
+
+### `chunk` Message
+
+```json
+{
+  "type": "chunk",
+  "chunk_index": 0,
+  "total_chunks": 3,
+  "text": "First chunk.",
+  "pitch": 2.0,
+  "bytes": 12234,
+  "sample_rate": 24000,
+  "duration_sec": 1.28,
+  "synth_ms": 85.41,
+  "format": "opus",
+  "opus_bitrate": "32k",
+  "wav_sample_rate": null,
+  "mime_type": "audio/ogg",
+  "audio_base64": "..."
+}
+```
+
+### `error` Message
+
+```json
+{
+  "type": "error",
+  "detail": "Pitch shifting failed: ...",
+  "chunk_index": 1
+}
+```
+
+### `done` Message
+
+```json
+{
+  "type": "done",
+  "total_chunks": 3
+}
+```
+
+## `WS /ws/speak-stream`
+
+Streams the same message types as `/api/speak-stream`, but over WebSocket.
+
+### Client Flow
+
+1. Connect to `ws://127.0.0.1:8000/ws/speak-stream`
+2. Send one JSON text message matching the `/api/speak-stream` request body
+3. Read `meta`, `chunk`, `error`, and `done` messages as JSON text frames
+
+### Example Client Payload
+
+```json
+{
+  "text": "Long text here.",
+  "voice": "af_heart",
+  "speed": 1.0,
+  "pitch": -1.5,
+  "lang": "en-us",
+  "format": "wav",
+  "wav_sample_rate": "native",
+  "target_chunk_chars": 360
+}
+```
+
+### Message Types
+
+The server sends the same `meta`, `chunk`, `error`, and `done` shapes documented for `/api/speak-stream`.
+
+## `GET /v1/models`
+
+OpenAI-compatible model list.
+
+### Response
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "kokoro",
+      "object": "model",
+      "created": 0,
+      "owned_by": "kokoro-webui"
+    }
+  ]
+}
+```
+
+## `GET /v1/models/{model_id}`
+
+Returns metadata for `kokoro`.
+
+### Success Response
+
+```json
+{
+  "id": "kokoro",
+  "object": "model",
+  "created": 0,
+  "owned_by": "kokoro-webui"
+}
+```
+
+### Not Found Response
+
+Status: `404`
+
+```json
+{
+  "error": {
+    "message": "The model 'other-model' does not exist.",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": "model_not_found"
+  }
+}
+```
+
+## `POST /v1/audio/speech`
+
+OpenAI-compatible speech generation.
+
+### Request
+
+```json
+{
+  "model": "kokoro",
+  "input": "The future sounds calmer when it is rendered locally.",
+  "voice": "af_heart",
+  "response_format": "wav",
+  "speed": 1.0
+}
+```
+
+### Request Fields
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `model` | string | yes | Accepted for compatibility, currently ignored |
+| `input` | string | yes | `1..4096` chars |
+| `voice` | string or object | yes | String voice ID, optional suffixed form like `af_heart+2.0`, or object form like `{ "id": "af_heart-2.0" }` |
+| `response_format` | string | no | `wav` or `opus`, default `wav` |
+| `speed` | number | no | Accepted range `0.25..4.0`, but values outside `0.5..1.8` are rejected by the Kokoro adapter |
+| `instructions` | string or null | no | Accepted but currently unused |
+| `stream_format` | string or null | no | `sse` is not supported |
+
+### Success Response
+
+Returns audio bytes directly.
+
+- `audio/wav` when `response_format` is `wav`
+- `audio/ogg` when `response_format` is `opus`
+
+### Response Headers
+
+| Header | Meaning |
+| --- | --- |
+| `X-OpenAI-Compatible` | Always `kokoro` |
+| `X-Audio-Format` | `wav` or `opus` |
+| `X-Sample-Rate` | Final sample rate |
+
+### Error Response
+
+Status: `400`
+
+```json
+{
+  "error": {
+    "message": "speed must be between 0.5 and 1.8 for Kokoro.",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": null
+  }
+}
+```
+
+Notes:
+
+- This compatibility route does not expose a separate `pitch` field. Use the `voice` suffix forms `af_heart+2.0` or `af_heart-2.0` instead.
+- The suffix is optional. `af_heart` implies `0.0` pitch shift and skips post-processing.
+- The signed voice suffix must stay within `-6.0..+6.0` semitones.
+- This compatibility route does not expose native `lang`, `opus_bitrate`, `wav_sample_rate`, or `target_chunk_chars`.
+- `stream_format: "sse"` returns an error.
+
+## Curl Examples
+
+### Health
+
+```bash
+curl http://127.0.0.1:8000/api/health
+```
+
+### Single WAV Render
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/speak \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "Local TTS stays fast when the interface stays honest.",
+    "voice": "af_heart",
+    "speed": 1.0,
+    "pitch": -1.0,
+    "lang": "en-us",
+    "format": "wav",
+    "wav_sample_rate": "native"
+  }' \
+  --output output.wav
+```
+
+### NDJSON Stream
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/api/speak-stream \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "First sentence. Second sentence. Third sentence.",
+    "voice": "af_heart",
+    "speed": 1.0,
+    "pitch": 1.5,
+    "lang": "en-us",
+    "format": "opus",
+    "opus_bitrate": "32k",
+    "target_chunk_chars": 120
+  }'
+```

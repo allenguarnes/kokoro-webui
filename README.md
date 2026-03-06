@@ -43,8 +43,12 @@ uv run uvicorn app.main:app --reload
 - The backend uses `Kokoro(model_path, voices_path)` and `tts.create(text, voice=..., speed=..., lang=...)`, matching the `kokoro-onnx` usage example from the project docs.
 - You can override model file locations with `KOKORO_MODEL_PATH` and `KOKORO_VOICES_PATH`.
 - If the health badge shows missing runtime files, install dependencies and add the model assets before generating audio.
+- The Web UI pitch control is processed in the backend via `ffmpeg`'s `rubberband` filter for the app's `/api/*` synthesis routes.
+- The OpenAI-compatible `/v1/audio/speech` endpoint does not expose pitch yet.
 
 ## API
+
+Full reference: [docs/API.md](docs/API.md)
 
 - `POST /api/speak`: single audio output (`wav` or `opus`)
 - `POST /api/chunk-plan`: metadata-only chunk plan for debugging/planning
@@ -69,8 +73,9 @@ uv run uvicorn app.main:app --reload
 ```json
 {
   "text": "Long text here.",
-  "voice": "af_sarah",
+  "voice": "af_heart",
   "speed": 1.0,
+  "pitch": -2.0,
   "lang": "en-us",
   "format": "opus",
   "opus_bitrate": "32k",
@@ -79,8 +84,10 @@ uv run uvicorn app.main:app --reload
 ```
 
 - `opus_bitrate` supports: `16k`, `24k`, `32k`, `48k`
+- `pitch` is expressed in semitones and currently supports `-6.0` through `+6.0`
+- `pitch: 0.0` is a no-op and skips backend pitch-shift processing entirely
 - Sentence boundaries are preserved when creating chunks; `target_chunk_chars` is approximate, not a hard cut.
-- `GET /api/health` returns `websocket_streaming` to indicate whether websocket upgrade support is available in the current runtime.
+- `GET /api/health` returns `websocket_streaming` and `pitch_shifting` to indicate which runtime features are available.
 
 ### OpenAI-Compatible Speech
 
@@ -95,6 +102,7 @@ uv run uvicorn app.main:app --reload
 ```
 
 - `model` is accepted for compatibility and is currently ignored by the speech endpoint
-- `voice` should be one of the Kokoro voice ids such as `af_heart`
+- `voice` should be a Kokoro voice id such as `af_heart`, or a suffixed form such as `af_heart+2.0` or `af_heart-2.0`
+- Omitting the suffix implies `0.0` pitch shift, so `af_heart` uses the raw voice with no post-processing
 - Supported `response_format` values are currently `wav` and `opus`
 - `speed` is accepted in the OpenAI-style request, but Kokoro currently supports `0.5` through `1.8`
