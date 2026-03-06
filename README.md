@@ -1,178 +1,197 @@
+<p align="center">
+  <img src="static/favicon.ico" alt="Kokoro WebUI logo" width="64" height="64" />
+</p>
+
 # Kokoro WebUI
 
-Small local WebUI for Kokoro TTS with automatic playback after synthesis.
+Local text-to-speech server and browser UI powered by Kokoro ONNX.
 
-## Stack
+Kokoro WebUI provides:
+- Native synthesis endpoints (`/api/*`)
+- OpenAI-compatible speech endpoints (`/v1/*`)
+- Streaming over NDJSON and WebSocket
+- Optional backend pitch shifting
 
-- FastAPI backend
+## Technology Stack
+
+- Python 3.12 / 3.13
+- FastAPI + Uvicorn
+- `kokoro-onnx`
+- NumPy + SoundFile
 - Static HTML/CSS/JS frontend
-- `kokoro-onnx` runtime for synthesis
 
-## Files
+## Project Architecture
 
-- `app/main.py`: API and static file server
-- `static/`: frontend assets
-- `models/`: put Kokoro model files here
+```text
+Browser UI (static/index.html + static/app.js)
+  -> FastAPI app (app/main.py)
+      -> kokoro-onnx runtime (model + voices)
+      -> optional ffmpeg pipeline (opus encoding, pitch shifting)
+```
 
-## Prerequisites and Setup
+Request flow:
+1. UI or API client sends synthesis request.
+2. Backend validates payload and synthesizes PCM via Kokoro.
+3. Optional post-processing is applied (`pitch`, `opus`).
+4. Audio is returned directly or streamed chunk-by-chunk.
 
-### Required
+## Quick Start
 
-- Python 3.12 or 3.13
-- `uv` package manager
-- Kokoro model assets:
-  - `models/kokoro-v1.0.onnx`
-  - `models/voices-v1.0.bin`
-
-### Optional Runtime Tools
-
-- `ffmpeg`
-  - Needed for `opus` output encoding.
-  - Without it:
-    - `wav` synthesis still works.
-    - `opus` requests fail with HTTP 400 (`ffmpeg is required for Opus output but is not installed.`).
-- `ffmpeg` build with `rubberband` filter
-  - Needed for backend pitch shifting (`pitch != 0`).
-  - Without it:
-    - Pitch shifting is reported unavailable in `/api/health` (`pitch_shifting: false`).
-    - Web UI pitch control is disabled automatically.
-    - Requests with non-zero pitch fail with HTTP 400.
-    - Pitch `0` remains a no-op and works normally.
-- WebSocket transport runtime (`websockets` or `wsproto`)
-  - Needed for `/ws/speak-stream`.
-  - Without it:
-    - NDJSON streaming (`/api/speak-stream`) and non-streaming endpoints continue to work.
-    - `/api/health` reports `websocket_streaming: false`, and the UI disables WebSocket transport.
-
-### Setup Steps
-
-1. Install dependencies:
+### 1) Install dependencies
 
 ```bash
 uv sync
 ```
 
-2. Download the Kokoro ONNX model and voices bundle, then place them here:
+### 2) Add model files
 
-   Source: [model-files-v1.0 release](https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.0)
+Place these files in `models/`:
 
 ```text
 models/kokoro-v1.0.onnx
 models/voices-v1.0.bin
 ```
 
-3. Start the app:
+Model source:
+[model-files-v1.0 release](https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.0)
+
+### 3) Run the server
 
 ```bash
 uv run python -m app.main
 ```
 
-4. Open `http://127.0.0.1:8000`.
+Open: `http://127.0.0.1:8000`
 
-### Network Binding
+## Runtime Requirements
 
-Server bind settings come from environment variables:
+### Required
 
-- `KOKORO_HOST` (default: `127.0.0.1`)
-- `KOKORO_PORT` (default: `8000`)
-- `KOKORO_RELOAD` (default: disabled; enable only for development with `1/true/yes/on`)
+- Python `3.12` or `3.13`
+- `uv`
+- Model files listed above
 
-The app also auto-loads a local `.env` file (if present) before reading these values.
+### Optional (feature-dependent)
 
-Examples:
+- `ffmpeg`
+  - Required for `opus` output
+  - Without it, `wav` still works
+- `ffmpeg` with `rubberband` filter
+  - Required for non-zero pitch shifting
+  - Without it, pitch control is unavailable
+- WebSocket runtime (`websockets` or `wsproto`)
+  - Required for `/ws/speak-stream`
+  - Without it, NDJSON streaming still works
 
-```bash
-# Localhost only (default behavior)
-KOKORO_HOST=127.0.0.1 KOKORO_PORT=8000 uv run python -m app.main
+> [!NOTE]
+> `pitch: 0.0` is a no-op and skips pitch-shift post-processing.
 
-# Bind all interfaces (use firewall restrictions in untrusted networks)
-KOKORO_HOST=0.0.0.0 KOKORO_PORT=8000 uv run python -m app.main
+> [!WARNING]
+> If `ffmpeg` is missing, requests using `format: opus` fail with HTTP 400.
 
-# Bind directly to your Tailscale interface IP
-KOKORO_HOST=100.x.y.z KOKORO_PORT=8000 uv run python -m app.main
+## Configuration
 
-# Development hot-reload only
-KOKORO_RELOAD=1 uv run python -m app.main
-```
+The app auto-loads `.env` (if present).
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `KOKORO_HOST` | `127.0.0.1` | Bind host |
+| `KOKORO_PORT` | `8000` | Bind port |
+| `KOKORO_RELOAD` | `0` | Development auto-reload |
+| `KOKORO_MODEL_PATH` | `models/kokoro-v1.0.onnx` | Override model path |
+| `KOKORO_VOICES_PATH` | `models/voices-v1.0.bin` | Override voices path |
 
 Example `.env`:
 
 ```dotenv
-KOKORO_HOST=100.x.y.z
+KOKORO_HOST=127.0.0.1
 KOKORO_PORT=8000
 KOKORO_RELOAD=0
 ```
 
-## Notes
+Development reload:
 
-- The backend uses `Kokoro(model_path, voices_path)` and `tts.create(text, voice=..., speed=..., lang=...)`, matching the `kokoro-onnx` usage example from the project docs.
-- You can override model file locations with `KOKORO_MODEL_PATH` and `KOKORO_VOICES_PATH`.
-- If the health badge shows missing runtime files, install dependencies and add the model assets before generating audio.
-- The Web UI pitch control is processed in the backend via `ffmpeg`'s `rubberband` filter for the app's `/api/*` synthesis routes.
-- The OpenAI-compatible `/v1/audio/speech` endpoint does not expose pitch yet.
+```bash
+KOKORO_RELOAD=1 uv run python -m app.main
+```
 
-## API
+> [!TIP]
+> Keep `KOKORO_RELOAD=0` in release deployments.
+
+## Development and Testing
+
+- Development hot reload:
+
+```bash
+KOKORO_RELOAD=1 uv run python -m app.main
+```
+
+- Validate runtime quickly:
+  - open `/api/health`
+  - check `ok`, `missing`, `pitch_shifting`, `websocket_streaming`
+
+> [!NOTE]
+> This repository currently does not include an automated test suite.
+
+## API Overview
 
 Full reference: [docs/API.md](docs/API.md)
 
-- `POST /api/speak`: single audio output (`wav` or `opus`)
-- `POST /api/chunk-plan`: metadata-only chunk plan for debugging/planning
-- `POST /api/speak-stream`: NDJSON streaming chunks with audio payloads
-- `WS /ws/speak-stream`: websocket streaming alternative to NDJSON
-- `POST /v1/audio/speech`: OpenAI-compatible speech endpoint
-- `GET /v1/models`: OpenAI-compatible model list
-- `GET /v1/models/kokoro`: OpenAI-compatible model metadata
+### Native Endpoints
 
-### Chunk Plan (metadata-only)
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/health` | Runtime capability and readiness |
+| `POST` | `/api/speak` | Single render (`wav` or `opus`) |
+| `POST` | `/api/chunk-plan` | Chunk metadata only |
+| `POST` | `/api/speak-stream` | NDJSON chunked streaming |
+| `WS` | `/ws/speak-stream` | WebSocket chunked streaming |
 
-```json
-{
-  "text": "Long text here.",
-  "target_chunk_chars": 360,
-  "include_text": false
-}
+### OpenAI-Compatible Endpoints
+
+| Method | Path |
+| --- | --- |
+| `GET` | `/v1/models` |
+| `GET` | `/v1/models/kokoro` |
+| `POST` | `/v1/audio/speech` |
+
+### Pitch Behavior
+
+- Native API uses `pitch` field (`-6.0` to `+6.0`).
+- OpenAI-compatible API uses voice suffixes:
+  - `af_heart+2.0`
+  - `af_heart-2.0`
+  - `af_heart` (implies `0.0`)
+
+## Health and Troubleshooting
+
+Use `/api/health` first when diagnosing runtime issues.
+
+Key fields:
+- `ok`
+- `missing`
+- `pitch_shifting`
+- `websocket_streaming`
+
+If synthesis fails, verify:
+1. Model files exist at expected paths
+2. Optional runtime tools are installed for requested features (`opus`, pitch, WebSocket)
+3. Request fields are within supported ranges
+
+## Project Structure
+
+```text
+app/
+  main.py
+static/
+  index.html
+  styles.css
+  app.js
+docs/
+  API.md
+models/
+  .gitkeep
+README.md
 ```
 
-### Streaming Request Fields
-
-```json
-{
-  "text": "Long text here.",
-  "voice": "af_heart",
-  "speed": 1.0,
-  "pitch": -2.0,
-  "lang": "en-us",
-  "format": "opus",
-  "opus_bitrate": "32k",
-  "target_chunk_chars": 360
-}
-```
-
-- `opus_bitrate` supports: `16k`, `24k`, `32k`, `48k`
-- `pitch` is expressed in semitones and currently supports `-6.0` through `+6.0`
-- `pitch: 0.0` is a no-op and skips backend pitch-shift processing entirely
-- Sentence boundaries are preserved when creating chunks; `target_chunk_chars` is approximate, not a hard cut.
-- `GET /api/health` returns `websocket_streaming` and `pitch_shifting` to indicate which runtime features are available.
-
-### OpenAI-Compatible Speech
-
-```json
-{
-  "model": "kokoro",
-  "input": "The future sounds calmer when it is rendered locally.",
-  "voice": "af_heart",
-  "response_format": "wav",
-  "speed": 1.0
-}
-```
-
-- `model` is accepted for compatibility and is currently ignored by the speech endpoint
-- `voice` should be a Kokoro voice id such as `af_heart`, or a suffixed form such as `af_heart+2.0` or `af_heart-2.0`
-- Omitting the suffix implies `0.0` pitch shift, so `af_heart` uses the raw voice with no post-processing
-- Supported `response_format` values are currently `wav` and `opus`
-- `speed` is accepted in the OpenAI-style request, but Kokoro currently supports `0.5` through `1.8`
-
-## License
-
-- Project license: Apache-2.0 ([LICENSE](LICENSE))
-- Third-party and model/runtime licensing notes: [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)
+For licensing details, see `LICENSE` and `THIRD_PARTY_LICENSES.md`.
