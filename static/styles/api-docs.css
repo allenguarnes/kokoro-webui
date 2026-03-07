@@ -194,6 +194,39 @@
     outline: none;
 }
 
+.site-footer {
+    grid-column: 1 / -1;
+    display: flex;
+    justify-content: center;
+    padding: 0.2rem 0 0.3rem;
+}
+
+.site-footer-copy {
+    margin: 0;
+    color: var(--ink-soft);
+    font-family: var(--mono);
+    font-size: 0.76rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+}
+
+.site-footer-link {
+    color: var(--accent);
+    text-decoration: none;
+    border-bottom: 1px solid rgba(204, 86, 97, 0.35);
+    padding-bottom: 0.08rem;
+    transition:
+        color 180ms ease,
+        border-color 180ms ease;
+}
+
+.site-footer-link:hover,
+.site-footer-link:focus-visible {
+    color: var(--ink);
+    border-color: var(--accent);
+    outline: none;
+}
+
 .field {
     display: grid;
     gap: 0.42rem;

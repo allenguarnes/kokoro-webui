@@ -30,12 +30,20 @@
                             <option value="ws">WebSocket</option>
                         </select>
                     </label>
+                    <span
+                        id="providerBadge"
+                        class="runtime-badge runtime-badge-idle"
+                        title="Active runtime provider: unknown"
+                        aria-label="Active runtime provider: unknown"
+                    >
+                        Runtime
+                    </span>
                     <button
                         id="systemStatus"
                         type="button"
                         class="status-widget status-widget-warn"
-                        title="Runtime: checking. WebSocket: unknown."
-                        aria-label="Runtime: checking. WebSocket: unknown."
+                        title="Runtime: checking, WebSocket: unknown."
+                        aria-label="Runtime: checking, WebSocket: unknown."
                     >
                         <span
                             class="icon icon-system"
@@ -485,6 +493,20 @@ The future sounds calmer when it is rendered locally.</textarea
                     </div>
                 </details>
             </section>
+
+            <footer class="site-footer">
+                <p class="site-footer-copy">
+                    Built on
+                    <a
+                        class="site-footer-link"
+                        href="https://github.com/hexgrad/kokoro"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                    >
+                        Kokoro TTS
+                    </a>
+                </p>
+            </footer>
         </main>
 
         <script type="module" src="/static/app.js"></script>

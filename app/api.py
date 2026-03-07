@@ -53,9 +53,11 @@ def create_app() -> FastAPI:
         if not config.VOICES_PATH.exists():
             missing.append(str(config.VOICES_PATH.name))
 
+        runtime_status = runtime.get_runtime_status()
+
         return JSONResponse(
             {
-                "ok": not missing,
+                "ok": not missing and runtime_status.runtime_error is None,
                 "missing": missing,
                 "model_path": str(config.MODEL_PATH),
                 "voices_path": str(config.VOICES_PATH),
@@ -63,6 +65,16 @@ def create_app() -> FastAPI:
                 "formats": ["wav", "opus"],
                 "opus_bitrates": config.OPUS_BITRATES,
                 "wav_sample_rates": config.WAV_SAMPLE_RATES,
+                "requested_provider": runtime_status.requested_provider,
+                "attempted_providers": runtime_status.attempted_providers,
+                "available_providers": runtime_status.available_providers,
+                "active_provider": runtime_status.active_providers[0]
+                if runtime_status.active_providers
+                else None,
+                "active_providers": runtime_status.active_providers,
+                "provider_fallback": runtime_status.provider_fallback,
+                "provider_error": runtime_status.provider_error,
+                "runtime_error": runtime_status.runtime_error,
                 "pitch_shifting": audio.ffmpeg_supports_rubberband(),
                 "max_pitch_semitones": config.MAX_PITCH_SHIFT_SEMITONES,
                 "streaming": True,

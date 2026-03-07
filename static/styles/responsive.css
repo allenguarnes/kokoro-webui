@@ -27,6 +27,11 @@
         flex-wrap: wrap;
     }
 
+    .runtime-badge {
+        order: 2;
+        margin-right: 0;
+    }
+
     .topbar-meta .field-topbar-transport {
         width: 100%;
         margin-right: 0;

@@ -73,13 +73,42 @@ export async function loadHealth() {
     refreshCustomSelect(transportInput);
     syncTransportModeText();
     updateFormatControlState();
+    const activeProvider =
+      typeof data.active_provider === "string" ? data.active_provider : null;
+    const providerFallback = data.provider_fallback === true;
+    const providerError =
+      typeof data.provider_error === "string" ? data.provider_error : null;
+    const runtimeError =
+      typeof data.runtime_error === "string" ? data.runtime_error : null;
     if (data.ok) {
-      setSystemStatus(true, websocketEnabled);
+      setSystemStatus(
+        true,
+        websocketEnabled,
+        activeProvider,
+        providerFallback,
+        providerError,
+        runtimeError,
+      );
+      if (providerFallback && activeProvider) {
+        setStatus("Ready for synthesis with CPU fallback.", true);
+        return;
+      }
       setStatus("Ready for synthesis");
       return;
     }
 
-    setSystemStatus(false, websocketEnabled);
+    setSystemStatus(
+      false,
+      websocketEnabled,
+      activeProvider,
+      providerFallback,
+      providerError,
+      runtimeError,
+    );
+    if (runtimeError) {
+      setStatus(`Runtime unavailable: ${runtimeError}`, true);
+      return;
+    }
     setStatus(`Missing runtime files: ${data.missing.join(", ")}`, true);
   } catch (_error) {
     setSystemStatus(false, false);

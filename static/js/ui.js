@@ -18,6 +18,7 @@ import {
   submitButton,
   submitButtonLabel,
   systemStatus,
+  providerBadge,
   textInput,
   themeToggle,
   transportInput,
@@ -49,16 +50,74 @@ export function formatVoiceLabel(voice) {
   return `${baseLabel} (${prefix || "other"})`;
 }
 
-export function setSystemStatus(runtimeReady, websocketReady) {
-  const title = `Runtime: ${runtimeReady ? "ready" : "unavailable"}. WebSocket: ${
-    websocketReady ? "ready" : "unavailable"
-  }.`;
+function formatProviderLabel(activeProvider) {
+  if (!activeProvider) {
+    return "Runtime";
+  }
+
+  const labels = {
+    CPUExecutionProvider: "CPU",
+    CUDAExecutionProvider: "CUDA",
+    TensorrtExecutionProvider: "TensorRT",
+    DmlExecutionProvider: "DirectML",
+    CoreMLExecutionProvider: "CoreML",
+  };
+  return (
+    labels[activeProvider] || activeProvider.replace(/ExecutionProvider$/, "")
+  );
+}
+
+export function setSystemStatus(
+  runtimeReady,
+  websocketReady,
+  activeProvider = null,
+  providerFallback = false,
+  providerError = null,
+  runtimeError = null,
+) {
+  const providerLabel = formatProviderLabel(activeProvider);
+  const details = [
+    `Runtime: ${runtimeReady ? "Ready" : "Unavailable"},`,
+    `WebSocket: ${websocketReady ? "Ready" : "Unavailable"},`,
+  ];
+  if (activeProvider) {
+    details.push(`Provider: ${activeProvider}`);
+  }
+  if (providerFallback) {
+    details.push("GPU fallback: active.");
+  }
+  if (providerError) {
+    details.push(`Provider error: ${providerError}.`);
+  }
+  if (runtimeError) {
+    details.push(`Runtime error: ${runtimeError}.`);
+  }
+
+  const title = details.join(" ");
   systemStatus.title = title;
   systemStatus.setAttribute("aria-label", title);
   systemStatus.className =
-    runtimeReady && websocketReady
+    runtimeReady && websocketReady && !providerFallback
       ? "status-widget status-widget-ok"
       : "status-widget status-widget-warn";
+
+  providerBadge.textContent = providerLabel;
+  providerBadge.title = `Active runtime provider: ${providerLabel}`;
+  providerBadge.setAttribute(
+    "aria-label",
+    `Active runtime provider: ${providerLabel}`,
+  );
+  providerBadge.className = "runtime-badge";
+  if (!activeProvider) {
+    providerBadge.classList.add("runtime-badge-idle");
+  } else if (providerLabel === "CUDA" || providerLabel === "TensorRT") {
+    providerBadge.classList.add("runtime-badge-accel");
+  } else {
+    providerBadge.classList.add("runtime-badge-default");
+  }
+  if (providerFallback || runtimeError) {
+    providerBadge.classList.add("runtime-badge-warn");
+  }
 }
 
 function getSelectLabel(selectEl) {

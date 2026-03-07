@@ -22,6 +22,7 @@ export const exportButton = document.getElementById("exportButton");
 export const exportButtonLabel = exportButton.querySelector(".button-label");
 export const player = document.getElementById("player");
 export const systemStatus = document.getElementById("systemStatus");
+export const providerBadge = document.getElementById("providerBadge");
 export const themeToggle = document.getElementById("themeToggle");
 export const genTime = document.getElementById("genTime");
 export const charCount = document.getElementById("charCount");

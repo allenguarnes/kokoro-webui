@@ -16,6 +16,7 @@ import app.config as config
 import app.main as main
 import app.runtime as runtime
 from app.schemas import RenderedChunk, SynthesisRequest
+from app.runtime import RuntimeStatus
 
 
 def make_rendered_chunk(payload: SynthesisRequest, text: str) -> RenderedChunk:
@@ -47,7 +48,7 @@ class ApiIntegrationTests(unittest.TestCase):
         self.client = TestClient(main.app)
         self.existing_path = Path(__file__)
         audio.ffmpeg_supports_rubberband.cache_clear()
-        runtime.get_tts.cache_clear()
+        runtime.clear_runtime_caches()
 
     @override
     def tearDown(self) -> None:
@@ -55,15 +56,25 @@ class ApiIntegrationTests(unittest.TestCase):
         if client is not None:
             client.close()
         audio.ffmpeg_supports_rubberband.cache_clear()
-        runtime.get_tts.cache_clear()
+        runtime.clear_runtime_caches()
 
     def test_health_reports_runtime_capabilities(self) -> None:
+        fake_status = RuntimeStatus(
+            requested_provider="auto",
+            attempted_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            available_providers=["CPUExecutionProvider", "CUDAExecutionProvider"],
+            active_providers=["CPUExecutionProvider"],
+            provider_fallback=True,
+            provider_error="Failed to load CUDA runtime.",
+            runtime_error=None,
+        )
         with (
             patch.object(config, "MODEL_PATH", self.existing_path),
             patch.object(config, "VOICES_PATH", self.existing_path),
             patch.object(
                 runtime, "load_voice_names", return_value=["af_heart", "bf_alice"]
             ),
+            patch.object(runtime, "get_runtime_status", return_value=fake_status),
             patch.object(audio, "ffmpeg_supports_rubberband", return_value=True),
             patch.object(runtime, "websocket_runtime_available", return_value=True),
         ):
@@ -73,8 +84,47 @@ class ApiIntegrationTests(unittest.TestCase):
         payload = cast(dict[str, object], response.json())
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["voices"], ["af_heart", "bf_alice"])
+        self.assertEqual(payload["requested_provider"], "auto")
+        self.assertEqual(
+            payload["attempted_providers"],
+            ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        self.assertEqual(payload["active_provider"], "CPUExecutionProvider")
+        self.assertEqual(payload["active_providers"], ["CPUExecutionProvider"])
+        self.assertEqual(
+            payload["available_providers"],
+            ["CPUExecutionProvider", "CUDAExecutionProvider"],
+        )
+        self.assertTrue(cast(bool, payload["provider_fallback"]))
+        self.assertEqual(payload["provider_error"], "Failed to load CUDA runtime.")
+        self.assertIsNone(payload["runtime_error"])
         self.assertTrue(payload["pitch_shifting"])
         self.assertTrue(payload["websocket_streaming"])
+
+    def test_health_reports_runtime_error_as_not_ready(self) -> None:
+        fake_status = RuntimeStatus(
+            requested_provider="cuda",
+            attempted_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            available_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            active_providers=[],
+            provider_fallback=False,
+            provider_error=None,
+            runtime_error="Failed to allocate CUDA memory.",
+        )
+        with (
+            patch.object(config, "MODEL_PATH", self.existing_path),
+            patch.object(config, "VOICES_PATH", self.existing_path),
+            patch.object(runtime, "load_voice_names", return_value=["af_heart"]),
+            patch.object(runtime, "get_runtime_status", return_value=fake_status),
+            patch.object(audio, "ffmpeg_supports_rubberband", return_value=True),
+            patch.object(runtime, "websocket_runtime_available", return_value=True),
+        ):
+            response = self.get_client().get("/api/health")
+
+        self.assertEqual(response.status_code, 200)
+        payload = cast(dict[str, object], response.json())
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["runtime_error"], "Failed to allocate CUDA memory.")
 
     def test_native_speak_returns_audio_headers(self) -> None:
         request_payload = {

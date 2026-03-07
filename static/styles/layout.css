@@ -52,6 +52,69 @@
     align-items: center;
 }
 
+.runtime-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 4.15rem;
+    min-height: 1.95rem;
+    padding: 0.18rem 0.46rem 0.16rem;
+    margin-right: 0.18rem;
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+    background: rgba(236, 237, 231, 0.04);
+    color: var(--ink-soft);
+    font-family: var(--mono);
+    font-size: 0.67rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.runtime-badge-idle {
+    color: var(--ink-soft);
+    border-color: var(--line-strong);
+}
+
+.runtime-badge-default {
+    color: var(--ink);
+    border-color: rgba(236, 237, 231, 0.18);
+}
+
+.runtime-badge-accel {
+    color: #9ce0ac;
+    border-color: rgba(121, 199, 144, 0.36);
+    background: rgba(121, 199, 144, 0.08);
+}
+
+.runtime-badge-warn {
+    color: #f0c0c8;
+    border-color: rgba(222, 135, 150, 0.4);
+    background: rgba(222, 135, 150, 0.08);
+}
+
+:root[data-theme="light"] .runtime-badge {
+    background: rgba(255, 255, 255, 0.52);
+}
+
+:root[data-theme="light"] .runtime-badge-default {
+    color: #1e2326;
+    border-color: rgba(30, 35, 38, 0.2);
+}
+
+:root[data-theme="light"] .runtime-badge-accel {
+    color: #216038;
+    border-color: rgba(33, 96, 56, 0.28);
+    background: rgba(96, 166, 119, 0.14);
+}
+
+:root[data-theme="light"] .runtime-badge-warn {
+    color: #8a3440;
+    border-color: rgba(138, 52, 64, 0.24);
+    background: rgba(204, 86, 97, 0.12);
+}
+
 .topbar-meta .field-topbar-transport {
     display: flex;
     align-items: center;
@@ -346,4 +409,3 @@ code {
         ),
         rgba(232, 224, 217, 0.98);
 }
-

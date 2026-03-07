@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal, cast
 
 ROOT = Path(__file__).resolve().parent.parent
 ENV_FILE_PATH = ROOT / ".env"
+ProviderMode = Literal["auto", "cpu", "cuda"]
 
 
 def load_env_file(path: Path) -> None:
@@ -48,6 +50,7 @@ OPENAI_COMPAT_OWNER = "kokoro-webui"
 DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 8000
 DEFAULT_FFMPEG_TIMEOUT_SEC = 20.0
+DEFAULT_RUNTIME_PROVIDER: ProviderMode = "auto"
 
 
 def parse_bool_env(value: str | None, *, default: bool = False) -> bool:
@@ -91,3 +94,24 @@ def get_ffmpeg_timeout_seconds() -> float:
             f"KOKORO_FFMPEG_TIMEOUT_SEC must be greater than 0, got {timeout}."
         )
     return timeout
+
+
+def get_runtime_provider_mode() -> ProviderMode:
+    raw_provider = os.getenv("KOKORO_PROVIDER", DEFAULT_RUNTIME_PROVIDER).strip().lower()
+    if raw_provider in {"auto", "cpu", "cuda"}:
+        return cast(ProviderMode, raw_provider)
+    raise RuntimeError(
+        f"KOKORO_PROVIDER must be one of 'auto', 'cpu', or 'cuda', got {raw_provider!r}."
+    )
+
+
+def get_runtime_provider_strict() -> bool:
+    return parse_bool_env(os.getenv("KOKORO_STRICT_PROVIDER"), default=False)
+
+
+def get_runtime_cuda_lib_dir() -> str | None:
+    value = os.getenv("KOKORO_CUDA_LIB_DIR")
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
