@@ -226,10 +226,3 @@
     border-color: var(--accent);
     outline: none;
 }
-
-.field {
-    display: grid;
-    gap: 0.42rem;
-}
-
-.field span,
