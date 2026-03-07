@@ -15,8 +15,8 @@ import app.audio as audio
 import app.config as config
 import app.main as main
 import app.runtime as runtime
-from app.schemas import RenderedChunk, SynthesisRequest
 from app.runtime import RuntimeStatus
+from app.schemas import RenderedChunk, SynthesisRequest
 
 
 def make_rendered_chunk(payload: SynthesisRequest, text: str) -> RenderedChunk:
@@ -183,11 +183,13 @@ class ApiIntegrationTests(unittest.TestCase):
                 websocket.send_text(json.dumps(request_payload))
                 meta = cast(dict[str, object], json.loads(websocket.receive_text()))
                 chunk = cast(dict[str, object], json.loads(websocket.receive_text()))
+                audio_bytes = websocket.receive_bytes()
                 done = cast(dict[str, object], json.loads(websocket.receive_text()))
 
         self.assertEqual(meta["type"], "meta")
         self.assertEqual(chunk["type"], "chunk")
         self.assertEqual(chunk["format"], "opus")
+        self.assertEqual(audio_bytes, b"af_heart|0.0|opus|Hello over websocket.")
         self.assertEqual(done["type"], "done")
 
     def test_openai_speech_accepts_voice_pitch_suffix(self) -> None:

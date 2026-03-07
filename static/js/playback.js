@@ -28,6 +28,20 @@ function decodeBase64ToBlob(base64Text, mimeType) {
   return new Blob([bytes], { type: mimeType });
 }
 
+function createQueueEntry(meta, blob) {
+  return {
+    index: meta.chunk_index,
+    totalChunks: meta.total_chunks,
+    blob,
+    bytes: meta.bytes,
+    durationSec: meta.duration_sec,
+    synthMs: meta.synth_ms,
+    format: meta.format,
+    opus_bitrate: meta.opus_bitrate,
+    sample_rate: meta.sample_rate,
+  };
+}
+
 function getInterChunkPauseMs(speed, pauseValue) {
   if (pauseValue > 0) {
     return pauseValue;
@@ -169,17 +183,12 @@ export async function readStreamIntoQueue(state, token) {
           }.`,
         );
       } else if (message.type === "chunk") {
-        state.queue.push({
-          index: message.chunk_index,
-          totalChunks: message.total_chunks,
-          blob: decodeBase64ToBlob(message.audio_base64, message.mime_type),
-          bytes: message.bytes,
-          durationSec: message.duration_sec,
-          synthMs: message.synth_ms,
-          format: message.format,
-          opus_bitrate: message.opus_bitrate,
-          sample_rate: message.sample_rate,
-        });
+        state.queue.push(
+          createQueueEntry(
+            message,
+            decodeBase64ToBlob(message.audio_base64, message.mime_type),
+          ),
+        );
         notifyQueue(state);
       } else if (message.type === "error") {
         state.streamError = message.detail || "Streaming synthesis failed.";
@@ -202,6 +211,7 @@ export function readWebSocketIntoQueue(state, token) {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${protocol}//${window.location.host}/ws/speak-stream`;
     const socket = new WebSocket(wsUrl);
+    socket.binaryType = "arraybuffer";
     appState.activeSocket = socket;
 
     socket.onopen = () => {
@@ -212,37 +222,46 @@ export function readWebSocketIntoQueue(state, token) {
       if (token !== appState.playbackToken || !appState.chunkState) {
         return;
       }
-      const message = JSON.parse(event.data);
-      if (message.type === "meta") {
-        state.totalChunks = message.total_chunks;
-        chunkProgress.textContent = `0 / ${state.totalChunks}`;
-        setStatus(
-          `Chunk plan ready with ${state.totalChunks} sentence-safe chunks${
-            message.pitch !== 0
-              ? ` at ${formatSignedSemitones(Number(message.pitch))}`
-              : ""
-          }.`,
-        );
-      } else if (message.type === "chunk") {
-        state.queue.push({
-          index: message.chunk_index,
-          totalChunks: message.total_chunks,
-          blob: decodeBase64ToBlob(message.audio_base64, message.mime_type),
-          bytes: message.bytes,
-          durationSec: message.duration_sec,
-          synthMs: message.synth_ms,
-          format: message.format,
-          opus_bitrate: message.opus_bitrate,
-          sample_rate: message.sample_rate,
-        });
-        notifyQueue(state);
-      } else if (message.type === "error") {
-        state.streamError = message.detail || "WebSocket streaming failed.";
-        notifyQueue(state);
-      } else if (message.type === "done") {
-        state.streamDone = true;
-        notifyQueue(state);
+      if (typeof event.data === "string") {
+        const message = JSON.parse(event.data);
+        if (message.type === "meta") {
+          state.totalChunks = message.total_chunks;
+          chunkProgress.textContent = `0 / ${state.totalChunks}`;
+          setStatus(
+            `Chunk plan ready with ${state.totalChunks} sentence-safe chunks${
+              message.pitch !== 0
+                ? ` at ${formatSignedSemitones(Number(message.pitch))}`
+                : ""
+            }.`,
+          );
+        } else if (message.type === "chunk") {
+          state.pendingChunkMeta = message;
+        } else if (message.type === "error") {
+          state.streamError = message.detail || "WebSocket streaming failed.";
+          notifyQueue(state);
+        } else if (message.type === "done") {
+          state.streamDone = true;
+          notifyQueue(state);
+        }
+        return;
       }
+
+      if (!(event.data instanceof ArrayBuffer) || !state.pendingChunkMeta) {
+        state.streamError =
+          "WebSocket stream lost chunk metadata before audio bytes arrived.";
+        notifyQueue(state);
+        return;
+      }
+
+      const chunkMeta = state.pendingChunkMeta;
+      state.pendingChunkMeta = null;
+      state.queue.push(
+        createQueueEntry(
+          chunkMeta,
+          new Blob([event.data], { type: chunkMeta.mime_type }),
+        ),
+      );
+      notifyQueue(state);
     };
 
     socket.onerror = () => {
@@ -250,7 +269,11 @@ export function readWebSocketIntoQueue(state, token) {
     };
 
     socket.onclose = () => {
-      if (token === appState.playbackToken && appState.chunkState && !state.streamDone) {
+      if (
+        token === appState.playbackToken &&
+        appState.chunkState &&
+        !state.streamDone
+      ) {
         state.streamDone = true;
         notifyQueue(state);
       }

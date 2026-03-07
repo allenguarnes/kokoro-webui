@@ -251,8 +251,10 @@ def run_case_websocket(client: TestClient, case: BenchmarkCase) -> SampleResult:
             event = as_object_mapping(cast(object, json.loads(frame)))
             event_type = get_string(event, "type")
             if event_type == "chunk":
+                chunk_audio = websocket.receive_bytes()
+                wire_bytes += len(chunk_audio)
                 chunk_count += 1
-                audio_bytes += get_int(event, "bytes")
+                audio_bytes += len(chunk_audio)
                 audio_duration_sec += get_float(event, "duration_sec")
                 synth_ms_sum += get_float(event, "synth_ms")
             if event_type in {"done", "error"}:

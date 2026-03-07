@@ -21,6 +21,7 @@ from app.schemas import (
     ChunkPlanEntry,
     OpenAIModelListResponse,
     OpenAISpeechRequest,
+    RenderedChunk,
     SynthesisRequest,
 )
 
@@ -34,6 +35,11 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
+
+    async def synthesize_chunk_async(
+        payload: SynthesisRequest, text: str
+    ) -> RenderedChunk:
+        return await asyncio.to_thread(audio.synthesize_chunk, payload, text)
 
     @app.get("/")
     async def index() -> FileResponse:
@@ -105,7 +111,7 @@ def create_app() -> FastAPI:
     async def openai_create_speech(payload: OpenAISpeechRequest) -> Response:
         try:
             synth_request = openai_compat.build_openai_synthesis_request(payload)
-            rendered = audio.synthesize_chunk(synth_request, synth_request.text)
+            rendered = await synthesize_chunk_async(synth_request, synth_request.text)
         except ValueError as exc:
             return openai_compat.openai_error_response(400, str(exc))
         except Exception as exc:
@@ -125,7 +131,7 @@ def create_app() -> FastAPI:
     @app.post("/api/speak")
     async def speak(payload: SynthesisRequest) -> StreamingResponse:
         try:
-            rendered = audio.synthesize_chunk(payload, payload.text)
+            rendered = await synthesize_chunk_async(payload, payload.text)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -174,28 +180,43 @@ def create_app() -> FastAPI:
 
     def build_chunk_event(
         payload: ChunkedSynthesisRequest, chunk: str, index: int, total_chunks: int
-    ) -> dict[str, object]:
+    ) -> tuple[dict[str, object], bytes]:
         started_at = time.perf_counter()
         rendered = audio.synthesize_chunk(payload, chunk)
         synth_ms = round((time.perf_counter() - started_at) * 1000, 2)
-        return {
-            "type": "chunk",
-            "chunk_index": index,
-            "total_chunks": total_chunks,
-            "text": chunk,
-            "pitch": payload.pitch,
-            "bytes": len(rendered["audio_bytes"]),
-            "sample_rate": rendered["sample_rate"],
-            "duration_sec": rendered["duration_sec"],
-            "synth_ms": synth_ms,
-            "format": payload.format,
-            "opus_bitrate": payload.opus_bitrate if payload.format == "opus" else None,
-            "wav_sample_rate": rendered["sample_rate"]
-            if payload.format == "wav"
-            else None,
-            "mime_type": rendered["media_type"],
-            "audio_base64": base64.b64encode(rendered["audio_bytes"]).decode("ascii"),
-        }
+        return (
+            {
+                "type": "chunk",
+                "chunk_index": index,
+                "total_chunks": total_chunks,
+                "text": chunk,
+                "pitch": payload.pitch,
+                "bytes": len(rendered["audio_bytes"]),
+                "sample_rate": rendered["sample_rate"],
+                "duration_sec": rendered["duration_sec"],
+                "synth_ms": synth_ms,
+                "format": payload.format,
+                "opus_bitrate": (
+                    payload.opus_bitrate if payload.format == "opus" else None
+                ),
+                "wav_sample_rate": (
+                    rendered["sample_rate"] if payload.format == "wav" else None
+                ),
+                "mime_type": rendered["media_type"],
+            },
+            rendered["audio_bytes"],
+        )
+
+    async def build_chunk_event_async(
+        payload: ChunkedSynthesisRequest, chunk: str, index: int, total_chunks: int
+    ) -> tuple[dict[str, object], bytes]:
+        return await asyncio.to_thread(
+            build_chunk_event,
+            payload,
+            chunk,
+            index,
+            total_chunks,
+        )
 
     async def watch_websocket_disconnect(
         websocket: WebSocket, disconnected: asyncio.Event
@@ -248,7 +269,9 @@ def create_app() -> FastAPI:
                 if await request.is_disconnected():
                     return
                 try:
-                    event = build_chunk_event(payload, chunk, index, total_chunks)
+                    event, audio_bytes = await build_chunk_event_async(
+                        payload, chunk, index, total_chunks
+                    )
                 except Exception as exc:
                     if await request.is_disconnected():
                         return
@@ -264,6 +287,7 @@ def create_app() -> FastAPI:
                     ).encode("utf-8")
                     return
 
+                event["audio_base64"] = base64.b64encode(audio_bytes).decode("ascii")
                 yield (json.dumps(event) + "\n").encode("utf-8")
 
             if await request.is_disconnected():
@@ -319,7 +343,9 @@ def create_app() -> FastAPI:
                 if disconnect_event.is_set():
                     return
                 try:
-                    event = build_chunk_event(payload, chunk, index, total_chunks)
+                    event, audio_bytes = await build_chunk_event_async(
+                        payload, chunk, index, total_chunks
+                    )
                 except Exception as exc:
                     if disconnect_event.is_set():
                         return
@@ -336,6 +362,9 @@ def create_app() -> FastAPI:
                 if disconnect_event.is_set():
                     return
                 await websocket.send_text(json.dumps(event))
+                if disconnect_event.is_set():
+                    return
+                await websocket.send_bytes(audio_bytes)
 
             if disconnect_event.is_set():
                 return

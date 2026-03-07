@@ -26,6 +26,7 @@ export function createChunkState() {
   return {
     queue: [],
     queueWaiter: null,
+    pendingChunkMeta: null,
     totalChunks: 0,
     playedChunks: 0,
     totalElapsedMs: 0,
