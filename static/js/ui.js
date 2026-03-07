@@ -27,12 +27,26 @@ import {
 import { appState } from "./state.js";
 
 export function formatVoiceLabel(voice) {
-  const [, rawName = voice] = String(voice).split("_", 2);
-  return rawName
+  const [prefix = "", rawName = voice] = String(voice).split("_", 2);
+  const baseLabel = rawName
     .split(/[-\s]+/)
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
+  const canonicalPrefixes = new Set([
+    "af",
+    "am",
+    "bf",
+    "bm",
+    "jf",
+    "jm",
+    "zf",
+    "zm",
+  ]);
+  if (canonicalPrefixes.has(prefix)) {
+    return baseLabel;
+  }
+  return `${baseLabel} (${prefix || "other"})`;
 }
 
 export function setSystemStatus(runtimeReady, websocketReady) {
@@ -301,32 +315,24 @@ export function populateVoices(voices) {
     grouped.get(groupKey).push(voice);
   });
 
-  [
-    "af",
-    "am",
-    "bf",
-    "bm",
-    "jf",
-    "jm",
-    "zf",
-    "zm",
-    "other",
-  ].forEach((groupKey) => {
-    const groupVoices = grouped.get(groupKey);
-    if (!groupVoices?.length) {
-      return;
-    }
+  ["af", "am", "bf", "bm", "jf", "jm", "zf", "zm", "other"].forEach(
+    (groupKey) => {
+      const groupVoices = grouped.get(groupKey);
+      if (!groupVoices?.length) {
+        return;
+      }
 
-    const optgroup = document.createElement("optgroup");
-    optgroup.label = groupLabels[groupKey];
-    groupVoices.forEach((voice) => {
-      const option = document.createElement("option");
-      option.value = voice;
-      option.textContent = formatVoiceLabel(voice);
-      optgroup.appendChild(option);
-    });
-    voiceInput.appendChild(optgroup);
-  });
+      const optgroup = document.createElement("optgroup");
+      optgroup.label = groupLabels[groupKey];
+      groupVoices.forEach((voice) => {
+        const option = document.createElement("option");
+        option.value = voice;
+        option.textContent = formatVoiceLabel(voice);
+        optgroup.appendChild(option);
+      });
+      voiceInput.appendChild(optgroup);
+    },
+  );
 
   if (!voiceInput.children.length) {
     const option = document.createElement("option");
@@ -337,7 +343,9 @@ export function populateVoices(voices) {
     voiceInput.appendChild(option);
   }
 
-  voiceInput.value = voices.includes(previousValue) ? previousValue : (voices[0] ?? "");
+  voiceInput.value = voices.includes(previousValue)
+    ? previousValue
+    : (voices[0] ?? "");
   refreshCustomSelect(voiceInput);
 }
 
@@ -422,7 +430,8 @@ export function updateTextStats() {
 
 export function updatePauseLabel() {
   const pauseValue = Number(pauseMsInput.value);
-  pauseMode.textContent = pauseValue > 0 ? `${pauseValue} ms fixed` : "0 = auto";
+  pauseMode.textContent =
+    pauseValue > 0 ? `${pauseValue} ms fixed` : "0 = auto";
 }
 
 export function updateFormatControlState() {
@@ -430,5 +439,6 @@ export function updateFormatControlState() {
 }
 
 export function syncTransportModeText() {
-  streamMode.textContent = transportInput.value === "ws" ? "WebSocket" : "NDJSON";
+  streamMode.textContent =
+    transportInput.value === "ws" ? "WebSocket" : "NDJSON";
 }
