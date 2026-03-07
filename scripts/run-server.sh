@@ -33,12 +33,42 @@ USAGE
   esac
 done
 
-if [[ -f .env ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env
-  set +a
-fi
+load_env_file() {
+  local env_file="$1"
+  [[ -f "$env_file" ]] || return 0
+
+  while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+    local line="$raw_line"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+    if [[ "$line" == export\ * ]]; then
+      line="${line#export }"
+      line="${line#"${line%%[![:space:]]*}"}"
+    fi
+    [[ "$line" == *=* ]] || continue
+
+    local key="${line%%=*}"
+    local value="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    key="${key#"${key%%[![:space:]]*}"}"
+    [[ -n "$key" ]] || continue
+    [[ -v "$key" ]] && continue
+
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "${value:0:1}" == "\"" && "${value: -1}" == "\"" ]] || [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+      value="${value:1:${#value}-2}"
+    else
+      value="${value%% \#*}"
+      value="${value%"${value##*[![:space:]]}"}"
+    fi
+
+    export "$key=$value"
+  done < "$env_file"
+}
+
+load_env_file .env
 
 if [[ -n "${KOKORO_CUDA_LIB_DIR:-}" ]]; then
   if [[ -d "$KOKORO_CUDA_LIB_DIR" ]]; then
@@ -210,6 +240,9 @@ import importlib.metadata as md
 import os
 from pathlib import Path
 
+from app.config import get_runtime_provider_mode
+from app.runtime import get_runtime_status
+
 items: list[tuple[str, str, str]] = []
 root = Path.cwd()
 venv_python = root / '.venv' / 'bin' / 'python'
@@ -228,19 +261,40 @@ voices_path = Path(os.getenv('KOKORO_VOICES_PATH', root / 'models' / 'voices-v1.
 items.append(('model', 'ok' if model_path.exists() else 'error', str(model_path)))
 items.append(('voices', 'ok' if voices_path.exists() else 'error', str(voices_path)))
 
-requested_provider = os.getenv('KOKORO_PROVIDER', 'auto').strip().lower() or 'auto'
-items.append(('provider', 'ok', requested_provider))
+try:
+    requested_provider = get_runtime_provider_mode()
+except Exception as exc:
+    items.append(('provider', 'error', str(exc)))
+else:
+    items.append(('provider', 'ok', requested_provider))
 
 try:
-    import onnxruntime as ort  # pyright: ignore[reportMissingImports]
+    status = get_runtime_status()
 except Exception as exc:
-    items.append(('providers', 'error', str(exc)))
+    items.append(('runtime', 'error', str(exc)))
 else:
-    available = ort.get_available_providers()
+    available = status.available_providers
     items.append(('providers', 'ok', ', '.join(available) if available else '(none)'))
-    if requested_provider != 'cpu':
-        if 'CUDAExecutionProvider' in available:
-            items.append(('cuda', 'ok', 'CUDAExecutionProvider available'))
+    if status.attempted_providers:
+        items.append(('attempted', 'ok', ', '.join(status.attempted_providers)))
+
+    if status.active_providers:
+        items.append(('active', 'ok', ', '.join(status.active_providers)))
+    elif status.runtime_error:
+        items.append(('runtime', 'error', status.runtime_error))
+    else:
+        items.append(('runtime', 'warn', 'no active providers'))
+
+    if status.provider_fallback:
+        items.append(('fallback', 'warn', f"requested {status.requested_provider}, active {', '.join(status.active_providers) or 'none'}"))
+    if status.provider_error:
+        level = 'error' if os.getenv('KOKORO_STRICT_PROVIDER', '').strip() in {'1', 'true', 'yes', 'on'} else 'warn'
+        items.append(('provider-error', level, status.provider_error))
+    if status.requested_provider != 'cpu':
+        if 'CUDAExecutionProvider' in status.active_providers:
+            items.append(('cuda', 'ok', 'CUDAExecutionProvider active'))
+        elif 'CUDAExecutionProvider' in available:
+            items.append(('cuda', 'warn', 'CUDAExecutionProvider detected but unusable; runtime is using CPU'))
         else:
             items.append(('cuda', 'warn', 'CUDAExecutionProvider unavailable; runtime will use CPU'))
 

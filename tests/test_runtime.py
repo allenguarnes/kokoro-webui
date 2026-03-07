@@ -19,6 +19,13 @@ class FakeSession:
         return list(self._providers)
 
 
+class FakeSessionOptions:
+    log_severity_level: int
+
+    def __init__(self) -> None:
+        self.log_severity_level = 0
+
+
 class FakeEngine:
     sess: FakeSession
 
@@ -52,6 +59,8 @@ class FakeOrt:
     available_providers: list[str]
     failures: dict[tuple[str, ...], RuntimeError]
     requests: list[list[str]]
+    session_options: list[FakeSessionOptions]
+    logger_severity: list[int]
 
     def __init__(
         self,
@@ -61,16 +70,27 @@ class FakeOrt:
         self.available_providers = list(available_providers)
         self.failures = failures or {}
         self.requests = []
+        self.session_options = []
+        self.logger_severity = []
 
     def get_available_providers(self) -> list[str]:
         return list(self.available_providers)
 
+    def set_default_logger_severity(self, severity: int) -> None:
+        self.logger_severity.append(severity)
+
+    def SessionOptions(self) -> FakeSessionOptions:
+        options = FakeSessionOptions()
+        self.session_options.append(options)
+        return options
+
     def InferenceSession(
         self,
         model_path: str,
+        sess_options: FakeSessionOptions | None = None,
         providers: list[str] | None = None,
     ) -> FakeSession:
-        _ = model_path
+        _ = (model_path, sess_options)
         resolved = list(providers or [])
         self.requests.append(resolved)
         failure = self.failures.get(tuple(resolved))
@@ -104,6 +124,8 @@ class RuntimeSelectionTests(unittest.TestCase):
             status = runtime.get_runtime_status()
 
         self.assertEqual(fake_ort.requests, [["CPUExecutionProvider"]])
+        self.assertEqual(fake_ort.logger_severity, [4])
+        self.assertEqual(fake_ort.session_options[0].log_severity_level, 4)
         self.assertEqual(status.requested_provider, "auto")
         self.assertEqual(status.active_providers, ["CPUExecutionProvider"])
         self.assertFalse(status.provider_fallback)

@@ -28,10 +28,12 @@ def _prepend_env_path(name: str, path: str) -> None:
     if not cleaned:
         return
 
-    current_parts = [part for part in os.environ.get(name, "").split(":") if part]
+    current_parts = [
+        part for part in os.environ.get(name, "").split(os.pathsep) if part
+    ]
     if cleaned in current_parts:
         return
-    os.environ[name] = ":".join([cleaned, *current_parts])
+    os.environ[name] = os.pathsep.join([cleaned, *current_parts])
 
 
 cuda_lib_dir = get_runtime_cuda_lib_dir()
@@ -55,12 +57,21 @@ class OnnxSession(Protocol):
     def get_providers(self) -> list[str]: ...
 
 
+class OnnxSessionOptions(Protocol):
+    log_severity_level: int
+
+
 class OnnxRuntimeModule(Protocol):
     def get_available_providers(self) -> list[str]: ...
+
+    def set_default_logger_severity(self, severity: int) -> None: ...
+
+    def SessionOptions(self) -> OnnxSessionOptions: ...
 
     def InferenceSession(
         self,
         model_path: str,
+        sess_options: OnnxSessionOptions | None = None,
         providers: list[str] | None = None,
     ) -> OnnxSession: ...
 
@@ -137,7 +148,14 @@ def _resolve_attempted_providers(
 def _create_runtime_from_session(providers: list[str]) -> KokoroEngineWithSession:
     onnx_runtime = _onnx_runtime()
     runtime_factory = _runtime_factory()
-    session = onnx_runtime.InferenceSession(str(MODEL_PATH), providers=providers)
+    onnx_runtime.set_default_logger_severity(4)
+    session_options = onnx_runtime.SessionOptions()
+    session_options.log_severity_level = 4
+    session = onnx_runtime.InferenceSession(
+        str(MODEL_PATH),
+        sess_options=session_options,
+        providers=providers,
+    )
     tts = runtime_factory.from_session(session, str(VOICES_PATH))
     return cast(KokoroEngineWithSession, tts)
 

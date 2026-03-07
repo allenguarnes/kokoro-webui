@@ -85,7 +85,7 @@ Preflight only:
 
 Open: `http://127.0.0.1:8000`
 
-`./scripts/run-server.sh` loads `.env`, prepends `KOKORO_CUDA_LIB_DIR` to `LD_LIBRARY_PATH` when set, prints a prerequisite preflight summary, and then starts the app.
+`./scripts/run-server.sh` is the Unix-like shell helper. It loads `.env`, prepends `KOKORO_CUDA_LIB_DIR` to `LD_LIBRARY_PATH` when set, prints a prerequisite preflight summary, and then starts the app.
 
 Useful flags:
 - `--quiet-checks`: start without printing the preflight summary
