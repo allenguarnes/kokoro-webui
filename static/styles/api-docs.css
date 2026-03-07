@@ -1,0 +1,202 @@
+.panel-api {
+    grid-column: 1 / -1;
+    position: relative;
+    z-index: 10;
+    padding: 0;
+    overflow: hidden;
+}
+
+.api-disclosure > summary {
+    list-style: none;
+    margin: 0;
+    padding: calc(0.92rem * var(--space-multiplier))
+        calc(1rem * var(--space-multiplier));
+    display: flex;
+    align-items: center;
+    gap: calc(0.65rem * var(--space-multiplier));
+    cursor: pointer;
+}
+
+.api-disclosure > summary::-webkit-details-marker {
+    display: none;
+}
+
+.api-disclosure > summary::after {
+    content: "";
+    width: 0.62rem;
+    height: 0.62rem;
+    margin-left: auto;
+    border-right: 2px solid var(--accent);
+    border-bottom: 2px solid var(--accent);
+    transform: rotate(45deg) translateY(-0.1rem);
+    transition: transform 140ms ease;
+}
+
+.api-disclosure[open] > summary::after {
+    transform: rotate(225deg) translateY(-0.02rem);
+}
+
+.api-disclosure[open] > summary {
+    border-bottom: 1px solid var(--line);
+}
+
+.api-disclosure > summary .mini {
+    text-transform: none;
+    letter-spacing: 0.02em;
+}
+
+.api-content {
+    padding: calc(0.85rem * var(--space-multiplier))
+        calc(1rem * var(--space-multiplier))
+        calc(1rem * var(--space-multiplier));
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: calc(0.7rem * var(--space-multiplier));
+}
+
+.api-block {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-md);
+    background: var(--surface-strong);
+    padding: calc(0.68rem * var(--space-multiplier));
+}
+
+.api-endpoints {
+    margin-top: calc(0.6rem * var(--space-multiplier));
+    display: grid;
+    gap: 0.34rem;
+}
+
+.api-endpoint {
+    width: 100%;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--ink);
+    box-shadow: none;
+    padding: 0.5rem 0.58rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.52rem;
+    text-align: left;
+    font-size: 0.82rem;
+}
+
+.api-endpoint code {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.62rem;
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 0.8rem;
+}
+
+.api-endpoint .api-method,
+.api-example-title .api-method {
+    display: inline-block;
+    width: 4.5ch;
+    color: var(--accent);
+}
+
+.api-endpoint .api-route,
+.api-example-title .api-route {
+    color: var(--ink);
+}
+
+.api-endpoint > span {
+    color: var(--ink-soft);
+    font-size: 0.76rem;
+    letter-spacing: 0.02em;
+    text-transform: none;
+}
+
+.api-endpoint:hover,
+.api-endpoint:focus-visible {
+    border-color: rgba(204, 86, 97, 0.42);
+    background: var(--accent-soft);
+    outline: none;
+    transform: none;
+}
+
+.api-endpoint.is-active {
+    border-color: rgba(204, 86, 97, 0.58);
+    background: var(--accent-soft);
+}
+
+.api-code {
+    grid-column: 1 / -1;
+}
+
+.api-code pre {
+    margin: calc(0.48rem * var(--space-multiplier)) 0 0;
+    border-radius: 11px;
+    border: 1px solid var(--line);
+    background: rgba(0, 0, 0, 0.22);
+    padding: calc(0.62rem * var(--space-multiplier))
+        calc(0.68rem * var(--space-multiplier));
+    overflow: auto;
+}
+
+:root[data-theme="light"] .api-code pre {
+    background: rgba(255, 255, 255, 0.55);
+}
+
+.api-code code {
+    display: block;
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    line-height: 1.45;
+}
+
+.api-block .mini {
+    margin: 0;
+    text-transform: none;
+    letter-spacing: 0.03em;
+    line-height: 1.4;
+}
+
+.api-example-title {
+    margin-top: 0.42rem;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.62rem;
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 0.8rem;
+}
+
+.api-docs-footer {
+    border-top: 1px solid var(--line);
+    padding: 0.66rem 1rem 0.72rem;
+}
+
+.api-doc-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    text-decoration: none;
+}
+
+.api-doc-icon {
+    width: 0.92rem;
+    height: 0.92rem;
+    flex: 0 0 auto;
+}
+
+.api-doc-link:hover,
+.api-doc-link:focus-visible {
+    text-decoration: underline;
+    outline: none;
+}
+
+.field {
+    display: grid;
+    gap: 0.42rem;
+}
+
+.field span,

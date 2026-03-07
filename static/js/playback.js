@@ -1,0 +1,336 @@
+import {
+  audioDuration,
+  chunkBar,
+  chunkProgress,
+  fileSize,
+  genTime,
+  pauseMsInput,
+  player,
+  speedInput,
+} from "./dom.js";
+import { appState } from "./state.js";
+import {
+  buildSynthesisPayload,
+  formatBytes,
+  formatDuration,
+  formatSignedSemitones,
+  formatWavRateLabel,
+  getPitchSemitones,
+  setStatus,
+} from "./ui.js";
+
+function decodeBase64ToBlob(base64Text, mimeType) {
+  const binary = atob(base64Text);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: mimeType });
+}
+
+function getInterChunkPauseMs(speed, pauseValue) {
+  if (pauseValue > 0) {
+    return pauseValue;
+  }
+  const pause = Math.round(260 / speed);
+  return Math.max(140, Math.min(420, pause));
+}
+
+export function resetPlaybackState() {
+  if (appState.chunkState?.queueWaiter) {
+    appState.chunkState.streamDone = true;
+    appState.chunkState.queueWaiter();
+    appState.chunkState.queueWaiter = null;
+  }
+  appState.playbackToken += 1;
+  appState.chunkState = null;
+  if (appState.streamAbortController) {
+    appState.streamAbortController.abort();
+    appState.streamAbortController = null;
+  }
+  if (appState.activeSocket) {
+    appState.activeSocket.close(1000, "reset");
+    appState.activeSocket = null;
+  }
+  if (appState.currentObjectUrl) {
+    URL.revokeObjectURL(appState.currentObjectUrl);
+    appState.currentObjectUrl = null;
+  }
+  player.pause();
+  player.currentTime = 0;
+  player.removeAttribute("src");
+  player.load();
+}
+
+export function handlePageExit() {
+  resetPlaybackState();
+}
+
+function waitForPlaybackEndOrAbort(token) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let frameId = null;
+
+    const onEnded = () => finish();
+
+    function finish() {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      player.removeEventListener("ended", onEnded);
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+      }
+      resolve();
+    }
+
+    function watchToken() {
+      if (token !== appState.playbackToken) {
+        finish();
+        return;
+      }
+      frameId = window.requestAnimationFrame(watchToken);
+    }
+
+    player.addEventListener("ended", onEnded, { once: true });
+    watchToken();
+  });
+}
+
+function notifyQueue(state) {
+  if (state.queueWaiter) {
+    state.queueWaiter();
+    state.queueWaiter = null;
+  }
+}
+
+async function waitForQueue(state, token) {
+  if (
+    token !== appState.playbackToken ||
+    state.queue.length ||
+    state.streamDone ||
+    state.streamError
+  ) {
+    return;
+  }
+  await new Promise((resolve) => {
+    state.queueWaiter = resolve;
+  });
+}
+
+export async function readStreamIntoQueue(state, token) {
+  appState.streamAbortController = new AbortController();
+  const response = await fetch("/api/speak-stream", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(buildSynthesisPayload()),
+    signal: appState.streamAbortController.signal,
+  });
+
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.detail || "Streaming synthesis failed.");
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error("Streaming reader is unavailable in this browser.");
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (token === appState.playbackToken) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.trim()) {
+        continue;
+      }
+      const message = JSON.parse(line);
+      if (message.type === "meta") {
+        state.totalChunks = message.total_chunks;
+        chunkProgress.textContent = `0 / ${state.totalChunks}`;
+        setStatus(
+          `Chunk plan ready with ${state.totalChunks} sentence-safe chunks${
+            message.pitch !== 0
+              ? ` at ${formatSignedSemitones(Number(message.pitch))}`
+              : ""
+          }.`,
+        );
+      } else if (message.type === "chunk") {
+        state.queue.push({
+          index: message.chunk_index,
+          totalChunks: message.total_chunks,
+          blob: decodeBase64ToBlob(message.audio_base64, message.mime_type),
+          bytes: message.bytes,
+          durationSec: message.duration_sec,
+          synthMs: message.synth_ms,
+          format: message.format,
+          opus_bitrate: message.opus_bitrate,
+          sample_rate: message.sample_rate,
+        });
+        notifyQueue(state);
+      } else if (message.type === "error") {
+        state.streamError = message.detail || "Streaming synthesis failed.";
+        notifyQueue(state);
+        return;
+      } else if (message.type === "done") {
+        state.streamDone = true;
+        notifyQueue(state);
+        return;
+      }
+    }
+  }
+
+  state.streamDone = true;
+  notifyQueue(state);
+}
+
+export function readWebSocketIntoQueue(state, token) {
+  return new Promise((resolve, reject) => {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${protocol}//${window.location.host}/ws/speak-stream`;
+    const socket = new WebSocket(wsUrl);
+    appState.activeSocket = socket;
+
+    socket.onopen = () => {
+      socket.send(JSON.stringify(buildSynthesisPayload()));
+    };
+
+    socket.onmessage = (event) => {
+      if (token !== appState.playbackToken || !appState.chunkState) {
+        return;
+      }
+      const message = JSON.parse(event.data);
+      if (message.type === "meta") {
+        state.totalChunks = message.total_chunks;
+        chunkProgress.textContent = `0 / ${state.totalChunks}`;
+        setStatus(
+          `Chunk plan ready with ${state.totalChunks} sentence-safe chunks${
+            message.pitch !== 0
+              ? ` at ${formatSignedSemitones(Number(message.pitch))}`
+              : ""
+          }.`,
+        );
+      } else if (message.type === "chunk") {
+        state.queue.push({
+          index: message.chunk_index,
+          totalChunks: message.total_chunks,
+          blob: decodeBase64ToBlob(message.audio_base64, message.mime_type),
+          bytes: message.bytes,
+          durationSec: message.duration_sec,
+          synthMs: message.synth_ms,
+          format: message.format,
+          opus_bitrate: message.opus_bitrate,
+          sample_rate: message.sample_rate,
+        });
+        notifyQueue(state);
+      } else if (message.type === "error") {
+        state.streamError = message.detail || "WebSocket streaming failed.";
+        notifyQueue(state);
+      } else if (message.type === "done") {
+        state.streamDone = true;
+        notifyQueue(state);
+      }
+    };
+
+    socket.onerror = () => {
+      reject(new Error("WebSocket transport failed."));
+    };
+
+    socket.onclose = () => {
+      if (token === appState.playbackToken && appState.chunkState && !state.streamDone) {
+        state.streamDone = true;
+        notifyQueue(state);
+      }
+      if (appState.activeSocket === socket) {
+        appState.activeSocket = null;
+      }
+      resolve();
+    };
+  });
+}
+
+export async function playQueueFromStream(state, token) {
+  while (token === appState.playbackToken) {
+    if (!state.queue.length) {
+      await waitForQueue(state, token);
+      if (token !== appState.playbackToken) {
+        return;
+      }
+    }
+
+    if (state.streamError) {
+      throw new Error(state.streamError);
+    }
+
+    if (!state.queue.length) {
+      if (state.streamDone) {
+        return;
+      }
+      continue;
+    }
+
+    const chunk = state.queue.shift();
+    state.playedChunks += 1;
+    state.totalElapsedMs += chunk.synthMs;
+    state.totalBytes += chunk.bytes;
+    state.totalDurationSec += chunk.durationSec;
+
+    chunkProgress.textContent = `${state.playedChunks} / ${chunk.totalChunks}`;
+    chunkBar.max = state.totalChunks || 1;
+    chunkBar.value = state.playedChunks;
+    genTime.textContent = `${state.totalElapsedMs.toFixed(0)} ms`;
+    fileSize.textContent = formatBytes(state.totalBytes);
+    audioDuration.textContent = formatDuration(state.totalDurationSec);
+
+    if (appState.currentObjectUrl) {
+      URL.revokeObjectURL(appState.currentObjectUrl);
+    }
+    appState.currentObjectUrl = URL.createObjectURL(chunk.blob);
+    player.src = appState.currentObjectUrl;
+
+    setStatus(
+      `Playing chunk ${chunk.index + 1} of ${chunk.totalChunks} as ${chunk.format.toUpperCase()}${
+        chunk.opus_bitrate
+          ? ` @ ${chunk.opus_bitrate}`
+          : formatWavRateLabel(chunk.sample_rate)
+      }${
+        getPitchSemitones() !== 0
+          ? ` at ${formatSignedSemitones(getPitchSemitones())}`
+          : ""
+      }`,
+    );
+
+    const endedPromise = waitForPlaybackEndOrAbort(token);
+    try {
+      await player.play();
+    } catch (error) {
+      if (token !== appState.playbackToken) {
+        return;
+      }
+      throw error;
+    }
+    await endedPromise;
+
+    if (state.playedChunks < chunk.totalChunks) {
+      const pauseMs = getInterChunkPauseMs(
+        Number(speedInput.value),
+        Number(pauseMsInput.value),
+      );
+      setStatus(`Queue pause ${pauseMs} ms before next chunk.`);
+      await new Promise((resolve) => window.setTimeout(resolve, pauseMs));
+    }
+  }
+}

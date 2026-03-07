@@ -98,6 +98,7 @@ The app auto-loads `.env` (if present).
 | `KOKORO_HOST` | `127.0.0.1` | Bind host |
 | `KOKORO_PORT` | `8000` | Bind port |
 | `KOKORO_RELOAD` | `0` | Development auto-reload |
+| `KOKORO_FFMPEG_TIMEOUT_SEC` | `20` | Timeout for ffmpeg/rubberband subprocess work |
 | `KOKORO_MODEL_PATH` | `models/kokoro-v1.0.onnx` | Override model path |
 | `KOKORO_VOICES_PATH` | `models/voices-v1.0.bin` | Override voices path |
 
@@ -107,6 +108,7 @@ Example `.env`:
 KOKORO_HOST=127.0.0.1
 KOKORO_PORT=8000
 KOKORO_RELOAD=0
+KOKORO_FFMPEG_TIMEOUT_SEC=20
 ```
 
 Development reload:
@@ -124,6 +126,13 @@ KOKORO_RELOAD=1 uv run python -m app.main
 
 ```bash
 KOKORO_RELOAD=1 uv run python -m app.main
+```
+
+- Run the integration tests:
+
+```bash
+uv sync --dev
+uv run python -m unittest tests.test_api
 ```
 
 - Validate runtime quickly:
