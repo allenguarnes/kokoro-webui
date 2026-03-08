@@ -13,6 +13,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+server = [
+    "uvicorn[standard]>=0.37.0",
+]
 gpu = [
     "onnxruntime-gpu>=1.24.3",
 ]

@@ -238,6 +238,7 @@ from __future__ import annotations
 
 import importlib.metadata as md
 import os
+import platform
 from pathlib import Path
 
 from app.config import get_runtime_provider_mode, get_synthesis_workers
@@ -255,6 +256,23 @@ for package_name in ('kokoro-onnx', 'onnxruntime', 'onnxruntime-gpu'):
     except md.PackageNotFoundError:
         level = 'warn' if package_name == 'onnxruntime-gpu' else 'error'
         items.append((package_name, level, 'not installed'))
+
+if platform.system() == 'Linux':
+    linux_stack: list[str] = []
+    missing_linux_stack: list[str] = []
+    for package_name in ('uvloop', 'httptools'):
+        try:
+            linux_stack.append(f'{package_name} {md.version(package_name)}')
+        except md.PackageNotFoundError:
+            missing_linux_stack.append(package_name)
+    if linux_stack:
+        items.append(('server-stack', 'ok', ', '.join(linux_stack)))
+    if missing_linux_stack:
+        items.append((
+            'server-stack',
+            'warn',
+            f"missing {', '.join(missing_linux_stack)}; install 'uv sync --extra server' for faster Linux event loop/parser",
+        ))
 
 model_path = Path(os.getenv('KOKORO_MODEL_PATH', root / 'models' / 'kokoro-v1.0.onnx'))
 voices_path = Path(os.getenv('KOKORO_VOICES_PATH', root / 'models' / 'voices-v1.0.bin'))

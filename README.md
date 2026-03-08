@@ -47,10 +47,22 @@ CPU-only baseline:
 uv sync
 ```
 
+Recommended Linux/server stack:
+
+```bash
+uv sync --extra server
+```
+
 Optional NVIDIA GPU runtime:
 
 ```bash
 uv sync --extra gpu
+```
+
+Linux + NVIDIA GPU:
+
+```bash
+uv sync --extra server --extra gpu
 ```
 
 ### 2) Add model files
@@ -113,6 +125,9 @@ Useful flags:
 - `onnxruntime-gpu`
   - Required for NVIDIA GPU acceleration
   - Without it, the app runs on CPU
+- `uvicorn[standard]` (`uvloop`, `httptools`, and related runtime helpers)
+  - Recommended on Linux for lower-overhead request/event-loop handling
+  - Without it, the app still works with the pure-Python/cross-platform stack
 
 > [!NOTE]
 > `pitch: 0.0` is a no-op and skips pitch-shift post-processing.
@@ -177,6 +192,8 @@ The app auto-loads `.env` (if present).
 | `KOKORO_CUDA_LIB_DIR` | unset | Optional. Use only when compatible CUDA libraries are installed outside the normal dynamic linker search paths |
 | `KOKORO_MODEL_PATH` | `models/kokoro-v1.0.onnx` | Override model path |
 | `KOKORO_VOICES_PATH` | `models/voices-v1.0.bin` | Override voices path |
+
+On Linux, `uv sync --extra server` installs `uvicorn[standard]`, which gives Uvicorn access to `uvloop` and `httptools` automatically. The app remains cross-platform because those packages are optional rather than required.
 
 Example `.env`:
 
