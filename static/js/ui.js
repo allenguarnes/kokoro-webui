@@ -373,7 +373,13 @@ export function updatePitchControlAvailability() {
 }
 
 export function buildExportFilename(format) {
-  return `kokoro-output.${format === "opus" ? "opus" : "wav"}`;
+  if (format === "opus") {
+    return "kokoro-output.opus";
+  }
+  if (format === "pcm") {
+    return "kokoro-output.pcm";
+  }
+  return "kokoro-output.wav";
 }
 
 export function populateVoices(voices) {
@@ -480,7 +486,14 @@ function qualityOptionText(value, isOpus) {
   return `${Number(value).toLocaleString()} Hz`;
 }
 
+function isSampleRateFormat(format) {
+  return format === "wav" || format === "pcm";
+}
+
 function formatOptionText(value) {
+  if (value === "pcm") {
+    return "PCM";
+  }
   return value === "opus" ? "Opus" : "WAV";
 }
 
@@ -509,6 +522,7 @@ function rebuildFormatOptions() {
 
 function rebuildFormatQualityOptions() {
   const isOpus = formatInput.value === "opus";
+  const isSampleRate = isSampleRateFormat(formatInput.value);
   const options = isOpus
     ? appState.availableOpusBitrates
     : appState.availableWavSampleRates;
@@ -516,7 +530,11 @@ function rebuildFormatQualityOptions() {
     ? appState.selectedOpusBitrate
     : appState.selectedWavSampleRate;
 
-  formatQualityLabel.textContent = isOpus ? "Opus Bitrate" : "WAV Sample Rate";
+  formatQualityLabel.textContent = isOpus
+    ? "Opus Bitrate"
+    : isSampleRate && formatInput.value === "pcm"
+      ? "PCM Sample Rate"
+      : "WAV Sample Rate";
   formatQualityInput.innerHTML = "";
   options.forEach((value) => {
     const option = document.createElement("option");

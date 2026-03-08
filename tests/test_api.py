@@ -27,15 +27,32 @@ def make_rendered_chunk(payload: SynthesisRequest, text: str) -> RenderedChunk:
     audio_bytes = f"{payload.voice}|{payload.pitch}|{payload.format}|{text}".encode(
         "utf-8"
     )
+    if payload.format == "opus":
+        media_type = "audio/ogg"
+        filename = "kokoro-output.ogg"
+    elif payload.format == "pcm":
+        media_type = "audio/pcm"
+        filename = "kokoro-output.pcm"
+    else:
+        media_type = "audio/wav"
+        filename = "kokoro-output.wav"
     return {
         "audio_bytes": audio_bytes,
-        "media_type": "audio/ogg" if payload.format == "opus" else "audio/wav",
-        "filename": "kokoro-output.ogg"
-        if payload.format == "opus"
-        else "kokoro-output.wav",
+        "media_type": media_type,
+        "filename": filename,
         "sample_rate": 24000,
         "duration_sec": 0.5,
     }
+
+
+def make_pcm_chunk(
+    payload: SynthesisRequest, text: str
+) -> tuple[np.ndarray, int, float]:
+    _ = payload
+    samples = np.full(len(text) + 4, 0.25, dtype=np.float32)
+    sample_rate = 24000
+    duration_sec = float(len(samples) / sample_rate)
+    return samples, sample_rate, duration_sec
 
 
 class ApiIntegrationTests(unittest.TestCase):
@@ -72,7 +89,9 @@ class ApiIntegrationTests(unittest.TestCase):
             )
         )
         _ = self.patch_stack.enter_context(
-            patch.object(config, "get_available_formats", return_value=["wav", "opus"])
+            patch.object(
+                config, "get_available_formats", return_value=["wav", "opus", "pcm"]
+            )
         )
         _ = self.patch_stack.enter_context(
             patch.object(config, "get_synthesis_workers", return_value=2)
@@ -279,6 +298,57 @@ class ApiIntegrationTests(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_openai_stream_respects_stream_capacity_limit(self) -> None:
+        request_payload = {
+            "model": "kokoro",
+            "input": "Hello from streamed openai.",
+            "voice": "af_heart",
+            "response_format": "wav",
+            "speed": 1.0,
+        }
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_pcm_chunk(
+            payload: SynthesisRequest, text: str
+        ) -> tuple[np.ndarray, int, float]:
+            _ = text
+            started.set()
+            _ = release.wait(timeout=2.0)
+            return make_pcm_chunk(payload, "chunk")
+
+        async def run_test() -> None:
+            with (
+                patch.object(config, "get_synthesis_workers", return_value=1),
+                patch.object(config, "get_synthesis_queue_limit", return_value=1),
+                patch.object(
+                    runtime, "split_text_into_chunks", return_value=["First chunk."]
+                ),
+                patch.object(
+                    audio, "synthesize_pcm_chunk", side_effect=blocking_pcm_chunk
+                ),
+            ):
+                test_app = api.create_app()
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    first_request = asyncio.create_task(
+                        client.post("/v1/audio/speech", json=request_payload)
+                    )
+                    while not started.is_set():
+                        await asyncio.sleep(0.01)
+                    overload_response = await client.post(
+                        "/v1/audio/speech", json=request_payload
+                    )
+                    self.assertEqual(overload_response.status_code, 503)
+                    release.set()
+                    first_response = await first_request
+                    self.assertEqual(first_response.status_code, 200)
+
+        asyncio.run(run_test())
+
     def test_native_speak_returns_audio_headers(self) -> None:
         request_payload = {
             "text": "Hello from test.",
@@ -295,6 +365,24 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(response.headers["x-audio-format"], "wav")
         self.assertEqual(response.headers["x-sample-rate"], "24000")
         self.assertEqual(response.content, b"af_heart|0.0|wav|Hello from test.")
+
+    def test_native_speak_supports_pcm(self) -> None:
+        request_payload = {
+            "text": "Hello from pcm.",
+            "voice": "af_heart",
+            "speed": 1.0,
+            "pitch": 0.0,
+            "lang": "en-us",
+            "format": "pcm",
+        }
+        with patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk):
+            response = self.get_client().post("/api/speak", json=request_payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "audio/pcm")
+        self.assertEqual(response.headers["x-audio-format"], "pcm")
+        self.assertEqual(response.headers["x-sample-rate"], "24000")
+        self.assertEqual(response.content, b"af_heart|0.0|pcm|Hello from pcm.")
 
     def test_native_speak_rejects_disabled_format(self) -> None:
         request_payload = {
@@ -354,6 +442,29 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "done")
         self.assertEqual(events[0]["total_chunks"], 2)
 
+    def test_native_stream_reports_pcm_sample_rate_metadata(self) -> None:
+        request_payload = {
+            "text": "Hello over ndjson stream.",
+            "voice": "af_heart",
+            "speed": 1.0,
+            "pitch": 0.0,
+            "lang": "en-us",
+            "format": "pcm",
+            "wav_sample_rate": "16000",
+            "target_chunk_chars": 120,
+        }
+        with patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk):
+            response = self.get_client().post("/api/speak-stream", json=request_payload)
+
+        events = cast(
+            list[dict[str, object]],
+            [json.loads(line) for line in response.text.splitlines() if line.strip()],
+        )
+        self.assertEqual(events[0]["format"], "pcm")
+        self.assertEqual(events[0]["wav_sample_rate"], "16000")
+        self.assertEqual(events[1]["mime_type"], "audio/pcm")
+        self.assertIsNone(events[1]["opus_bitrate"])
+
     def test_websocket_stream_returns_chunk_flow(self) -> None:
         request_payload = {
             "text": "Hello over websocket.",
@@ -381,9 +492,11 @@ class ApiIntegrationTests(unittest.TestCase):
     def test_openai_speech_accepts_voice_pitch_suffix(self) -> None:
         captured_requests: list[SynthesisRequest] = []
 
-        def capture_request(payload: SynthesisRequest, text: str) -> RenderedChunk:
+        def capture_request(
+            payload: SynthesisRequest, text: str
+        ) -> tuple[np.ndarray, int, float]:
             captured_requests.append(payload)
-            return make_rendered_chunk(payload, text)
+            return make_pcm_chunk(payload, text)
 
         request_payload = {
             "model": "kokoro",
@@ -392,7 +505,7 @@ class ApiIntegrationTests(unittest.TestCase):
             "response_format": "wav",
             "speed": 1.0,
         }
-        with patch.object(audio, "synthesize_chunk", side_effect=capture_request):
+        with patch.object(audio, "synthesize_pcm_chunk", side_effect=capture_request):
             response = self.get_client().post("/v1/audio/speech", json=request_payload)
 
         self.assertEqual(response.status_code, 200)
@@ -400,6 +513,7 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(len(captured_requests), 1)
         self.assertEqual(captured_requests[0].voice, "af_heart")
         self.assertEqual(captured_requests[0].pitch, 2.0)
+        self.assertTrue(response.content.startswith(b"RIFF"))
 
     def test_openai_speech_rejects_out_of_range_voice_pitch_suffix(self) -> None:
         request_payload = {
@@ -450,6 +564,56 @@ class ApiIntegrationTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["x-audio-format"], "opus")
+
+    def test_openai_speech_streams_wav_over_chunked_response(self) -> None:
+        request_payload = {
+            "model": "kokoro",
+            "input": "First sentence. Second sentence.",
+            "voice": "af_heart",
+            "response_format": "wav",
+            "speed": 1.0,
+        }
+
+        with (
+            patch.object(
+                runtime,
+                "split_text_into_chunks",
+                return_value=["First sentence.", "Second sentence."],
+            ),
+            patch.object(audio, "synthesize_pcm_chunk", side_effect=make_pcm_chunk),
+        ):
+            response = self.get_client().post("/v1/audio/speech", json=request_payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "audio/wav")
+        self.assertEqual(response.headers["x-audio-format"], "wav")
+        self.assertTrue(response.content.startswith(b"RIFF"))
+        self.assertGreater(len(response.content), 44)
+
+    def test_openai_speech_streams_pcm_without_wav_wrapper(self) -> None:
+        request_payload = {
+            "model": "kokoro",
+            "input": "First sentence. Second sentence.",
+            "voice": "af_heart",
+            "response_format": "pcm",
+            "speed": 1.0,
+        }
+
+        with (
+            patch.object(
+                runtime,
+                "split_text_into_chunks",
+                return_value=["First sentence.", "Second sentence."],
+            ),
+            patch.object(audio, "synthesize_pcm_chunk", side_effect=make_pcm_chunk),
+        ):
+            response = self.get_client().post("/v1/audio/speech", json=request_payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "audio/pcm")
+        self.assertEqual(response.headers["x-audio-format"], "pcm")
+        self.assertFalse(response.content.startswith(b"RIFF"))
+        self.assertGreater(len(response.content), 0)
 
     def test_encode_opus_timeout_maps_to_runtime_error(self) -> None:
         with (

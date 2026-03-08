@@ -91,8 +91,8 @@ class OpenAISpeechRequest(BaseModel):
         normalized = value.strip().lower()
         if not normalized:
             return allowed_formats[0]
-        if normalized not in {"wav", "opus"}:
-            raise ValueError("response_format must be one of: wav, opus.")
+        if normalized not in {"wav", "opus", "pcm"}:
+            raise ValueError("response_format must be one of: wav, opus, pcm.")
         if normalized not in allowed_formats:
             allowed = ", ".join(allowed_formats)
             raise ValueError(
@@ -128,8 +128,8 @@ class SynthesisRequest(BaseModel):
         normalized = value.strip().lower()
         if not normalized:
             return allowed_formats[0]
-        if normalized not in {"wav", "opus"}:
-            raise ValueError("format must be one of: wav, opus.")
+        if normalized not in {"wav", "opus", "pcm"}:
+            raise ValueError("format must be one of: wav, opus, pcm.")
         if normalized not in allowed_formats:
             allowed = ", ".join(allowed_formats)
             raise ValueError(

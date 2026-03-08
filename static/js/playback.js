@@ -19,13 +19,47 @@ import {
   setStatus,
 } from "./ui.js";
 
-function decodeBase64ToBlob(base64Text, mimeType) {
+function decodeBase64ToBytes(base64Text) {
   const binary = atob(base64Text);
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) {
     bytes[index] = binary.charCodeAt(index);
   }
-  return new Blob([bytes], { type: mimeType });
+  return bytes;
+}
+
+function createWavHeader(sampleRate, pcmByteLength) {
+  const buffer = new ArrayBuffer(44);
+  const view = new DataView(buffer);
+  const writeAscii = (offset, text) => {
+    for (let index = 0; index < text.length; index += 1) {
+      view.setUint8(offset + index, text.charCodeAt(index));
+    }
+  };
+  writeAscii(0, "RIFF");
+  view.setUint32(4, 36 + pcmByteLength, true);
+  writeAscii(8, "WAVE");
+  writeAscii(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(36, "data");
+  view.setUint32(40, pcmByteLength, true);
+  return buffer;
+}
+
+function createPlaybackBlob(chunkMeta, bytes) {
+  if (chunkMeta.format === "pcm") {
+    const sampleRate = Number(chunkMeta.sample_rate) || 24000;
+    return new Blob([createWavHeader(sampleRate, bytes.byteLength), bytes], {
+      type: "audio/wav",
+    });
+  }
+  return new Blob([bytes], { type: chunkMeta.mime_type });
 }
 
 function createQueueEntry(meta, blob) {
@@ -186,7 +220,10 @@ export async function readStreamIntoQueue(state, token) {
         state.queue.push(
           createQueueEntry(
             message,
-            decodeBase64ToBlob(message.audio_base64, message.mime_type),
+            createPlaybackBlob(
+              message,
+              decodeBase64ToBytes(message.audio_base64),
+            ),
           ),
         );
         notifyQueue(state);
@@ -256,10 +293,7 @@ export function readWebSocketIntoQueue(state, token) {
       const chunkMeta = state.pendingChunkMeta;
       state.pendingChunkMeta = null;
       state.queue.push(
-        createQueueEntry(
-          chunkMeta,
-          new Blob([event.data], { type: chunkMeta.mime_type }),
-        ),
+        createQueueEntry(chunkMeta, createPlaybackBlob(chunkMeta, event.data)),
       );
       notifyQueue(state);
     };

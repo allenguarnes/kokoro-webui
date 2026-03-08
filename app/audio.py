@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import shutil
+import struct
 import subprocess
 from collections.abc import Callable
 from functools import lru_cache
@@ -63,6 +64,37 @@ def encode_wav(samples: Float32Array, sample_rate: int) -> bytes:
     sf_write = cast(Callable[..., None], sf.write)
     sf_write(wav, samples, sample_rate, format="WAV")
     return wav.getvalue()
+
+
+def wav_stream_header(sample_rate: int) -> bytes:
+    channels = 1
+    bits_per_sample = 16
+    byte_rate = sample_rate * channels * (bits_per_sample // 8)
+    block_align = channels * (bits_per_sample // 8)
+    riff_chunk_size = 0xFFFFFFFF
+    data_chunk_size = 0xFFFFFFFF
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        riff_chunk_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        data_chunk_size,
+    )
+
+
+def pcm16_bytes(samples: Float32Array) -> bytes:
+    clipped = np.clip(np.asarray(samples, dtype=np.float32).reshape(-1), -1.0, 1.0)
+    pcm16 = np.round(clipped * 32767.0).astype(np.int16, copy=False)
+    return pcm16.tobytes()
 
 
 def encode_opus(samples: Float32Array, sample_rate: int, bitrate: str) -> bytes:
@@ -183,7 +215,9 @@ def pitch_shift_samples(
     return clipped.astype(np.float32, copy=False)
 
 
-def synthesize_chunk(payload: SynthesisRequest, text: str) -> RenderedChunk:
+def synthesize_pcm_chunk(
+    payload: SynthesisRequest, text: str
+) -> tuple[Float32Array, int, float]:
     tts = get_tts()
     samples, sample_rate = tts.create(
         text.strip(),
@@ -193,20 +227,31 @@ def synthesize_chunk(payload: SynthesisRequest, text: str) -> RenderedChunk:
     )
     samples = pitch_shift_samples(samples, sample_rate, payload.pitch)
 
+    if payload.format in {"wav", "pcm"} and payload.wav_sample_rate != "native":
+        target_rate = int(payload.wav_sample_rate)
+        samples = resample_linear(samples, sample_rate, target_rate)
+        sample_rate = target_rate
+
+    duration_sec = float(len(samples) / sample_rate) if sample_rate else 0.0
+    return samples, sample_rate, duration_sec
+
+
+def synthesize_chunk(payload: SynthesisRequest, text: str) -> RenderedChunk:
+    samples, sample_rate, duration_sec = synthesize_pcm_chunk(payload, text)
+
     if payload.format == "opus":
         audio_bytes = encode_opus(samples, sample_rate, payload.opus_bitrate)
         media_type = "audio/ogg"
         filename = "kokoro-output.ogg"
+    elif payload.format == "pcm":
+        audio_bytes = pcm16_bytes(samples)
+        media_type = "audio/pcm"
+        filename = "kokoro-output.pcm"
     else:
-        if payload.wav_sample_rate != "native":
-            target_rate = int(payload.wav_sample_rate)
-            samples = resample_linear(samples, sample_rate, target_rate)
-            sample_rate = target_rate
         audio_bytes = encode_wav(samples, sample_rate)
         media_type = "audio/wav"
         filename = "kokoro-output.wav"
 
-    duration_sec = float(len(samples) / sample_rate) if sample_rate else 0.0
     return {
         "audio_bytes": audio_bytes,
         "media_type": media_type,

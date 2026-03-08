@@ -52,7 +52,7 @@ These fields are shared across the native synthesis routes.
 | `speed` | number | no | Range: `0.5..1.8`, default `1.0` |
 | `pitch` | number | no | Range: `-6.0..6.0` semitones, default `0.0` |
 | `lang` | string | no | One of `en-us`, `en-gb`, `fr-fr`, `ja`, `ko`, `cmn` |
-| `format` | string | no | Server-enabled format such as `wav` or `opus`. If omitted, the server uses its first enabled format. |
+| `format` | string | no | Server-enabled format such as `pcm`, `wav`, or `opus`. If omitted, the server uses its first enabled format. |
 | `opus_bitrate` | string | no | One of `16k`, `24k`, `32k`, `48k` |
 | `wav_sample_rate` | string | no | One of `native`, `16000`, `22050`, `24000`, `44100`, `48000` |
 
@@ -61,7 +61,7 @@ Notes:
 - `pitch: 0.0` is a no-op and skips backend pitch-shift processing.
 - Pitch shifting depends on `ffmpeg` with the `rubberband` filter.
 - `opus_bitrate` matters only when `format` is `opus`.
-- `wav_sample_rate` matters only when `format` is `wav`.
+- `wav_sample_rate` matters when `format` is `wav` or `pcm`.
 - `/api/capabilities.formats` is the authoritative list of formats enabled on this server.
 
 ### `GET /api/health`
@@ -129,7 +129,7 @@ Returns the full runtime and configuration surface used by the Web UI.
   "model_path": "/abs/path/models/kokoro-v1.0.onnx",
   "voices_path": "/abs/path/models/voices-v1.0.bin",
   "voices": ["af_heart", "af_sarah"],
-  "formats": ["wav", "opus"],
+  "formats": ["wav", "opus", "pcm"],
   "opus_bitrates": ["16k", "24k", "32k", "48k"],
   "wav_sample_rates": ["native", "16000", "22050", "24000", "44100", "48000"],
   "requested_provider": "auto",
@@ -216,6 +216,7 @@ Generates one audio response.
 
 Returns audio bytes directly.
 
+- `audio/pcm` when `format` is `pcm`
 - `audio/wav` when `format` is `wav`
 - `audio/ogg` when `format` is `opus`
 
@@ -225,7 +226,7 @@ Returns audio bytes directly.
 | --- | --- |
 | `Content-Disposition` | Inline filename |
 | `X-Audio-Bytes` | Encoded audio byte length |
-| `X-Audio-Format` | `wav` or `opus` |
+| `X-Audio-Format` | `pcm`, `wav`, or `opus` |
 | `X-Sample-Rate` | Final sample rate |
 | `X-Audio-Duration` | Duration in seconds |
 | `X-Opus-Bitrate` | Populated for Opus responses |
@@ -486,7 +487,7 @@ OpenAI-compatible speech generation.
 | `model` | string | yes | Accepted for compatibility, currently ignored |
 | `input` | string | yes | `1..4096` chars |
 | `voice` | string or object | yes | String voice ID, optional suffixed form like `af_heart+2.0`, or object form like `{ "id": "af_heart-2.0" }` |
-| `response_format` | string | no | Server-enabled format such as `wav` or `opus`. If omitted, the server uses its first enabled format. |
+| `response_format` | string | no | Server-enabled format such as `pcm`, `wav`, or `opus`. If omitted, the server uses its first enabled format. |
 | `speed` | number | no | Accepted range `0.25..4.0`, but values outside `0.5..1.8` are rejected by the Kokoro adapter |
 | `instructions` | string or null | no | Accepted but currently unused |
 | `stream_format` | string or null | no | `sse` is not supported |
@@ -495,15 +496,18 @@ OpenAI-compatible speech generation.
 
 Returns audio bytes directly.
 
+- `audio/pcm` when `response_format` is `pcm`
 - `audio/wav` when `response_format` is `wav`
 - `audio/ogg` when `response_format` is `opus`
+
+For `wav` and `pcm`, the server writes the response progressively with HTTP chunked transfer encoding so clients can start playback before the full render finishes. That matches the common OpenAI `/v1/audio/speech` streaming pattern more closely. `opus` still returns after the full render is ready.
 
 ### Response Headers
 
 | Header | Meaning |
 | --- | --- |
 | `X-OpenAI-Compatible` | Always `kokoro` |
-| `X-Audio-Format` | `wav` or `opus` |
+| `X-Audio-Format` | `pcm`, `wav`, or `opus` |
 | `X-Sample-Rate` | Final sample rate |
 
 ### Error Response
@@ -584,6 +588,36 @@ curl -X POST http://127.0.0.1:8000/v1/audio/speech \
     "speed": 1.0
   }' \
   --output openai-output.wav
+```
+
+### OpenAI-Compatible Streaming WAV
+
+```bash
+curl http://127.0.0.1:8000/v1/audio/speech \
+  -H "Authorization: Bearer 1234" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "kokoro",
+    "input": "Good evening, and welcome. Tonight I want to speak about calm systems, patient work, and the quiet value of doing things well.",
+    "voice": "af_heart",
+    "response_format": "wav",
+    "speed": 1.0
+  }' | ffplay -i -
+```
+
+### OpenAI-Compatible Streaming PCM
+
+```bash
+curl http://127.0.0.1:8000/v1/audio/speech \
+  -H "Authorization: Bearer 1234" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "kokoro",
+    "input": "Good evening, and welcome. Tonight I want to speak about calm systems, patient work, and the quiet value of doing things well.",
+    "voice": "af_heart",
+    "response_format": "pcm",
+    "speed": 1.0
+  }' | ffplay -f s16le -ar 24000 -ch_layout mono -i -
 ```
 
 ### WebSocket Stream

@@ -37,7 +37,7 @@ Request flow:
 3. Optional post-processing is applied (`pitch`, `opus`).
 4. Audio is returned directly or streamed chunk-by-chunk.
 
-`wav` is the direct/native output path. `opus` is produced as a backend post-processing step through `ffmpeg`, similar to pitch shifting, so it adds extra work beyond base Kokoro synthesis.
+`pcm` is the closest thing to a native output path here: raw 16-bit PCM generated directly from synthesized samples with no container encoding. `wav` stays close to native, but adds a WAV container/header. `opus` is produced as a backend post-processing step through `ffmpeg`, similar to pitch shifting, so it adds extra work beyond base Kokoro synthesis.
 
 ## Quick Start
 
@@ -119,7 +119,7 @@ Optional, depending on features:
 - `ffmpeg`
   - Required for `opus` output
   - `opus` is not a native Kokoro output format here; it is encoded from synthesized PCM as a post-processing step
-  - Without it, `wav` still works
+  - Without it, `pcm` and `wav` still work
 - `ffmpeg` with `rubberband` filter
   - Required for non-zero pitch shifting
   - Without it, pitch control is unavailable
@@ -195,7 +195,7 @@ The app auto-loads `.env` (if present).
 | `KOKORO_PORT` | `8000` | Bind port |
 | `KOKORO_RELOAD` | `0` | Development auto-reload |
 | `KOKORO_FFMPEG_TIMEOUT_SEC` | `20` | Timeout for ffmpeg/rubberband subprocess work |
-| `KOKORO_FORMATS` | all supported formats | Optional comma-separated subset of enabled output formats, for example `wav` or `wav,opus` |
+| `KOKORO_FORMATS` | all supported formats | Optional comma-separated subset of enabled output formats, for example `wav`, `pcm`, or `wav,pcm,opus` |
 | `KOKORO_PROVIDER` | `auto` | Runtime selection: `auto`, `cpu`, or `cuda` |
 | `KOKORO_STRICT_PROVIDER` | `0` | Fail startup instead of falling back when requested provider cannot initialize |
 | `KOKORO_SYNTH_WORKERS` | `2` on CPU, `1` on auto/cuda | Cap concurrent synthesis jobs in the dedicated worker pool |
@@ -214,7 +214,7 @@ KOKORO_HOST=127.0.0.1
 KOKORO_PORT=8000
 KOKORO_RELOAD=0
 KOKORO_FFMPEG_TIMEOUT_SEC=20
-# KOKORO_FORMATS=wav,opus
+# KOKORO_FORMATS=wav,pcm,opus
 KOKORO_PROVIDER=auto
 KOKORO_STRICT_PROVIDER=0
 # Optional synthesis concurrency cap. Defaults to 2 on CPU, 1 on auto/cuda.
@@ -300,7 +300,7 @@ Full reference: [docs/API.md](docs/API.md)
 | --- | --- | --- |
 | `GET` | `/api/health` | Readiness and queue status |
 | `GET` | `/api/capabilities` | Voices, formats, runtime features, and synthesis limits |
-| `POST` | `/api/speak` | Single render (`wav` or `opus`) |
+| `POST` | `/api/speak` | Single render (`pcm`, `wav`, or `opus`) |
 | `POST` | `/api/chunk-plan` | Chunk metadata only |
 | `POST` | `/api/speak-stream` | NDJSON chunked streaming |
 | `WS` | `/ws/speak-stream` | WebSocket chunked streaming |

@@ -33,6 +33,7 @@ from app.schemas import (
 
 P = ParamSpec("P")
 T = TypeVar("T")
+_OPENAI_STREAM_TARGET_CHARS = 360
 
 
 def create_app() -> FastAPI:
@@ -142,6 +143,20 @@ def create_app() -> FastAPI:
             audio.synthesize_chunk, payload, text
         )
 
+    async def synthesize_pcm_chunk_async(
+        payload: SynthesisRequest, text: str
+    ) -> tuple[audio.Float32Array, int, float]:
+        return await run_interactive_synthesis_task(
+            audio.synthesize_pcm_chunk, payload, text
+        )
+
+    async def synthesize_pcm_stream_chunk_async(
+        payload: SynthesisRequest, text: str
+    ) -> tuple[audio.Float32Array, int, float]:
+        return await run_stream_synthesis_task(
+            audio.synthesize_pcm_chunk, payload, text
+        )
+
     @app.get("/")
     async def index() -> FileResponse:
         return FileResponse(config.STATIC_DIR / "index.html")
@@ -239,14 +254,82 @@ def create_app() -> FastAPI:
         return JSONResponse(openai_compat.openai_model_object())
 
     @app.post("/v1/audio/speech", include_in_schema=False, response_model=None)
-    async def openai_create_speech(payload: OpenAISpeechRequest) -> Response:
+    async def openai_create_speech(
+        payload: OpenAISpeechRequest, request: Request
+    ) -> Response:
         try:
             synth_request = openai_compat.build_openai_synthesis_request(payload)
-            rendered = await synthesize_chunk_async(synth_request, synth_request.text)
         except SynthesisOverloadedError as exc:
             return openai_compat.openai_error_response(503, str(exc))
         except ValueError as exc:
             return openai_compat.openai_error_response(400, str(exc))
+        except Exception as exc:
+            return openai_compat.openai_error_response(400, str(exc))
+
+        if synth_request.format in {"wav", "pcm"}:
+            chunks = runtime.split_text_into_chunks(
+                synth_request.text, _OPENAI_STREAM_TARGET_CHARS
+            )
+            if not chunks:
+                return openai_compat.openai_error_response(
+                    400, "Enter text before generating."
+                )
+
+            stream_sample_rate = (
+                int(synth_request.wav_sample_rate)
+                if synth_request.wav_sample_rate != "native"
+                else 24000
+            )
+            try:
+                (
+                    first_samples,
+                    first_sample_rate,
+                    _,
+                ) = await synthesize_pcm_stream_chunk_async(synth_request, chunks[0])
+            except SynthesisOverloadedError as exc:
+                return openai_compat.openai_error_response(503, str(exc))
+            except Exception as exc:
+                return openai_compat.openai_error_response(400, str(exc))
+
+            async def wav_stream() -> AsyncIterator[bytes]:
+                if synth_request.format == "wav":
+                    yield audio.wav_stream_header(first_sample_rate)
+                yield audio.pcm16_bytes(first_samples)
+
+                for chunk in chunks[1:]:
+                    if await request.is_disconnected():
+                        return
+                    try:
+                        (
+                            samples,
+                            _sample_rate,
+                            _,
+                        ) = await synthesize_pcm_stream_chunk_async(
+                            synth_request, chunk
+                        )
+                    except Exception:
+                        return
+                    if await request.is_disconnected():
+                        return
+                    yield audio.pcm16_bytes(samples)
+
+            headers = {
+                "X-OpenAI-Compatible": config.OPENAI_COMPAT_MODEL,
+                "X-Audio-Format": synth_request.format,
+                "X-Sample-Rate": str(stream_sample_rate),
+            }
+            return StreamingResponse(
+                wav_stream(),
+                media_type="audio/pcm"
+                if synth_request.format == "pcm"
+                else "audio/wav",
+                headers=headers,
+            )
+
+        try:
+            rendered = await synthesize_chunk_async(synth_request, synth_request.text)
+        except SynthesisOverloadedError as exc:
+            return openai_compat.openai_error_response(503, str(exc))
         except Exception as exc:
             return openai_compat.openai_error_response(400, str(exc))
 
@@ -335,7 +418,9 @@ def create_app() -> FastAPI:
                     payload.opus_bitrate if payload.format == "opus" else None
                 ),
                 "wav_sample_rate": (
-                    rendered["sample_rate"] if payload.format == "wav" else None
+                    rendered["sample_rate"]
+                    if payload.format in {"wav", "pcm"}
+                    else None
                 ),
                 "mime_type": rendered["media_type"],
             },
@@ -377,7 +462,7 @@ def create_app() -> FastAPI:
                         if payload.format == "opus"
                         else None,
                         "wav_sample_rate": payload.wav_sample_rate
-                        if payload.format == "wav"
+                        if payload.format in {"wav", "pcm"}
                         else None,
                         "pitch": payload.pitch,
                         "target_chunk_chars": payload.target_chunk_chars,
@@ -461,7 +546,7 @@ def create_app() -> FastAPI:
                         if payload.format == "opus"
                         else None,
                         "wav_sample_rate": payload.wav_sample_rate
-                        if payload.format == "wav"
+                        if payload.format in {"wav", "pcm"}
                         else None,
                         "pitch": payload.pitch,
                         "target_chunk_chars": payload.target_chunk_chars,

@@ -42,7 +42,7 @@ MODEL_PATH = Path(os.getenv("KOKORO_MODEL_PATH", MODELS_DIR / "kokoro-v1.0.onnx"
 VOICES_PATH = Path(os.getenv("KOKORO_VOICES_PATH", MODELS_DIR / "voices-v1.0.bin"))
 
 DEFAULT_VOICES = ["af_heart"]
-ALL_AUDIO_FORMATS: tuple[str, ...] = ("wav", "opus")
+ALL_AUDIO_FORMATS: tuple[str, ...] = ("wav", "opus", "pcm")
 OPUS_BITRATES: list[str] = ["16k", "24k", "32k", "48k"]
 WAV_SAMPLE_RATES: list[str] = ["native", "16000", "22050", "24000", "44100", "48000"]
 MAX_PITCH_SHIFT_SEMITONES = 6.0
