@@ -97,6 +97,7 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(metrics.active_jobs, 1)
             self.assertEqual(metrics.queued_jobs, 1)
             self.assertEqual(metrics.available_slots, 0)
+            self.assertEqual(metrics.queue_wait_samples, 1)
 
             with self.assertRaises(SynthesisOverloadedError):
                 _ = await scheduler.run(blocking_job, "third")
@@ -112,5 +113,8 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(final_metrics.admitted_jobs_total, 2)
             self.assertEqual(final_metrics.completed_jobs_total, 2)
             self.assertEqual(final_metrics.rejected_jobs_total, 1)
+            self.assertEqual(final_metrics.queue_wait_samples, 2)
+            self.assertGreater(final_metrics.queue_wait_max_ms, 0.0)
+            self.assertGreater(final_metrics.queue_wait_avg_ms, 0.0)
         finally:
             scheduler.shutdown()

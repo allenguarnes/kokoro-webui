@@ -220,6 +220,8 @@ KOKORO_STRICT_PROVIDER=0
 
 `KOKORO_SYNTH_QUEUE` controls how many additional synthesis jobs can wait behind the active workers before the server starts rejecting overload with `503`. That is useful once the app is serving multiple users instead of only local, single-user traffic.
 
+`/api/health` now also reports queue wait-time metrics so you can tell the difference between “idle,” “busy but healthy,” and “saturating with growing wait time.”
+
 The scheduler is now provider-aware at the policy level:
 - CPU mode allows a small shared-runtime worker pool
 - GPU-preferred modes still use a shared runtime/session model, so `workers > 1` should be treated as a benchmarked tuning scenario rather than a default recommendation
@@ -247,7 +249,7 @@ KOKORO_RELOAD=1 ./scripts/run-server.sh
 
 ```bash
 uv sync --dev
-uv run python -m unittest tests.test_api tests.test_runtime
+uv run python -m unittest tests.test_api tests.test_runtime tests.test_scheduler
 ```
 
 - Validate runtime quickly:
@@ -309,6 +311,14 @@ Then use `/api/capabilities` for:
 - `pitch_shifting`
 - `websocket_streaming`
 - `scheduler`
+
+Useful queue fields in `/api/health`:
+- `queue.queued_jobs`
+- `queue.available_slots`
+- `queue.rejected_jobs_total`
+- `queue.queue_wait_last_ms`
+- `queue.queue_wait_avg_ms`
+- `queue.queue_wait_max_ms`
 
 If synthesis fails, verify:
 1. Model files exist at expected paths

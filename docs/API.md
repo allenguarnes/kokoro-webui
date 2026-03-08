@@ -68,7 +68,11 @@ Returns lightweight readiness and queue status.
     "available_slots": 10,
     "admitted_jobs_total": 24,
     "completed_jobs_total": 24,
-    "rejected_jobs_total": 0
+    "rejected_jobs_total": 0,
+    "queue_wait_last_ms": 0.21,
+    "queue_wait_avg_ms": 0.11,
+    "queue_wait_max_ms": 1.48,
+    "queue_wait_samples": 24
   }
 }
 ```
@@ -82,7 +86,7 @@ Returns lightweight readiness and queue status.
 | `active_provider` | Currently active provider, if available |
 | `provider_fallback` | Whether runtime fell back from the requested provider |
 | `runtime_error` | Runtime bootstrap failure, if any |
-| `queue` | Current scheduler capacity and cumulative rejection counters |
+| `queue` | Current scheduler capacity, rejection counters, and queue-wait timing |
 
 ## `GET /api/capabilities`
 
@@ -113,6 +117,7 @@ Returns the richer runtime/configuration surface used by the Web UI.
     "requested_provider": "auto",
     "runtime_kind": "gpu",
     "execution_model": "shared-runtime",
+    "supported_execution_models": ["shared-runtime", "session-pool"],
     "worker_limit": 2,
     "queue_limit": 8,
     "prefers_serial_workers": true,
@@ -133,7 +138,11 @@ Returns the richer runtime/configuration surface used by the Web UI.
     "available_slots": 10,
     "admitted_jobs_total": 24,
     "completed_jobs_total": 24,
-    "rejected_jobs_total": 0
+    "rejected_jobs_total": 0,
+    "queue_wait_last_ms": 0.21,
+    "queue_wait_avg_ms": 0.11,
+    "queue_wait_max_ms": 1.48,
+    "queue_wait_samples": 24
   }
 }
 ```
@@ -148,6 +157,7 @@ Returns the richer runtime/configuration surface used by the Web UI.
 | `synthesis_workers` | Number of active synthesis worker threads |
 | `synthesis_queue_limit` | Number of queued jobs allowed behind active workers |
 | `scheduler` | Provider-aware scheduling policy used by the backend |
+| `queue.queue_wait_*` | Recent and cumulative wait-time indicators for admitted jobs |
 
 ## `POST /api/speak`
 

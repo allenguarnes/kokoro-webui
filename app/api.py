@@ -73,7 +73,7 @@ def create_app() -> FastAPI:
     )
     app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
 
-    def queue_payload() -> dict[str, int]:
+    def queue_payload() -> dict[str, int | float]:
         metrics = synthesis_scheduler.snapshot()
         return {
             "worker_limit": metrics.worker_limit,
@@ -86,6 +86,10 @@ def create_app() -> FastAPI:
             "admitted_jobs_total": metrics.admitted_jobs_total,
             "completed_jobs_total": metrics.completed_jobs_total,
             "rejected_jobs_total": metrics.rejected_jobs_total,
+            "queue_wait_last_ms": metrics.queue_wait_last_ms,
+            "queue_wait_avg_ms": metrics.queue_wait_avg_ms,
+            "queue_wait_max_ms": metrics.queue_wait_max_ms,
+            "queue_wait_samples": metrics.queue_wait_samples,
         }
 
     def scheduler_payload() -> dict[str, object]:
@@ -93,6 +97,7 @@ def create_app() -> FastAPI:
             "requested_provider": scheduler_policy.requested_provider,
             "runtime_kind": scheduler_policy.runtime_kind,
             "execution_model": scheduler_policy.execution_model,
+            "supported_execution_models": ["shared-runtime", "session-pool"],
             "worker_limit": scheduler_policy.worker_limit,
             "queue_limit": scheduler_policy.queue_limit,
             "prefers_serial_workers": scheduler_policy.prefers_serial_workers,

@@ -113,6 +113,10 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(worker_limit, 1)
         self.assertGreaterEqual(queue_limit, 0)
         self.assertEqual(capacity_limit, worker_limit + queue_limit)
+        self.assertIn("queue_wait_last_ms", queue)
+        self.assertIn("queue_wait_avg_ms", queue)
+        self.assertIn("queue_wait_max_ms", queue)
+        self.assertIn("queue_wait_samples", queue)
 
     def test_capabilities_reports_runtime_and_formats(self) -> None:
         fake_status = RuntimeStatus(
@@ -154,6 +158,10 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(scheduler["execution_model"], "shared-runtime")
         self.assertIn(scheduler["runtime_kind"], {"cpu", "gpu"})
         self.assertIsInstance(scheduler["concurrency_note"], str)
+        self.assertEqual(
+            scheduler["supported_execution_models"],
+            ["shared-runtime", "session-pool"],
+        )
 
     def test_health_reports_runtime_error_as_not_ready(self) -> None:
         fake_status = RuntimeStatus(
