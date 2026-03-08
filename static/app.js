@@ -31,7 +31,8 @@ import {
 } from "./js/ui.js";
 
 speedInput.addEventListener("input", () => {
-  document.getElementById("speedValue").textContent = `${Number(speedInput.value).toFixed(2)}x`;
+  document.getElementById("speedValue").textContent =
+    `${Number(speedInput.value).toFixed(2)}x`;
 });
 
 pitchInput.addEventListener("input", () => {
