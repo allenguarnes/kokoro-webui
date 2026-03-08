@@ -25,6 +25,9 @@ This server exposes two API groups:
 - [`GET /v1/models`](#get-v1models)
 - [`GET /v1/models/{model_id}`](#get-v1modelsmodel_id)
 - [`POST /v1/audio/speech`](#post-v1audiospeech)
+
+### Examples
+
 - [Curl Examples](#curl-examples)
 
 ## Native Endpoints
@@ -61,7 +64,7 @@ Notes:
 - `wav_sample_rate` matters only when `format` is `wav`.
 - `/api/capabilities.formats` is the authoritative list of formats enabled on this server.
 
-## `GET /api/health`
+### `GET /api/health`
 
 Returns lightweight readiness and queue status.
 
@@ -115,7 +118,7 @@ Returns lightweight readiness and queue status.
 | `gpu` | Per-process GPU memory for the current server process when NVML is available and the runtime is using a GPU provider |
 | `queue` | Current scheduler capacity, rejection counters, and queue-wait timing |
 
-## `GET /api/capabilities`
+### `GET /api/capabilities`
 
 Returns the full runtime and configuration surface used by the Web UI.
 
@@ -191,7 +194,7 @@ Returns the full runtime and configuration surface used by the Web UI.
 | `scheduler` | Provider-aware scheduling policy currently used by the backend |
 | `queue.queue_wait_*` | Recent and cumulative wait-time indicators for admitted jobs |
 
-## `POST /api/speak`
+### `POST /api/speak`
 
 Generates one audio response.
 
@@ -238,7 +241,7 @@ Status: `400`
 }
 ```
 
-## `POST /api/chunk-plan`
+### `POST /api/chunk-plan`
 
 Returns how the server would split text before synthesis.
 
@@ -280,7 +283,7 @@ Returns how the server would split text before synthesis.
 
 If `include_text` is `true`, each chunk object also includes `text`.
 
-## `POST /api/speak-stream`
+### `POST /api/speak-stream`
 
 Streams chunked synthesis over NDJSON.
 
@@ -367,7 +370,7 @@ Each line is one JSON object with a `type`.
 }
 ```
 
-## `WS /ws/speak-stream`
+### `WS /ws/speak-stream`
 
 Streams the same message types as `/api/speak-stream`, but over WebSocket.
 
@@ -410,7 +413,7 @@ That is usually the correct setting for external integrations. If you point thos
 | `GET` | `/v1/models/{model_id}` | OpenAI-compatible model metadata |
 | `POST` | `/v1/audio/speech` | OpenAI-compatible speech generation |
 
-## `GET /v1/models`
+### `GET /v1/models`
 
 OpenAI-compatible model list.
 
@@ -430,7 +433,7 @@ OpenAI-compatible model list.
 }
 ```
 
-## `GET /v1/models/{model_id}`
+### `GET /v1/models/{model_id}`
 
 Returns metadata for `kokoro`.
 
@@ -460,7 +463,7 @@ Status: `404`
 }
 ```
 
-## `POST /v1/audio/speech`
+### `POST /v1/audio/speech`
 
 OpenAI-compatible speech generation.
 
@@ -566,4 +569,36 @@ curl -N -X POST http://127.0.0.1:8000/api/speak-stream \
     "opus_bitrate": "32k",
     "target_chunk_chars": 120
   }'
+```
+
+### OpenAI-Compatible Speech
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "kokoro",
+    "input": "This request uses the OpenAI-compatible endpoint.",
+    "voice": "af_heart+1.5",
+    "response_format": "wav",
+    "speed": 1.0
+  }' \
+  --output openai-output.wav
+```
+
+### WebSocket Stream
+
+This example uses [`websocat`](https://github.com/vi/websocat).
+
+```bash
+printf '%s\n' '{
+  "text": "First sentence. Second sentence. Third sentence.",
+  "voice": "af_heart",
+  "speed": 1.0,
+  "pitch": 0.0,
+  "lang": "en-us",
+  "format": "wav",
+  "wav_sample_rate": "native",
+  "target_chunk_chars": 120
+}' | websocat ws://127.0.0.1:8000/ws/speak-stream
 ```
