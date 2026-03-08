@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Literal, Protocol, TypedDict
+from typing import ClassVar, Literal, Protocol, TypedDict
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.config import MAX_PITCH_SHIFT_SEMITONES
+from app import config
 
 
 class RenderedChunk(TypedDict):
@@ -70,30 +70,72 @@ class OpenAIVoiceRef(BaseModel):
 
 
 class OpenAISpeechRequest(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(validate_default=True)
+
     model: str = Field(min_length=1, max_length=128)
     input: str = Field(min_length=1, max_length=4096)
     voice: str | OpenAIVoiceRef
-    response_format: Literal["wav", "opus"] = "wav"
+    response_format: str = Field(
+        default_factory=lambda: config.get_available_formats()[0]
+    )
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
     instructions: str | None = Field(default=None, max_length=4096)
     stream_format: Literal["audio", "sse"] | None = None
 
+    @field_validator("response_format", mode="before")
+    @classmethod
+    def validate_response_format(cls, value: object) -> str:
+        allowed_formats = config.get_available_formats()
+        if not isinstance(value, str):
+            raise TypeError("response_format must be a string.")
+        normalized = value.strip().lower()
+        if not normalized:
+            return allowed_formats[0]
+        if normalized not in {"wav", "opus"}:
+            raise ValueError("response_format must be one of: wav, opus.")
+        if normalized not in allowed_formats:
+            allowed = ", ".join(allowed_formats)
+            raise ValueError(
+                f"response_format {normalized!r} is not enabled on this server. Allowed formats: {allowed}."
+            )
+        return normalized
+
 
 class SynthesisRequest(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(validate_default=True)
+
     text: str = Field(min_length=1, max_length=2500)
     voice: str = Field(default="af_heart", min_length=1, max_length=64)
     speed: float = Field(default=1.0, ge=0.5, le=1.8)
     pitch: float = Field(
         default=0.0,
-        ge=-MAX_PITCH_SHIFT_SEMITONES,
-        le=MAX_PITCH_SHIFT_SEMITONES,
+        ge=-config.MAX_PITCH_SHIFT_SEMITONES,
+        le=config.MAX_PITCH_SHIFT_SEMITONES,
     )
     lang: Literal["en-us", "en-gb", "fr-fr", "ja", "ko", "cmn"] = "en-us"
-    format: Literal["wav", "opus"] = "wav"
+    format: str = Field(default_factory=lambda: config.get_available_formats()[0])
     opus_bitrate: Literal["16k", "24k", "32k", "48k"] = "32k"
     wav_sample_rate: Literal["native", "16000", "22050", "24000", "44100", "48000"] = (
         "native"
     )
+
+    @field_validator("format", mode="before")
+    @classmethod
+    def validate_format(cls, value: object) -> str:
+        allowed_formats = config.get_available_formats()
+        if not isinstance(value, str):
+            raise TypeError("format must be a string.")
+        normalized = value.strip().lower()
+        if not normalized:
+            return allowed_formats[0]
+        if normalized not in {"wav", "opus"}:
+            raise ValueError("format must be one of: wav, opus.")
+        if normalized not in allowed_formats:
+            allowed = ", ".join(allowed_formats)
+            raise ValueError(
+                f"format {normalized!r} is not enabled on this server. Allowed formats: {allowed}."
+            )
+        return normalized
 
 
 class ChunkedSynthesisRequest(SynthesisRequest):

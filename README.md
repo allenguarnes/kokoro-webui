@@ -37,6 +37,8 @@ Request flow:
 3. Optional post-processing is applied (`pitch`, `opus`).
 4. Audio is returned directly or streamed chunk-by-chunk.
 
+`wav` is the direct/native output path. `opus` is produced as a backend post-processing step through `ffmpeg`, similar to pitch shifting, so it adds extra work beyond base Kokoro synthesis.
+
 ## Quick Start
 
 This is the shortest path to a working local install.
@@ -116,6 +118,7 @@ Optional, depending on features:
 
 - `ffmpeg`
   - Required for `opus` output
+  - `opus` is not a native Kokoro output format here; it is encoded from synthesized PCM as a post-processing step
   - Without it, `wav` still works
 - `ffmpeg` with `rubberband` filter
   - Required for non-zero pitch shifting
@@ -187,6 +190,7 @@ The app auto-loads `.env` (if present).
 | `KOKORO_PORT` | `8000` | Bind port |
 | `KOKORO_RELOAD` | `0` | Development auto-reload |
 | `KOKORO_FFMPEG_TIMEOUT_SEC` | `20` | Timeout for ffmpeg/rubberband subprocess work |
+| `KOKORO_FORMATS` | all supported formats | Optional comma-separated subset of enabled output formats, for example `wav` or `wav,opus` |
 | `KOKORO_PROVIDER` | `auto` | Runtime selection: `auto`, `cpu`, or `cuda` |
 | `KOKORO_STRICT_PROVIDER` | `0` | Fail startup instead of falling back when requested provider cannot initialize |
 | `KOKORO_SYNTH_WORKERS` | `2` on CPU, `1` on auto/cuda | Cap concurrent synthesis jobs in the dedicated worker pool |
@@ -205,6 +209,7 @@ KOKORO_HOST=127.0.0.1
 KOKORO_PORT=8000
 KOKORO_RELOAD=0
 KOKORO_FFMPEG_TIMEOUT_SEC=20
+# KOKORO_FORMATS=wav,opus
 KOKORO_PROVIDER=auto
 KOKORO_STRICT_PROVIDER=0
 # Optional synthesis concurrency cap. Defaults to 2 on CPU, 1 on auto/cuda.
@@ -222,6 +227,8 @@ KOKORO_STRICT_PROVIDER=0
 `KOKORO_SYNTH_QUEUE` controls how many additional synthesis jobs can wait behind the active workers before the server starts rejecting overload with `503`. That is useful once the app is serving multiple users instead of only local, single-user traffic.
 
 `/api/health` also reports queue wait-time metrics so you can tell the difference between idle, busy, and saturated behavior.
+
+If `KOKORO_FORMATS` is narrowed to a single value, the Web UI locks the format control to that server-configured format.
 
 The scheduler is now provider-aware at the policy level:
 - CPU mode allows a small shared-runtime worker pool

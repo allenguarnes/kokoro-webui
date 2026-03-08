@@ -38,6 +38,15 @@ export async function loadHealth() {
     const capabilities = await capabilitiesResponse.json();
     populateVoices(capabilities.voices || []);
     if (
+      Array.isArray(capabilities.formats) &&
+      capabilities.formats.length > 0
+    ) {
+      appState.availableFormats = capabilities.formats;
+      if (!appState.availableFormats.includes(appState.selectedFormat)) {
+        appState.selectedFormat = appState.availableFormats[0];
+      }
+    }
+    if (
       Array.isArray(capabilities.opus_bitrates) &&
       capabilities.opus_bitrates.length > 0
     ) {

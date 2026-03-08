@@ -42,6 +42,7 @@ MODEL_PATH = Path(os.getenv("KOKORO_MODEL_PATH", MODELS_DIR / "kokoro-v1.0.onnx"
 VOICES_PATH = Path(os.getenv("KOKORO_VOICES_PATH", MODELS_DIR / "voices-v1.0.bin"))
 
 DEFAULT_VOICES = ["af_heart"]
+ALL_AUDIO_FORMATS: tuple[str, ...] = ("wav", "opus")
 OPUS_BITRATES: list[str] = ["16k", "24k", "32k", "48k"]
 WAV_SAMPLE_RATES: list[str] = ["native", "16000", "22050", "24000", "44100", "48000"]
 MAX_PITCH_SHIFT_SEMITONES = 6.0
@@ -122,6 +123,36 @@ def get_synthesis_queue_limit(*, default: int) -> int:
     if limit < 0:
         raise RuntimeError(f"KOKORO_SYNTH_QUEUE must be 0 or greater, got {limit}.")
     return limit
+
+
+def get_available_formats() -> list[str]:
+    raw_formats = os.getenv("KOKORO_FORMATS")
+    if raw_formats is None or not raw_formats.strip():
+        return list(ALL_AUDIO_FORMATS)
+
+    parsed_formats: list[str] = []
+    invalid_formats: list[str] = []
+    for token in raw_formats.split(","):
+        value = token.strip().lower()
+        if not value:
+            continue
+        if value not in ALL_AUDIO_FORMATS:
+            invalid_formats.append(value)
+            continue
+        if value not in parsed_formats:
+            parsed_formats.append(value)
+
+    if invalid_formats:
+        allowed = ", ".join(ALL_AUDIO_FORMATS)
+        invalid = ", ".join(invalid_formats)
+        raise RuntimeError(
+            f"KOKORO_FORMATS contains unsupported values: {invalid}. Allowed values: {allowed}."
+        )
+    if not parsed_formats:
+        raise RuntimeError(
+            "KOKORO_FORMATS must include at least one supported format when set."
+        )
+    return parsed_formats
 
 
 def get_allow_experimental_cuda_concurrency() -> bool:

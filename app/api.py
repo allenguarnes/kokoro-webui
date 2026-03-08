@@ -181,12 +181,13 @@ def create_app() -> FastAPI:
     @app.get("/api/capabilities")
     async def capabilities() -> JSONResponse:
         runtime_status = runtime.get_runtime_status()
+        available_formats = config.get_available_formats()
         return JSONResponse(
             {
                 "model_path": str(config.MODEL_PATH),
                 "voices_path": str(config.VOICES_PATH),
                 "voices": runtime.load_voice_names(),
-                "formats": ["wav", "opus"],
+                "formats": available_formats,
                 "opus_bitrates": config.OPUS_BITRATES,
                 "wav_sample_rates": config.WAV_SAMPLE_RATES,
                 "requested_provider": runtime_status.requested_provider,
@@ -268,9 +269,9 @@ def create_app() -> FastAPI:
             "X-Sample-Rate": str(rendered["sample_rate"]),
             "X-Audio-Duration": f"{rendered['duration_sec']:.6f}",
             "X-Opus-Bitrate": payload.opus_bitrate if payload.format == "opus" else "",
-            "X-Wav-Sample-Rate": str(rendered["sample_rate"])
-            if payload.format == "wav"
-            else "",
+            "X-Wav-Sample-Rate": (
+                str(rendered["sample_rate"]) if payload.format == "wav" else ""
+            ),
         }
         return StreamingResponse(
             io.BytesIO(rendered["audio_bytes"]),

@@ -168,6 +168,14 @@ class ApiIntegrationTests(unittest.TestCase):
             ["session-pool"],
         )
 
+    def test_capabilities_reports_configured_formats(self) -> None:
+        with patch.object(config, "get_available_formats", return_value=["wav"]):
+            response = self.get_client().get("/api/capabilities")
+
+        self.assertEqual(response.status_code, 200)
+        payload = cast(dict[str, object], response.json())
+        self.assertEqual(payload["formats"], ["wav"])
+
     def test_health_reports_runtime_error_as_not_ready(self) -> None:
         fake_status = RuntimeStatus(
             requested_provider="cuda",
@@ -253,6 +261,39 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(response.headers["x-audio-format"], "wav")
         self.assertEqual(response.headers["x-sample-rate"], "24000")
         self.assertEqual(response.content, b"af_heart|0.0|wav|Hello from test.")
+
+    def test_native_speak_rejects_disabled_format(self) -> None:
+        request_payload = {
+            "text": "Hello from test.",
+            "voice": "af_heart",
+            "speed": 1.0,
+            "pitch": 0.0,
+            "lang": "en-us",
+            "format": "opus",
+        }
+        with patch.object(config, "get_available_formats", return_value=["wav"]):
+            response = self.get_client().post("/api/speak", json=request_payload)
+
+        self.assertEqual(response.status_code, 422)
+        payload = cast(dict[str, object], response.json())
+        self.assertIn("not enabled on this server", json.dumps(payload))
+
+    def test_native_speak_defaults_to_first_enabled_format(self) -> None:
+        request_payload = {
+            "text": "Hello from test.",
+            "voice": "af_heart",
+            "speed": 1.0,
+            "pitch": 0.0,
+            "lang": "en-us",
+        }
+        with (
+            patch.object(config, "get_available_formats", return_value=["opus"]),
+            patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk),
+        ):
+            response = self.get_client().post("/api/speak", json=request_payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["x-audio-format"], "opus")
 
     def test_native_stream_returns_meta_chunk_and_done_events(self) -> None:
         text = f"{'A' * 70}. {'B' * 70}."
@@ -342,6 +383,39 @@ class ApiIntegrationTests(unittest.TestCase):
         error = cast(dict[str, object], payload["error"])
         message = cast(str, error["message"])
         self.assertIn("voice pitch suffix must be between", message)
+
+    def test_openai_speech_rejects_disabled_response_format(self) -> None:
+        request_payload = {
+            "model": "kokoro",
+            "input": "OpenAI compatible request.",
+            "voice": "af_heart",
+            "response_format": "opus",
+            "speed": 1.0,
+        }
+
+        with patch.object(config, "get_available_formats", return_value=["wav"]):
+            response = self.get_client().post("/v1/audio/speech", json=request_payload)
+
+        self.assertEqual(response.status_code, 422)
+        payload = cast(dict[str, object], response.json())
+        self.assertIn("not enabled on this server", json.dumps(payload))
+
+    def test_openai_speech_defaults_to_first_enabled_response_format(self) -> None:
+        request_payload = {
+            "model": "kokoro",
+            "input": "OpenAI compatible request.",
+            "voice": "af_heart",
+            "speed": 1.0,
+        }
+
+        with (
+            patch.object(config, "get_available_formats", return_value=["opus"]),
+            patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk),
+        ):
+            response = self.get_client().post("/v1/audio/speech", json=request_payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["x-audio-format"], "opus")
 
     def test_encode_opus_timeout_maps_to_runtime_error(self) -> None:
         with (

@@ -452,6 +452,33 @@ function qualityOptionText(value, isOpus) {
   return `${Number(value).toLocaleString()} Hz`;
 }
 
+function formatOptionText(value) {
+  return value === "opus" ? "Opus" : "WAV";
+}
+
+function rebuildFormatOptions() {
+  const options = appState.availableFormats;
+  const currentValue = formatInput.value;
+  const preferredValue = options.includes(currentValue)
+    ? currentValue
+    : options.includes(appState.selectedFormat)
+      ? appState.selectedFormat
+      : options[0];
+
+  formatInput.innerHTML = "";
+  options.forEach((value) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = formatOptionText(value);
+    formatInput.appendChild(option);
+  });
+
+  formatInput.value = preferredValue;
+  appState.selectedFormat = formatInput.value;
+  formatInput.disabled = options.length === 1;
+  refreshCustomSelect(formatInput);
+}
+
 function rebuildFormatQualityOptions() {
   const isOpus = formatInput.value === "opus";
   const options = isOpus
@@ -494,6 +521,7 @@ export function updatePauseLabel() {
 }
 
 export function updateFormatControlState() {
+  rebuildFormatOptions();
   rebuildFormatQualityOptions();
 }
 

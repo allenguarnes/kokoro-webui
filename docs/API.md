@@ -32,7 +32,7 @@ These fields are shared across the native synthesis routes.
 | `speed` | number | no | Range: `0.5..1.8`, default `1.0` |
 | `pitch` | number | no | Range: `-6.0..6.0` semitones, default `0.0` |
 | `lang` | string | no | One of `en-us`, `en-gb`, `fr-fr`, `ja`, `ko`, `cmn` |
-| `format` | string | no | `wav` or `opus`, default `wav` |
+| `format` | string | no | Server-enabled format such as `wav` or `opus`. If omitted, the server uses its first enabled format. |
 | `opus_bitrate` | string | no | One of `16k`, `24k`, `32k`, `48k` |
 | `wav_sample_rate` | string | no | One of `native`, `16000`, `22050`, `24000`, `44100`, `48000` |
 
@@ -42,6 +42,7 @@ Notes:
 - Pitch shifting depends on `ffmpeg` with the `rubberband` filter.
 - `opus_bitrate` matters only when `format` is `opus`.
 - `wav_sample_rate` matters only when `format` is `wav`.
+- `/api/capabilities.formats` is the authoritative list of formats enabled on this server.
 
 ## `GET /api/health`
 
@@ -442,7 +443,7 @@ OpenAI-compatible speech generation.
 | `model` | string | yes | Accepted for compatibility, currently ignored |
 | `input` | string | yes | `1..4096` chars |
 | `voice` | string or object | yes | String voice ID, optional suffixed form like `af_heart+2.0`, or object form like `{ "id": "af_heart-2.0" }` |
-| `response_format` | string | no | `wav` or `opus`, default `wav` |
+| `response_format` | string | no | Server-enabled format such as `wav` or `opus`. If omitted, the server uses its first enabled format. |
 | `speed` | number | no | Accepted range `0.25..4.0`, but values outside `0.5..1.8` are rejected by the Kokoro adapter |
 | `instructions` | string or null | no | Accepted but currently unused |
 | `stream_format` | string or null | no | `sse` is not supported |

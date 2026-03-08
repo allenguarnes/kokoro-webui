@@ -7,6 +7,8 @@ export const appState = {
   currentTheme: "dark",
   customSelectRegistry: new Map(),
   lastExportRequest: null,
+  availableFormats: ["wav", "opus"],
+  selectedFormat: "wav",
   availableOpusBitrates: ["16k", "24k", "32k", "48k"],
   availableWavSampleRates: [
     "native",
