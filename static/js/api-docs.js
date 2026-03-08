@@ -5,6 +5,10 @@ const apiExamples = {
     title: "GET /api/health",
     request: "curl http://127.0.0.1:8000/api/health",
   },
+  "native-capabilities": {
+    title: "GET /api/capabilities",
+    request: "curl http://127.0.0.1:8000/api/capabilities",
+  },
   "native-speak": {
     title: "POST /api/speak",
     request:
@@ -113,8 +117,9 @@ export function initializeApiExamples() {
     });
   });
   const defaultButton =
-    apiExampleButtons.find((button) => button.classList.contains("is-active")) ||
-    apiExampleButtons[0];
+    apiExampleButtons.find((button) =>
+      button.classList.contains("is-active"),
+    ) || apiExampleButtons[0];
   if (defaultButton) {
     setApiExample(defaultButton.dataset.apiExample);
   }

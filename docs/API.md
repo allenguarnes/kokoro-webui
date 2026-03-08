@@ -11,7 +11,8 @@ This server exposes two API groups:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/health` | Runtime capability and voice availability |
+| `GET` | `/api/health` | Readiness and queue status |
+| `GET` | `/api/capabilities` | Runtime capabilities, voices, formats, and limits |
 | `POST` | `/api/speak` | Render one audio response |
 | `POST` | `/api/chunk-plan` | Return chunk metadata without audio |
 | `POST` | `/api/speak-stream` | Stream chunked audio over NDJSON |
@@ -44,7 +45,7 @@ Notes:
 
 ## `GET /api/health`
 
-Returns runtime status and supported options.
+Returns lightweight readiness and queue status.
 
 ### Response
 
@@ -52,16 +53,23 @@ Returns runtime status and supported options.
 {
   "ok": true,
   "missing": [],
-  "model_path": "/abs/path/models/kokoro-v1.0.onnx",
-  "voices_path": "/abs/path/models/voices-v1.0.bin",
-  "voices": ["af_heart", "af_sarah"],
-  "formats": ["wav", "opus"],
-  "opus_bitrates": ["16k", "24k", "32k", "48k"],
-  "wav_sample_rates": ["native", "16000", "22050", "24000", "44100", "48000"],
-  "pitch_shifting": true,
-  "max_pitch_semitones": 6.0,
-  "streaming": true,
-  "websocket_streaming": true
+  "active_provider": "CPUExecutionProvider",
+  "active_providers": ["CPUExecutionProvider"],
+  "provider_fallback": false,
+  "provider_error": null,
+  "runtime_error": null,
+  "queue": {
+    "worker_limit": 2,
+    "queue_limit": 8,
+    "capacity_limit": 10,
+    "reserved_jobs": 0,
+    "active_jobs": 0,
+    "queued_jobs": 0,
+    "available_slots": 10,
+    "admitted_jobs_total": 24,
+    "completed_jobs_total": 24,
+    "rejected_jobs_total": 0
+  }
 }
 ```
 
@@ -71,9 +79,75 @@ Returns runtime status and supported options.
 | --- | --- |
 | `ok` | `true` when runtime and model assets are available |
 | `missing` | Missing dependency or asset names |
+| `active_provider` | Currently active provider, if available |
+| `provider_fallback` | Whether runtime fell back from the requested provider |
+| `runtime_error` | Runtime bootstrap failure, if any |
+| `queue` | Current scheduler capacity and cumulative rejection counters |
+
+## `GET /api/capabilities`
+
+Returns the richer runtime/configuration surface used by the Web UI.
+
+### Response
+
+```json
+{
+  "model_path": "/abs/path/models/kokoro-v1.0.onnx",
+  "voices_path": "/abs/path/models/voices-v1.0.bin",
+  "voices": ["af_heart", "af_sarah"],
+  "formats": ["wav", "opus"],
+  "opus_bitrates": ["16k", "24k", "32k", "48k"],
+  "wav_sample_rates": ["native", "16000", "22050", "24000", "44100", "48000"],
+  "requested_provider": "auto",
+  "attempted_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+  "available_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+  "active_provider": "CPUExecutionProvider",
+  "active_providers": ["CPUExecutionProvider"],
+  "provider_fallback": true,
+  "provider_error": "Failed to load CUDA runtime.",
+  "runtime_error": null,
+  "pitch_shifting": true,
+  "synthesis_workers": 2,
+  "synthesis_queue_limit": 8,
+  "scheduler": {
+    "requested_provider": "auto",
+    "runtime_kind": "gpu",
+    "execution_model": "shared-runtime",
+    "worker_limit": 2,
+    "queue_limit": 8,
+    "prefers_serial_workers": true,
+    "experimental_gpu_concurrency": true,
+    "concurrency_note": "GPU-preferred mode currently shares one runtime session; keep workers at 1 unless benchmarked.",
+    "warning": "GPU-preferred mode currently shares one runtime session. If this resolves to CUDA, KOKORO_SYNTH_WORKERS > 1 is an experimental tuning path."
+  },
+  "max_pitch_semitones": 6.0,
+  "streaming": true,
+  "websocket_streaming": true,
+  "queue": {
+    "worker_limit": 2,
+    "queue_limit": 8,
+    "capacity_limit": 10,
+    "reserved_jobs": 0,
+    "active_jobs": 0,
+    "queued_jobs": 0,
+    "available_slots": 10,
+    "admitted_jobs_total": 24,
+    "completed_jobs_total": 24,
+    "rejected_jobs_total": 0
+  }
+}
+```
+
+### Field Notes
+
+| Field | Meaning |
+| --- | --- |
 | `voices` | Available Kokoro voice IDs |
 | `pitch_shifting` | Whether backend pitch shift is available |
 | `websocket_streaming` | Whether the runtime can serve WebSocket streaming |
+| `synthesis_workers` | Number of active synthesis worker threads |
+| `synthesis_queue_limit` | Number of queued jobs allowed behind active workers |
+| `scheduler` | Provider-aware scheduling policy used by the backend |
 
 ## `POST /api/speak`
 

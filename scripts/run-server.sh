@@ -241,7 +241,13 @@ import os
 import platform
 from pathlib import Path
 
-from app.config import get_runtime_provider_mode, get_synthesis_workers
+from app.config import (
+    get_allow_experimental_cuda_concurrency,
+    get_runtime_provider_mode,
+    get_synthesis_queue_limit,
+    get_synthesis_workers,
+)
+from app.scheduler import build_scheduler_policy
 from app.runtime import get_runtime_status
 
 items: list[tuple[str, str, str]] = []
@@ -279,6 +285,7 @@ voices_path = Path(os.getenv('KOKORO_VOICES_PATH', root / 'models' / 'voices-v1.
 items.append(('model', 'ok' if model_path.exists() else 'error', str(model_path)))
 items.append(('voices', 'ok' if voices_path.exists() else 'error', str(voices_path)))
 
+requested_provider = 'auto'
 try:
     requested_provider = get_runtime_provider_mode()
 except Exception as exc:
@@ -297,6 +304,39 @@ else:
     if not is_explicit:
         detail = f'{detail} (default)'
     items.append(('synth-workers', 'ok', detail))
+
+default_synthesis_queue = synthesis_workers * 4
+try:
+    synthesis_queue = get_synthesis_queue_limit(default=default_synthesis_queue)
+except Exception as exc:
+    items.append(('synth-queue', 'error', str(exc)))
+else:
+    is_explicit = 'KOKORO_SYNTH_QUEUE' in os.environ
+    detail = str(synthesis_queue)
+    if not is_explicit:
+        detail = f'{detail} (default)'
+    items.append(('synth-queue', 'ok', detail))
+
+allow_experimental_gpu_concurrency = get_allow_experimental_cuda_concurrency()
+items.append((
+    'gpu-experimental',
+    'ok' if allow_experimental_gpu_concurrency else 'ok',
+    'enabled' if allow_experimental_gpu_concurrency else 'disabled',
+))
+
+try:
+    scheduler_policy = build_scheduler_policy(
+        requested_provider=requested_provider,
+        worker_limit=synthesis_workers,
+        queue_limit=synthesis_queue,
+        allow_experimental_gpu_concurrency=allow_experimental_gpu_concurrency,
+    )
+except Exception as exc:
+    items.append(('scheduler', 'error', str(exc)))
+else:
+    items.append(('scheduler', 'ok', scheduler_policy.execution_model))
+    if scheduler_policy.warning:
+        items.append(('scheduler-warn', 'warn', scheduler_policy.warning))
 
 try:
     status = get_runtime_status()

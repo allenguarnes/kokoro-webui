@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import subprocess
+import threading
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+import httpx
 import numpy as np
 from fastapi.testclient import TestClient
 
+import app.api as api
 import app.audio as audio
 import app.config as config
-import app.main as main
 import app.runtime as runtime
 from app.runtime import RuntimeStatus
 from app.schemas import RenderedChunk, SynthesisRequest
@@ -37,6 +41,7 @@ def make_rendered_chunk(payload: SynthesisRequest, text: str) -> RenderedChunk:
 class ApiIntegrationTests(unittest.TestCase):
     client: TestClient | None = None
     existing_path: Path = Path()
+    patch_stack: ExitStack | None = None
 
     def get_client(self) -> TestClient:
         client = self.client
@@ -45,8 +50,18 @@ class ApiIntegrationTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.client = TestClient(main.app)
         self.existing_path = Path(__file__)
+        self.patch_stack = ExitStack()
+        _ = self.patch_stack.enter_context(
+            patch.object(config, "get_runtime_provider_mode", return_value="cpu")
+        )
+        _ = self.patch_stack.enter_context(
+            patch.object(config, "get_synthesis_workers", return_value=2)
+        )
+        _ = self.patch_stack.enter_context(
+            patch.object(config, "get_synthesis_queue_limit", return_value=8)
+        )
+        self.client = TestClient(api.create_app())
         audio.ffmpeg_supports_rubberband.cache_clear()
         runtime.clear_runtime_caches()
 
@@ -55,6 +70,9 @@ class ApiIntegrationTests(unittest.TestCase):
         client = self.client
         if client is not None:
             client.close()
+        patch_stack = self.patch_stack
+        if patch_stack is not None:
+            patch_stack.close()
         audio.ffmpeg_supports_rubberband.cache_clear()
         runtime.clear_runtime_caches()
 
@@ -83,23 +101,59 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = cast(dict[str, object], response.json())
         self.assertTrue(payload["ok"])
+        self.assertEqual(payload["active_provider"], "CPUExecutionProvider")
+        self.assertEqual(payload["active_providers"], ["CPUExecutionProvider"])
+        self.assertTrue(cast(bool, payload["provider_fallback"]))
+        self.assertEqual(payload["provider_error"], "Failed to load CUDA runtime.")
+        self.assertIsNone(payload["runtime_error"])
+        queue = cast(dict[str, object], payload["queue"])
+        worker_limit = cast(int, queue["worker_limit"])
+        queue_limit = cast(int, queue["queue_limit"])
+        capacity_limit = cast(int, queue["capacity_limit"])
+        self.assertGreaterEqual(worker_limit, 1)
+        self.assertGreaterEqual(queue_limit, 0)
+        self.assertEqual(capacity_limit, worker_limit + queue_limit)
+
+    def test_capabilities_reports_runtime_and_formats(self) -> None:
+        fake_status = RuntimeStatus(
+            requested_provider="auto",
+            attempted_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            available_providers=["CPUExecutionProvider", "CUDAExecutionProvider"],
+            active_providers=["CPUExecutionProvider"],
+            provider_fallback=True,
+            provider_error="Failed to load CUDA runtime.",
+            runtime_error=None,
+        )
+        with (
+            patch.object(
+                runtime, "load_voice_names", return_value=["af_heart", "bf_alice"]
+            ),
+            patch.object(runtime, "get_runtime_status", return_value=fake_status),
+            patch.object(audio, "ffmpeg_supports_rubberband", return_value=True),
+            patch.object(runtime, "websocket_runtime_available", return_value=True),
+        ):
+            response = self.get_client().get("/api/capabilities")
+
+        self.assertEqual(response.status_code, 200)
+        payload = cast(dict[str, object], response.json())
         self.assertEqual(payload["voices"], ["af_heart", "bf_alice"])
         self.assertEqual(payload["requested_provider"], "auto")
         self.assertEqual(
             payload["attempted_providers"],
             ["CUDAExecutionProvider", "CPUExecutionProvider"],
         )
-        self.assertEqual(payload["active_provider"], "CPUExecutionProvider")
-        self.assertEqual(payload["active_providers"], ["CPUExecutionProvider"])
         self.assertEqual(
             payload["available_providers"],
             ["CPUExecutionProvider", "CUDAExecutionProvider"],
         )
-        self.assertTrue(cast(bool, payload["provider_fallback"]))
-        self.assertEqual(payload["provider_error"], "Failed to load CUDA runtime.")
-        self.assertIsNone(payload["runtime_error"])
         self.assertTrue(payload["pitch_shifting"])
         self.assertTrue(payload["websocket_streaming"])
+        self.assertGreaterEqual(cast(int, payload["synthesis_workers"]), 1)
+        self.assertGreaterEqual(cast(int, payload["synthesis_queue_limit"]), 0)
+        scheduler = cast(dict[str, object], payload["scheduler"])
+        self.assertEqual(scheduler["execution_model"], "shared-runtime")
+        self.assertIn(scheduler["runtime_kind"], {"cpu", "gpu"})
+        self.assertIsInstance(scheduler["concurrency_note"], str)
 
     def test_health_reports_runtime_error_as_not_ready(self) -> None:
         fake_status = RuntimeStatus(
@@ -125,6 +179,50 @@ class ApiIntegrationTests(unittest.TestCase):
         payload = cast(dict[str, object], response.json())
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["runtime_error"], "Failed to allocate CUDA memory.")
+
+    def test_queue_overload_returns_503(self) -> None:
+        request_payload = {
+            "text": "Hello from test.",
+            "voice": "af_heart",
+            "speed": 1.0,
+            "pitch": 0.0,
+            "lang": "en-us",
+            "format": "wav",
+        }
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_render(payload: SynthesisRequest, text: str) -> RenderedChunk:
+            started.set()
+            _ = release.wait(timeout=2.0)
+            return make_rendered_chunk(payload, text)
+
+        async def run_test() -> None:
+            with (
+                patch.object(config, "get_synthesis_workers", return_value=1),
+                patch.object(config, "get_synthesis_queue_limit", return_value=0),
+                patch.object(audio, "synthesize_chunk", side_effect=blocking_render),
+            ):
+                test_app = api.create_app()
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    first_request = asyncio.create_task(
+                        client.post("/api/speak", json=request_payload)
+                    )
+                    while not started.is_set():
+                        await asyncio.sleep(0.01)
+                    overload_response = await client.post(
+                        "/api/speak", json=request_payload
+                    )
+                    self.assertEqual(overload_response.status_code, 503)
+                    release.set()
+                    first_response = await first_request
+                    self.assertEqual(first_response.status_code, 200)
+
+        asyncio.run(run_test())
 
     def test_native_speak_returns_audio_headers(self) -> None:
         request_payload = {

@@ -30,11 +30,18 @@ import {
 
 export async function loadHealth() {
   try {
-    const response = await fetch("/api/health");
-    const data = await response.json();
-    populateVoices(data.voices || []);
-    if (Array.isArray(data.opus_bitrates) && data.opus_bitrates.length > 0) {
-      appState.availableOpusBitrates = data.opus_bitrates;
+    const [healthResponse, capabilitiesResponse] = await Promise.all([
+      fetch("/api/health"),
+      fetch("/api/capabilities"),
+    ]);
+    const health = await healthResponse.json();
+    const capabilities = await capabilitiesResponse.json();
+    populateVoices(capabilities.voices || []);
+    if (
+      Array.isArray(capabilities.opus_bitrates) &&
+      capabilities.opus_bitrates.length > 0
+    ) {
+      appState.availableOpusBitrates = capabilities.opus_bitrates;
       if (
         !appState.availableOpusBitrates.includes(appState.selectedOpusBitrate)
       ) {
@@ -42,10 +49,10 @@ export async function loadHealth() {
       }
     }
     if (
-      Array.isArray(data.wav_sample_rates) &&
-      data.wav_sample_rates.length > 0
+      Array.isArray(capabilities.wav_sample_rates) &&
+      capabilities.wav_sample_rates.length > 0
     ) {
-      appState.availableWavSampleRates = data.wav_sample_rates;
+      appState.availableWavSampleRates = capabilities.wav_sample_rates;
       if (
         !appState.availableWavSampleRates.includes(
           appState.selectedWavSampleRate,
@@ -54,7 +61,7 @@ export async function loadHealth() {
         appState.selectedWavSampleRate = appState.availableWavSampleRates[0];
       }
     }
-    const websocketEnabled = Boolean(data.websocket_streaming);
+    const websocketEnabled = Boolean(capabilities.websocket_streaming);
     const wsOption = transportInput.querySelector('option[value="ws"]');
     if (wsOption) {
       wsOption.disabled = !websocketEnabled;
@@ -62,25 +69,27 @@ export async function loadHealth() {
     if (transportInput.value === "ws" && !websocketEnabled) {
       transportInput.value = "ndjson";
     }
-    appState.pitchShiftingAvailable = data.pitch_shifting !== false;
+    appState.pitchShiftingAvailable = capabilities.pitch_shifting !== false;
     if (
-      Number.isFinite(data.max_pitch_semitones) &&
-      data.max_pitch_semitones > 0
+      Number.isFinite(capabilities.max_pitch_semitones) &&
+      capabilities.max_pitch_semitones > 0
     ) {
-      appState.maxPitchSemitones = data.max_pitch_semitones;
+      appState.maxPitchSemitones = capabilities.max_pitch_semitones;
     }
     updatePitchControlAvailability();
     refreshCustomSelect(transportInput);
     syncTransportModeText();
     updateFormatControlState();
     const activeProvider =
-      typeof data.active_provider === "string" ? data.active_provider : null;
-    const providerFallback = data.provider_fallback === true;
+      typeof health.active_provider === "string"
+        ? health.active_provider
+        : null;
+    const providerFallback = health.provider_fallback === true;
     const providerError =
-      typeof data.provider_error === "string" ? data.provider_error : null;
+      typeof health.provider_error === "string" ? health.provider_error : null;
     const runtimeError =
-      typeof data.runtime_error === "string" ? data.runtime_error : null;
-    if (data.ok) {
+      typeof health.runtime_error === "string" ? health.runtime_error : null;
+    if (health.ok) {
       setSystemStatus(
         true,
         websocketEnabled,
@@ -109,7 +118,7 @@ export async function loadHealth() {
       setStatus(`Runtime unavailable: ${runtimeError}`, true);
       return;
     }
-    setStatus(`Missing runtime files: ${data.missing.join(", ")}`, true);
+    setStatus(`Missing runtime files: ${health.missing.join(", ")}`, true);
   } catch (_error) {
     setSystemStatus(false, false);
     setStatus("Unable to reach the backend.", true);

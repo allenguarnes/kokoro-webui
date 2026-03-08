@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import concurrent.futures
-import functools
 import io
 import json
 import re
@@ -19,6 +17,11 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 
 from app import audio, config, openai_compat, runtime
+from app.scheduler import (
+    SynthesisOverloadedError,
+    SynthesisScheduler,
+    build_scheduler_policy,
+)
 from app.schemas import (
     ChunkedSynthesisRequest,
     ChunkMetadataRequest,
@@ -34,20 +37,32 @@ T = TypeVar("T")
 
 
 def create_app() -> FastAPI:
-    default_synthesis_workers = 2 if config.get_runtime_provider_mode() == "cpu" else 1
+    requested_provider = config.get_runtime_provider_mode()
+    default_synthesis_workers = 2 if requested_provider == "cpu" else 1
     synthesis_workers = config.get_synthesis_workers(default=default_synthesis_workers)
-    synthesis_executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=synthesis_workers,
-        thread_name_prefix="kokoro-synth",
+    default_synthesis_queue = synthesis_workers * 4
+    synthesis_queue_limit = config.get_synthesis_queue_limit(
+        default=default_synthesis_queue
     )
-    synthesis_slots = asyncio.Semaphore(synthesis_workers)
+    allow_experimental_gpu_concurrency = (
+        config.get_allow_experimental_cuda_concurrency()
+    )
+    scheduler_policy = build_scheduler_policy(
+        requested_provider=requested_provider,
+        worker_limit=synthesis_workers,
+        queue_limit=synthesis_queue_limit,
+        allow_experimental_gpu_concurrency=allow_experimental_gpu_concurrency,
+    )
+    synthesis_scheduler = SynthesisScheduler(
+        policy=scheduler_policy,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
             yield
         finally:
-            synthesis_executor.shutdown(wait=False, cancel_futures=True)
+            synthesis_scheduler.shutdown()
 
     app = FastAPI(title="Kokoro WebUI", lifespan=lifespan)
     app.add_middleware(
@@ -58,13 +73,40 @@ def create_app() -> FastAPI:
     )
     app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
 
+    def queue_payload() -> dict[str, int]:
+        metrics = synthesis_scheduler.snapshot()
+        return {
+            "worker_limit": metrics.worker_limit,
+            "queue_limit": metrics.queue_limit,
+            "capacity_limit": metrics.capacity_limit,
+            "reserved_jobs": metrics.reserved_jobs,
+            "active_jobs": metrics.active_jobs,
+            "queued_jobs": metrics.queued_jobs,
+            "available_slots": metrics.available_slots,
+            "admitted_jobs_total": metrics.admitted_jobs_total,
+            "completed_jobs_total": metrics.completed_jobs_total,
+            "rejected_jobs_total": metrics.rejected_jobs_total,
+        }
+
+    def scheduler_payload() -> dict[str, object]:
+        return {
+            "requested_provider": scheduler_policy.requested_provider,
+            "runtime_kind": scheduler_policy.runtime_kind,
+            "execution_model": scheduler_policy.execution_model,
+            "worker_limit": scheduler_policy.worker_limit,
+            "queue_limit": scheduler_policy.queue_limit,
+            "prefers_serial_workers": scheduler_policy.prefers_serial_workers,
+            "experimental_gpu_concurrency": (
+                scheduler_policy.experimental_gpu_concurrency
+            ),
+            "concurrency_note": scheduler_policy.concurrency_note,
+            "warning": scheduler_policy.warning,
+        }
+
     async def run_synthesis_task(
         function: Callable[P, T], *args: P.args, **kwargs: P.kwargs
     ) -> T:
-        async with synthesis_slots:
-            loop = asyncio.get_running_loop()
-            task = functools.partial(function, *args, **kwargs)
-            return await loop.run_in_executor(synthesis_executor, task)
+        return await synthesis_scheduler.run(function, *args, **kwargs)
 
     async def synthesize_chunk_async(
         payload: SynthesisRequest, text: str
@@ -95,6 +137,22 @@ def create_app() -> FastAPI:
             {
                 "ok": not missing and runtime_status.runtime_error is None,
                 "missing": missing,
+                "active_provider": runtime_status.active_providers[0]
+                if runtime_status.active_providers
+                else None,
+                "active_providers": runtime_status.active_providers,
+                "provider_fallback": runtime_status.provider_fallback,
+                "provider_error": runtime_status.provider_error,
+                "runtime_error": runtime_status.runtime_error,
+                "queue": queue_payload(),
+            }
+        )
+
+    @app.get("/api/capabilities")
+    async def capabilities() -> JSONResponse:
+        runtime_status = runtime.get_runtime_status()
+        return JSONResponse(
+            {
                 "model_path": str(config.MODEL_PATH),
                 "voices_path": str(config.VOICES_PATH),
                 "voices": runtime.load_voice_names(),
@@ -113,9 +171,12 @@ def create_app() -> FastAPI:
                 "runtime_error": runtime_status.runtime_error,
                 "pitch_shifting": audio.ffmpeg_supports_rubberband(),
                 "synthesis_workers": synthesis_workers,
+                "synthesis_queue_limit": synthesis_queue_limit,
+                "scheduler": scheduler_payload(),
                 "max_pitch_semitones": config.MAX_PITCH_SHIFT_SEMITONES,
                 "streaming": True,
                 "websocket_streaming": runtime.websocket_runtime_available(),
+                "queue": queue_payload(),
             }
         )
 
@@ -143,6 +204,8 @@ def create_app() -> FastAPI:
         try:
             synth_request = openai_compat.build_openai_synthesis_request(payload)
             rendered = await synthesize_chunk_async(synth_request, synth_request.text)
+        except SynthesisOverloadedError as exc:
+            return openai_compat.openai_error_response(503, str(exc))
         except ValueError as exc:
             return openai_compat.openai_error_response(400, str(exc))
         except Exception as exc:
@@ -163,6 +226,8 @@ def create_app() -> FastAPI:
     async def speak(payload: SynthesisRequest) -> StreamingResponse:
         try:
             rendered = await synthesize_chunk_async(payload, payload.text)
+        except SynthesisOverloadedError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -303,6 +368,20 @@ def create_app() -> FastAPI:
                     event, audio_bytes = await build_chunk_event_async(
                         payload, chunk, index, total_chunks
                     )
+                except SynthesisOverloadedError as exc:
+                    if await request.is_disconnected():
+                        return
+                    yield (
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "detail": str(exc),
+                                "chunk_index": index,
+                            }
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                    return
                 except Exception as exc:
                     if await request.is_disconnected():
                         return
@@ -377,6 +456,19 @@ def create_app() -> FastAPI:
                     event, audio_bytes = await build_chunk_event_async(
                         payload, chunk, index, total_chunks
                     )
+                except SynthesisOverloadedError as exc:
+                    if disconnect_event.is_set():
+                        return
+                    await websocket.send_text(
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "detail": str(exc),
+                                "chunk_index": index,
+                            }
+                        )
+                    )
+                    return
                 except Exception as exc:
                     if disconnect_event.is_set():
                         return

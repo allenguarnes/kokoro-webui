@@ -111,6 +111,26 @@ def get_synthesis_workers(*, default: int) -> int:
     return workers
 
 
+def get_synthesis_queue_limit(*, default: int) -> int:
+    raw_limit = os.getenv("KOKORO_SYNTH_QUEUE", str(default)).strip()
+    try:
+        limit = int(raw_limit)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"KOKORO_SYNTH_QUEUE must be a non-negative integer, got {raw_limit!r}."
+        ) from exc
+    if limit < 0:
+        raise RuntimeError(f"KOKORO_SYNTH_QUEUE must be 0 or greater, got {limit}.")
+    return limit
+
+
+def get_allow_experimental_cuda_concurrency() -> bool:
+    return parse_bool_env(
+        os.getenv("KOKORO_ALLOW_EXPERIMENTAL_CUDA_CONCURRENCY"),
+        default=False,
+    )
+
+
 def get_runtime_provider_mode() -> ProviderMode:
     raw_provider = (
         os.getenv("KOKORO_PROVIDER", DEFAULT_RUNTIME_PROVIDER).strip().lower()

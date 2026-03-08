@@ -189,6 +189,8 @@ The app auto-loads `.env` (if present).
 | `KOKORO_PROVIDER` | `auto` | Runtime selection: `auto`, `cpu`, or `cuda` |
 | `KOKORO_STRICT_PROVIDER` | `0` | Fail startup instead of falling back when requested provider cannot initialize |
 | `KOKORO_SYNTH_WORKERS` | `2` on CPU, `1` on auto/cuda | Cap concurrent synthesis jobs in the dedicated worker pool |
+| `KOKORO_SYNTH_QUEUE` | `workers * 4` | Queue depth for admitted synthesis jobs waiting behind active workers |
+| `KOKORO_ALLOW_EXPERIMENTAL_CUDA_CONCURRENCY` | `0` | Allow `KOKORO_SYNTH_WORKERS > 1` when the runtime is explicitly forced to `cuda` |
 | `KOKORO_CUDA_LIB_DIR` | unset | Optional. Use only when compatible CUDA libraries are installed outside the normal dynamic linker search paths |
 | `KOKORO_MODEL_PATH` | `models/kokoro-v1.0.onnx` | Override model path |
 | `KOKORO_VOICES_PATH` | `models/voices-v1.0.bin` | Override voices path |
@@ -206,11 +208,23 @@ KOKORO_PROVIDER=auto
 KOKORO_STRICT_PROVIDER=0
 # Optional synthesis concurrency cap. Defaults to 2 on CPU, 1 on auto/cuda.
 # KOKORO_SYNTH_WORKERS=2
+# Optional queue depth for admitted synthesis jobs waiting behind active workers.
+# KOKORO_SYNTH_QUEUE=8
+# Only set when intentionally benchmarking shared-session GPU concurrency.
+# KOKORO_ALLOW_EXPERIMENTAL_CUDA_CONCURRENCY=1
 # Only set when CUDA 12.x libs are in a non-standard location
 # KOKORO_CUDA_LIB_DIR=/opt/cuda-12.9/lib64
 ```
 
 `KOKORO_SYNTH_WORKERS` is intentionally conservative by default. CPU mode can benefit from a small amount of parallelism, but GPU mode should usually stay at `1` unless you have measured that additional concurrent jobs improve throughput on your hardware. If you expect concurrent CPU-only requests on a higher-core machine, `KOKORO_SYNTH_WORKERS=3` is a reasonable first tuning step to benchmark.
+
+`KOKORO_SYNTH_QUEUE` controls how many additional synthesis jobs can wait behind the active workers before the server starts rejecting overload with `503`. That is useful once the app is serving multiple users instead of only local, single-user traffic.
+
+The scheduler is now provider-aware at the policy level:
+- CPU mode allows a small shared-runtime worker pool
+- GPU-preferred modes still use a shared runtime/session model, so `workers > 1` should be treated as a benchmarked tuning scenario rather than a default recommendation
+
+If you explicitly force `KOKORO_PROVIDER=cuda`, the server now blocks `KOKORO_SYNTH_WORKERS > 1` by default. Use `KOKORO_ALLOW_EXPERIMENTAL_CUDA_CONCURRENCY=1` only when you are intentionally benchmarking shared-session GPU concurrency.
 
 Development reload:
 
@@ -239,7 +253,8 @@ uv run python -m unittest tests.test_api tests.test_runtime
 - Validate runtime quickly:
   - run `./scripts/run-server.sh --check-only`
   - open `/api/health`
-  - check `requested_provider`, `active_provider`, `provider_fallback`, and `runtime_error`
+  - check `ok`, `active_provider`, `runtime_error`, and `queue`
+  - open `/api/capabilities` for voices, formats, and scheduler/runtime details
 
 ## API Overview
 
@@ -249,7 +264,8 @@ Full reference: [docs/API.md](docs/API.md)
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/health` | Runtime capability, provider selection, and readiness |
+| `GET` | `/api/health` | Readiness and queue status |
+| `GET` | `/api/capabilities` | Voices, formats, runtime features, and synthesis limits |
 | `POST` | `/api/speak` | Single render (`wav` or `opus`) |
 | `POST` | `/api/chunk-plan` | Chunk metadata only |
 | `POST` | `/api/speak-stream` | NDJSON chunked streaming |
@@ -278,15 +294,21 @@ Use `/api/health` first when diagnosing runtime issues.
 Key fields:
 - `ok`
 - `missing`
-- `requested_provider`
-- `attempted_providers`
-- `available_providers`
 - `active_provider`
 - `provider_fallback`
 - `provider_error`
 - `runtime_error`
+- `queue`
+
+Then use `/api/capabilities` for:
+- `voices`
+- `formats`
+- `requested_provider`
+- `attempted_providers`
+- `available_providers`
 - `pitch_shifting`
 - `websocket_streaming`
+- `scheduler`
 
 If synthesis fails, verify:
 1. Model files exist at expected paths
@@ -304,6 +326,7 @@ app/
   main.py
   openai_compat.py
   runtime.py
+  scheduler.py
   schemas.py
 static/
   index.html
