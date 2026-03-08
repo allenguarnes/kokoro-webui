@@ -6,6 +6,7 @@ import {
   exportButtonLabel,
   fileSize,
   genTime,
+  gpuVram,
   transportInput,
 } from "./dom.js";
 import { appState, createChunkState } from "./state.js";
@@ -19,6 +20,7 @@ import {
   setSystemStatus,
   syncTransportModeText,
   updateFormatControlState,
+  updateQueueMonitorLayout,
   updatePitchControlAvailability,
 } from "./ui.js";
 import {
@@ -98,6 +100,12 @@ export async function loadHealth() {
       typeof health.provider_error === "string" ? health.provider_error : null;
     const runtimeError =
       typeof health.runtime_error === "string" ? health.runtime_error : null;
+    updateQueueMonitorLayout(activeProvider);
+    const processVramMb = Number(health?.gpu?.process_vram_used_mb);
+    gpuVram.textContent =
+      Number.isFinite(processVramMb) && processVramMb >= 0
+        ? `${processVramMb.toFixed(processVramMb >= 1024 ? 0 : 1)} MB`
+        : "--";
     if (health.ok) {
       setSystemStatus(
         true,
@@ -129,6 +137,8 @@ export async function loadHealth() {
     }
     setStatus(`Missing runtime files: ${health.missing.join(", ")}`, true);
   } catch (_error) {
+    updateQueueMonitorLayout(null);
+    gpuVram.textContent = "--";
     setSystemStatus(false, false);
     setStatus("Unable to reach the backend.", true);
   }
@@ -144,6 +154,7 @@ export async function synthesize(event) {
   genTime.textContent = "--";
   fileSize.textContent = "--";
   audioDuration.textContent = "--";
+  gpuVram.textContent = gpuVram.textContent || "--";
   chunkProgress.textContent = "0 / 0";
   chunkBar.max = 1;
   chunkBar.value = 0;

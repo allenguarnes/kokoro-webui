@@ -129,6 +129,10 @@ Optional, depending on features:
 - `onnxruntime-gpu`
   - Required for NVIDIA GPU acceleration
   - Without it, the app runs on CPU
+- `nvidia-ml-py`
+  - Optional NVIDIA-only metrics path used to report `kokoro-webui` process VRAM
+  - Included with `uv sync --extra gpu`
+  - Without it, synthesis still works and GPU memory metrics are simply unavailable
 - `uvicorn[standard]` (`uvloop`, `httptools`, and related runtime helpers)
   - Recommended on Linux for lower-overhead request/event-loop handling
   - Without it, the app still works with the pure-Python/cross-platform stack
@@ -147,6 +151,7 @@ Default behavior:
 - `KOKORO_PROVIDER=auto`
 - try CUDA when `CUDAExecutionProvider` is available
 - fall back to `CPUExecutionProvider` if CUDA initialization fails
+- when NVML is available, `/api/health` also reports VRAM used by the current `kokoro-webui` process
 
 Recommended NVIDIA setup:
 1. Install the base project with `uv sync --extra gpu`

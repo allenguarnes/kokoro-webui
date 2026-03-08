@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import os
 import re
@@ -76,6 +77,21 @@ class OnnxRuntimeModule(Protocol):
     ) -> OnnxSession: ...
 
 
+class NvmlProcessInfo(Protocol):
+    pid: int
+    usedGpuMemory: int
+
+
+class NvmlModule(Protocol):
+    def nvmlInit(self) -> None: ...
+
+    def nvmlShutdown(self) -> None: ...
+
+    def nvmlDeviceGetCount(self) -> int: ...
+
+    def nvmlDeviceGetHandleByIndex(self, index: int) -> object: ...
+
+
 class KokoroRuntimeFactory(Protocol):
     def __call__(self, model_path: str, voices_path: str) -> KokoroEngine: ...
 
@@ -108,8 +124,19 @@ class RuntimeBootstrap:
     status: RuntimeStatus
 
 
+@dataclass(frozen=True)
+class GpuProcessUsage:
+    pid: int
+    available: bool
+    used_bytes: int | None
+    used_megabytes: float | None
+    source: str | None
+    error: str | None
+
+
 _CPU_PROVIDER = "CPUExecutionProvider"
 _CUDA_PROVIDER = "CUDAExecutionProvider"
+_TENSORRT_PROVIDER = "TensorrtExecutionProvider"
 
 
 def _runtime_factory() -> KokoroRuntimeFactory:
@@ -126,6 +153,14 @@ def _onnx_runtime() -> OnnxRuntimeModule:
             "onnxruntime is not installed. Install dependencies with `uv sync`."
         )
     return ort  # pyright: ignore[reportReturnType]
+
+
+def _load_nvml_module() -> NvmlModule | None:
+    try:
+        module = importlib.import_module("pynvml")
+        return cast(NvmlModule, cast(object, module))
+    except ImportError:
+        return None
 
 
 def _sanitize_runtime_error(exc: BaseException) -> str:
@@ -261,6 +296,113 @@ def get_active_runtime_providers() -> list[str]:
 def get_active_runtime_provider() -> str | None:
     providers = get_active_runtime_providers()
     return providers[0] if providers else None
+
+
+def _is_gpu_runtime_provider(provider: str | None) -> bool:
+    return provider in {_CUDA_PROVIDER, _TENSORRT_PROVIDER}
+
+
+def _iter_nvml_compute_processes(
+    nvml_module: NvmlModule, handle: object
+) -> list[NvmlProcessInfo]:
+    for attr_name in (
+        "nvmlDeviceGetComputeRunningProcesses_v3",
+        "nvmlDeviceGetComputeRunningProcesses_v2",
+        "nvmlDeviceGetComputeRunningProcesses",
+    ):
+        getter = cast(
+            Callable[[object], object] | None, getattr(nvml_module, attr_name, None)
+        )
+        if getter is None:
+            continue
+        raw_processes = getter(handle)
+        if not isinstance(raw_processes, Iterable):
+            return []
+        return [cast(NvmlProcessInfo, process) for process in raw_processes]
+    return []
+
+
+def get_current_process_gpu_usage() -> GpuProcessUsage:
+    pid = os.getpid()
+    active_provider = get_active_runtime_provider()
+    if not _is_gpu_runtime_provider(active_provider):
+        return GpuProcessUsage(
+            pid=pid,
+            available=False,
+            used_bytes=None,
+            used_megabytes=None,
+            source=None,
+            error=None,
+        )
+
+    nvml_module = _load_nvml_module()
+    if nvml_module is None:
+        return GpuProcessUsage(
+            pid=pid,
+            available=False,
+            used_bytes=None,
+            used_megabytes=None,
+            source=None,
+            error="pynvml is not installed.",
+        )
+    try:
+        nvml_module.nvmlInit()
+    except Exception as exc:
+        return GpuProcessUsage(
+            pid=pid,
+            available=False,
+            used_bytes=None,
+            used_megabytes=None,
+            source=None,
+            error=_sanitize_runtime_error(exc),
+        )
+
+    try:
+        used_bytes = 0
+        for index in range(nvml_module.nvmlDeviceGetCount()):
+            handle = nvml_module.nvmlDeviceGetHandleByIndex(index)
+            try:
+                processes = _iter_nvml_compute_processes(nvml_module, handle)
+            except Exception:
+                continue
+            for process in processes:
+                process_pid = int(getattr(process, "pid", -1))
+                if process_pid != pid:
+                    continue
+                used_bytes += int(getattr(process, "usedGpuMemory", 0))
+
+        if used_bytes <= 0:
+            return GpuProcessUsage(
+                pid=pid,
+                available=False,
+                used_bytes=0,
+                used_megabytes=0.0,
+                source="nvml",
+                error=None,
+            )
+
+        return GpuProcessUsage(
+            pid=pid,
+            available=True,
+            used_bytes=used_bytes,
+            used_megabytes=round(used_bytes / (1024 * 1024), 2),
+            source="nvml",
+            error=None,
+        )
+    except Exception as exc:
+        return GpuProcessUsage(
+            pid=pid,
+            available=False,
+            used_bytes=None,
+            used_megabytes=None,
+            source=None,
+            error=_sanitize_runtime_error(exc),
+        )
+    finally:
+        try:
+            nvml_module.nvmlShutdown()
+        except Exception:
+            pass
 
 
 def get_tts() -> KokoroEngine:

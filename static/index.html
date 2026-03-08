@@ -250,13 +250,17 @@ The future sounds calmer when it is rendered locally.</textarea
                             <span class="stat-name">Synthesis</span>
                             <strong id="genTime">--</strong>
                         </div>
-                        <div class="stat-card">
+                        <div class="stat-card stat-card-char">
                             <span class="stat-name">Characters</span>
                             <strong id="charCount">0</strong>
                         </div>
-                        <div class="stat-card">
+                        <div class="stat-card stat-card-word">
                             <span class="stat-name">Words</span>
                             <strong id="wordCount">0</strong>
+                        </div>
+                        <div class="stat-card stat-card-text" hidden>
+                            <span class="stat-name">Text</span>
+                            <strong id="textStats">0c / 0w</strong>
                         </div>
                         <div class="stat-card">
                             <span class="stat-name">Audio</span>
@@ -265,6 +269,10 @@ The future sounds calmer when it is rendered locally.</textarea
                         <div class="stat-card">
                             <span class="stat-name">File Size</span>
                             <strong id="fileSize">--</strong>
+                        </div>
+                        <div class="stat-card stat-card-vram" hidden>
+                            <span class="stat-name">VRAM</span>
+                            <strong id="gpuVram">--</strong>
                         </div>
                         <div class="stat-card">
                             <span class="stat-name">Chunks</span>

@@ -1,7 +1,6 @@
 # pyright: reportUnusedFunction=false, reportUnusedCallResult=false
 from __future__ import annotations
 
-import asyncio
 import base64
 import io
 import json
@@ -162,6 +161,7 @@ def create_app() -> FastAPI:
             missing.append(str(config.VOICES_PATH.name))
 
         runtime_status = runtime.get_runtime_status()
+        gpu_usage = runtime.get_current_process_gpu_usage()
 
         return JSONResponse(
             {
@@ -174,6 +174,14 @@ def create_app() -> FastAPI:
                 "provider_fallback": runtime_status.provider_fallback,
                 "provider_error": runtime_status.provider_error,
                 "runtime_error": runtime_status.runtime_error,
+                "gpu": {
+                    "process_pid": gpu_usage.pid,
+                    "available": gpu_usage.available,
+                    "process_vram_used_bytes": gpu_usage.used_bytes,
+                    "process_vram_used_mb": gpu_usage.used_megabytes,
+                    "source": gpu_usage.source,
+                    "error": gpu_usage.error,
+                },
                 "queue": queue_payload(),
             }
         )
@@ -345,20 +353,6 @@ def create_app() -> FastAPI:
             total_chunks,
         )
 
-    async def watch_websocket_disconnect(
-        websocket: WebSocket, disconnected: asyncio.Event
-    ) -> None:
-        try:
-            while not disconnected.is_set():
-                message = await websocket.receive()
-                if message["type"] == "websocket.disconnect":
-                    disconnected.set()
-                    return
-        except WebSocketDisconnect:
-            disconnected.set()
-        except RuntimeError:
-            disconnected.set()
-
     @app.post("/api/speak-stream")
     async def speak_stream(
         payload: ChunkedSynthesisRequest, request: Request
@@ -442,8 +436,6 @@ def create_app() -> FastAPI:
     @app.websocket("/ws/speak-stream")
     async def ws_speak_stream(websocket: WebSocket) -> None:
         await websocket.accept()
-        disconnect_event = asyncio.Event()
-        disconnect_task: asyncio.Task[None] | None = None
         try:
             raw_payload = await websocket.receive_text()
             payload = ChunkedSynthesisRequest.model_validate_json(raw_payload)
@@ -458,9 +450,6 @@ def create_app() -> FastAPI:
                 )
                 return
 
-            disconnect_task = asyncio.create_task(
-                watch_websocket_disconnect(websocket, disconnect_event)
-            )
             total_chunks = len(chunks)
             await websocket.send_text(
                 json.dumps(
@@ -481,15 +470,11 @@ def create_app() -> FastAPI:
             )
 
             for index, chunk in enumerate(chunks):
-                if disconnect_event.is_set():
-                    return
                 try:
                     event, audio_bytes = await build_chunk_event_async(
                         payload, chunk, index, total_chunks
                     )
                 except SynthesisOverloadedError as exc:
-                    if disconnect_event.is_set():
-                        return
                     await websocket.send_text(
                         json.dumps(
                             {
@@ -501,8 +486,6 @@ def create_app() -> FastAPI:
                     )
                     return
                 except Exception as exc:
-                    if disconnect_event.is_set():
-                        return
                     await websocket.send_text(
                         json.dumps(
                             {
@@ -513,34 +496,15 @@ def create_app() -> FastAPI:
                         )
                     )
                     return
-                if disconnect_event.is_set():
-                    return
                 await websocket.send_text(json.dumps(event))
-                if disconnect_event.is_set():
-                    return
                 await websocket.send_bytes(audio_bytes)
 
-            if disconnect_event.is_set():
-                return
             await websocket.send_text(
                 json.dumps({"type": "done", "total_chunks": total_chunks})
             )
         except WebSocketDisconnect:
             return
         except Exception as exc:
-            if disconnect_event.is_set():
-                return
             await websocket.send_text(json.dumps({"type": "error", "detail": str(exc)}))
-        finally:
-            if disconnect_task is not None:
-                disconnect_task.cancel()
-                try:
-                    await disconnect_task
-                except asyncio.CancelledError:
-                    pass
-            try:
-                await websocket.close()
-            except RuntimeError:
-                pass
 
     return app

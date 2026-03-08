@@ -1,5 +1,6 @@
 import {
   audioDuration,
+  charStatCard,
   charCount,
   chunkTargetInput,
   errorText,
@@ -20,9 +21,13 @@ import {
   systemStatus,
   providerBadge,
   textInput,
+  textStatCard,
+  textStats,
   themeToggle,
   transportInput,
   voiceInput,
+  vramStatCard,
+  wordStatCard,
   wordCount,
 } from "./dom.js";
 import { appState } from "./state.js";
@@ -64,6 +69,13 @@ function formatProviderLabel(activeProvider) {
   };
   return (
     labels[activeProvider] || activeProvider.replace(/ExecutionProvider$/, "")
+  );
+}
+
+function isGpuProvider(activeProvider) {
+  return (
+    activeProvider === "CUDAExecutionProvider" ||
+    activeProvider === "TensorrtExecutionProvider"
   );
 }
 
@@ -117,6 +129,22 @@ export function setSystemStatus(
   }
   if (providerFallback || runtimeError) {
     providerBadge.classList.add("runtime-badge-warn");
+  }
+}
+
+export function updateQueueMonitorLayout(activeProvider = null) {
+  const gpuMode = isGpuProvider(activeProvider);
+  if (charStatCard) {
+    charStatCard.hidden = gpuMode;
+  }
+  if (wordStatCard) {
+    wordStatCard.hidden = gpuMode;
+  }
+  if (textStatCard) {
+    textStatCard.hidden = !gpuMode;
+  }
+  if (vramStatCard) {
+    vramStatCard.hidden = !gpuMode;
   }
 }
 
@@ -510,8 +538,11 @@ function rebuildFormatQualityOptions() {
 
 export function updateTextStats() {
   const text = textInput.value.trim();
-  charCount.textContent = String(text.length);
-  wordCount.textContent = text ? String(text.split(/\s+/).length) : "0";
+  const charTotal = text.length;
+  const wordTotal = text ? text.split(/\s+/).length : 0;
+  charCount.textContent = String(charTotal);
+  wordCount.textContent = String(wordTotal);
+  textStats.textContent = `${charTotal}c / ${wordTotal}w`;
 }
 
 export function updatePauseLabel() {

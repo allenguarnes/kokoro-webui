@@ -26,6 +26,43 @@ class FakeSessionOptions:
         self.log_severity_level = 0
 
 
+class FakeNvmlProcess:
+    pid: int
+    usedGpuMemory: int
+
+    def __init__(self, pid: int, used_gpu_memory: int) -> None:
+        self.pid = pid
+        self.usedGpuMemory = used_gpu_memory
+
+
+class FakeNvml:
+    process_lists: dict[int, list[FakeNvmlProcess]]
+    init_calls: int
+    shutdown_calls: int
+
+    def __init__(self, process_lists: dict[int, list[FakeNvmlProcess]]) -> None:
+        self.process_lists = process_lists
+        self.init_calls = 0
+        self.shutdown_calls = 0
+
+    def nvmlInit(self) -> None:
+        self.init_calls += 1
+
+    def nvmlShutdown(self) -> None:
+        self.shutdown_calls += 1
+
+    def nvmlDeviceGetCount(self) -> int:
+        return len(self.process_lists)
+
+    def nvmlDeviceGetHandleByIndex(self, index: int) -> int:
+        return index
+
+    def nvmlDeviceGetComputeRunningProcesses_v3(
+        self, handle: int
+    ) -> list[FakeNvmlProcess]:
+        return list(self.process_lists.get(handle, []))
+
+
 class FakeEngine:
     sess: FakeSession
 
@@ -186,6 +223,55 @@ class RuntimeSelectionTests(unittest.TestCase):
         self.assertEqual(status.active_providers, [])
         self.assertFalse(status.provider_fallback)
         self.assertIn("libcublasLt", status.runtime_error or "")
+
+    def test_process_gpu_usage_reports_matching_pid_memory(self) -> None:
+        fake_nvml = FakeNvml(
+            {
+                0: [
+                    FakeNvmlProcess(pid=999, used_gpu_memory=128),
+                    FakeNvmlProcess(pid=4242, used_gpu_memory=64 * 1024 * 1024),
+                ],
+                1: [
+                    FakeNvmlProcess(pid=4242, used_gpu_memory=32 * 1024 * 1024),
+                ],
+            }
+        )
+        with (
+            patch.object(runtime, "_load_nvml_module", return_value=fake_nvml),
+            patch.object(
+                runtime,
+                "get_active_runtime_provider",
+                return_value="CUDAExecutionProvider",
+            ),
+            patch("app.runtime.os.getpid", return_value=4242),
+        ):
+            usage = runtime.get_current_process_gpu_usage()
+
+        self.assertTrue(usage.available)
+        self.assertEqual(usage.pid, 4242)
+        self.assertEqual(usage.used_bytes, 96 * 1024 * 1024)
+        self.assertEqual(usage.used_megabytes, 96.0)
+        self.assertEqual(usage.source, "nvml")
+        self.assertIsNone(usage.error)
+        self.assertEqual(fake_nvml.init_calls, 1)
+        self.assertEqual(fake_nvml.shutdown_calls, 1)
+
+    def test_process_gpu_usage_ignores_nvml_when_runtime_is_not_gpu(self) -> None:
+        with (
+            patch.object(runtime, "_load_nvml_module", return_value=None),
+            patch.object(
+                runtime,
+                "get_active_runtime_provider",
+                return_value="CPUExecutionProvider",
+            ),
+            patch("app.runtime.os.getpid", return_value=4242),
+        ):
+            usage = runtime.get_current_process_gpu_usage()
+
+        self.assertFalse(usage.available)
+        self.assertEqual(usage.pid, 4242)
+        self.assertIsNone(usage.used_bytes)
+        self.assertIsNone(usage.error)
 
 
 if __name__ == "__main__":

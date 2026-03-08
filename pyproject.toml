@@ -17,6 +17,7 @@ server = [
     "uvicorn[standard]>=0.37.0",
 ]
 gpu = [
+    "nvidia-ml-py",
     "onnxruntime-gpu>=1.24.3",
 ]
 

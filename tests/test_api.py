@@ -19,7 +19,7 @@ import app.api as api
 import app.audio as audio
 import app.config as config
 import app.runtime as runtime
-from app.runtime import RuntimeStatus
+from app.runtime import GpuProcessUsage, RuntimeStatus
 from app.schemas import RenderedChunk, SynthesisRequest
 
 
@@ -55,6 +55,24 @@ class ApiIntegrationTests(unittest.TestCase):
         self.patch_stack = ExitStack()
         _ = self.patch_stack.enter_context(
             patch.object(config, "get_runtime_provider_mode", return_value="cpu")
+        )
+        _ = self.patch_stack.enter_context(
+            patch.object(
+                runtime,
+                "get_runtime_status",
+                return_value=RuntimeStatus(
+                    requested_provider="cpu",
+                    attempted_providers=["CPUExecutionProvider"],
+                    available_providers=["CPUExecutionProvider"],
+                    active_providers=["CPUExecutionProvider"],
+                    provider_fallback=False,
+                    provider_error=None,
+                    runtime_error=None,
+                ),
+            )
+        )
+        _ = self.patch_stack.enter_context(
+            patch.object(config, "get_available_formats", return_value=["wav", "opus"])
         )
         _ = self.patch_stack.enter_context(
             patch.object(config, "get_synthesis_workers", return_value=2)
@@ -94,6 +112,18 @@ class ApiIntegrationTests(unittest.TestCase):
                 runtime, "load_voice_names", return_value=["af_heart", "bf_alice"]
             ),
             patch.object(runtime, "get_runtime_status", return_value=fake_status),
+            patch.object(
+                runtime,
+                "get_current_process_gpu_usage",
+                return_value=GpuProcessUsage(
+                    pid=4242,
+                    available=True,
+                    used_bytes=64 * 1024 * 1024,
+                    used_megabytes=64.0,
+                    source="nvml",
+                    error=None,
+                ),
+            ),
             patch.object(audio, "ffmpeg_supports_rubberband", return_value=True),
             patch.object(runtime, "websocket_runtime_available", return_value=True),
         ):
@@ -107,6 +137,10 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertTrue(cast(bool, payload["provider_fallback"]))
         self.assertEqual(payload["provider_error"], "Failed to load CUDA runtime.")
         self.assertIsNone(payload["runtime_error"])
+        gpu = cast(dict[str, object], payload["gpu"])
+        self.assertEqual(gpu["process_pid"], 4242)
+        self.assertEqual(gpu["process_vram_used_mb"], 64.0)
+        self.assertEqual(gpu["source"], "nvml")
         queue = cast(dict[str, object], payload["queue"])
         worker_limit = cast(int, queue["worker_limit"])
         queue_limit = cast(int, queue["queue_limit"])

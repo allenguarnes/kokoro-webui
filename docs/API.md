@@ -59,6 +59,14 @@ Returns lightweight readiness and queue status.
   "provider_fallback": false,
   "provider_error": null,
   "runtime_error": null,
+  "gpu": {
+    "process_pid": 41234,
+    "available": true,
+    "process_vram_used_bytes": 201326592,
+    "process_vram_used_mb": 192.0,
+    "source": "nvml",
+    "error": null
+  },
   "queue": {
     "worker_limit": 2,
     "queue_limit": 8,
@@ -87,6 +95,7 @@ Returns lightweight readiness and queue status.
 | `active_provider` | Currently active provider, if available |
 | `provider_fallback` | Whether runtime fell back from the requested provider |
 | `runtime_error` | Runtime bootstrap failure, if any |
+| `gpu` | Per-process GPU memory for the current server process when NVML is available and the runtime is using a GPU provider |
 | `queue` | Current scheduler capacity, rejection counters, and queue-wait timing |
 
 ## `GET /api/capabilities`

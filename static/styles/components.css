@@ -301,6 +301,10 @@ button:disabled {
     gap: 0.3rem;
 }
 
+.stat-card[hidden] {
+    display: none;
+}
+
 .stat-name {
     color: var(--ink-soft);
     font-size: 0.68rem;
