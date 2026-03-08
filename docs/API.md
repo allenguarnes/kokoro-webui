@@ -7,7 +7,27 @@ This server exposes two API groups:
 - Native Kokoro WebUI routes under `/api/*` plus `ws://.../ws/*`
 - OpenAI-compatible routes under `/v1/*`
 
-## Overview
+## Quick Links
+
+### Native Endpoints
+
+- [Common Native Fields](#common-native-fields)
+- [`GET /api/health`](#get-apihealth)
+- [`GET /api/capabilities`](#get-apicapabilities)
+- [`POST /api/speak`](#post-apispeak)
+- [`POST /api/chunk-plan`](#post-apichunk-plan)
+- [`POST /api/speak-stream`](#post-apispeak-stream)
+- [`WS /ws/speak-stream`](#ws-wsspeak-stream)
+
+### OpenAI-Compatible Endpoints
+
+- [OpenAI-Compatible Endpoints](#openai-compatible-endpoints)
+- [`GET /v1/models`](#get-v1models)
+- [`GET /v1/models/{model_id}`](#get-v1modelsmodel_id)
+- [`POST /v1/audio/speech`](#post-v1audiospeech)
+- [Curl Examples](#curl-examples)
+
+## Native Endpoints
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -17,9 +37,6 @@ This server exposes two API groups:
 | `POST` | `/api/chunk-plan` | Return chunk metadata without audio |
 | `POST` | `/api/speak-stream` | Stream chunked audio over NDJSON |
 | `WS` | `/ws/speak-stream` | Stream chunked audio over WebSocket |
-| `GET` | `/v1/models` | OpenAI-compatible model list |
-| `GET` | `/v1/models/{model_id}` | OpenAI-compatible model metadata |
-| `POST` | `/v1/audio/speech` | OpenAI-compatible speech generation |
 
 ## Common Native Fields
 
@@ -378,6 +395,20 @@ Streams the same message types as `/api/speak-stream`, but over WebSocket.
 ### Message Types
 
 The server sends the same `meta`, `chunk`, `error`, and `done` shapes documented for `/api/speak-stream`.
+
+## OpenAI-Compatible Endpoints
+
+Most OpenAI-compatible clients expect the base URL to already include `/v1`, for example:
+
+- `http://127.0.0.1:8000/v1`
+
+That is usually the correct setting for external integrations. If you point those clients at `http://127.0.0.1:8000` instead, many of them will append `/models` or `/audio/speech` on their own and miss the compatibility routes.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/v1/models` | OpenAI-compatible model list |
+| `GET` | `/v1/models/{model_id}` | OpenAI-compatible model metadata |
+| `POST` | `/v1/audio/speech` | OpenAI-compatible speech generation |
 
 ## `GET /v1/models`
 
