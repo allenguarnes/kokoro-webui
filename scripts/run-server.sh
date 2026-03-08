@@ -240,7 +240,7 @@ import importlib.metadata as md
 import os
 from pathlib import Path
 
-from app.config import get_runtime_provider_mode
+from app.config import get_runtime_provider_mode, get_synthesis_workers
 from app.runtime import get_runtime_status
 
 items: list[tuple[str, str, str]] = []
@@ -267,6 +267,18 @@ except Exception as exc:
     items.append(('provider', 'error', str(exc)))
 else:
     items.append(('provider', 'ok', requested_provider))
+
+default_synthesis_workers = 2 if requested_provider == 'cpu' else 1
+try:
+    synthesis_workers = get_synthesis_workers(default=default_synthesis_workers)
+except Exception as exc:
+    items.append(('synth-workers', 'error', str(exc)))
+else:
+    is_explicit = 'KOKORO_SYNTH_WORKERS' in os.environ
+    detail = str(synthesis_workers)
+    if not is_explicit:
+        detail = f'{detail} (default)'
+    items.append(('synth-workers', 'ok', detail))
 
 try:
     status = get_runtime_status()
@@ -297,6 +309,8 @@ else:
             items.append(('cuda', 'warn', 'CUDAExecutionProvider detected but unusable; runtime is using CPU'))
         else:
             items.append(('cuda', 'warn', 'CUDAExecutionProvider unavailable; runtime will use CPU'))
+    if status.active_providers == ['CPUExecutionProvider'] and 'KOKORO_SYNTH_WORKERS' not in os.environ:
+        items.append(('cpu-tuning', 'ok', 'default worker cap is conservative; try KOKORO_SYNTH_WORKERS=3 on higher-core CPUs if serving concurrent requests'))
 
 for label, level, detail in items:
     print(f'{label}\t{level}\t{detail}')

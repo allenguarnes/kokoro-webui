@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
+import functools
 import io
 import json
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from typing import ParamSpec, TypeVar
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,9 +29,27 @@ from app.schemas import (
     SynthesisRequest,
 )
 
+P = ParamSpec("P")
+T = TypeVar("T")
+
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Kokoro WebUI")
+    default_synthesis_workers = 2 if config.get_runtime_provider_mode() == "cpu" else 1
+    synthesis_workers = config.get_synthesis_workers(default=default_synthesis_workers)
+    synthesis_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=synthesis_workers,
+        thread_name_prefix="kokoro-synth",
+    )
+    synthesis_slots = asyncio.Semaphore(synthesis_workers)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            synthesis_executor.shutdown(wait=False, cancel_futures=True)
+
+    app = FastAPI(title="Kokoro WebUI", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -36,10 +58,18 @@ def create_app() -> FastAPI:
     )
     app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
 
+    async def run_synthesis_task(
+        function: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+    ) -> T:
+        async with synthesis_slots:
+            loop = asyncio.get_running_loop()
+            task = functools.partial(function, *args, **kwargs)
+            return await loop.run_in_executor(synthesis_executor, task)
+
     async def synthesize_chunk_async(
         payload: SynthesisRequest, text: str
     ) -> RenderedChunk:
-        return await asyncio.to_thread(audio.synthesize_chunk, payload, text)
+        return await run_synthesis_task(audio.synthesize_chunk, payload, text)
 
     @app.get("/")
     async def index() -> FileResponse:
@@ -82,6 +112,7 @@ def create_app() -> FastAPI:
                 "provider_error": runtime_status.provider_error,
                 "runtime_error": runtime_status.runtime_error,
                 "pitch_shifting": audio.ffmpeg_supports_rubberband(),
+                "synthesis_workers": synthesis_workers,
                 "max_pitch_semitones": config.MAX_PITCH_SHIFT_SEMITONES,
                 "streaming": True,
                 "websocket_streaming": runtime.websocket_runtime_available(),
@@ -210,7 +241,7 @@ def create_app() -> FastAPI:
     async def build_chunk_event_async(
         payload: ChunkedSynthesisRequest, chunk: str, index: int, total_chunks: int
     ) -> tuple[dict[str, object], bytes]:
-        return await asyncio.to_thread(
+        return await run_synthesis_task(
             build_chunk_event,
             payload,
             chunk,

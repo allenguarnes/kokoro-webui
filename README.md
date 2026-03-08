@@ -173,6 +173,7 @@ The app auto-loads `.env` (if present).
 | `KOKORO_FFMPEG_TIMEOUT_SEC` | `20` | Timeout for ffmpeg/rubberband subprocess work |
 | `KOKORO_PROVIDER` | `auto` | Runtime selection: `auto`, `cpu`, or `cuda` |
 | `KOKORO_STRICT_PROVIDER` | `0` | Fail startup instead of falling back when requested provider cannot initialize |
+| `KOKORO_SYNTH_WORKERS` | `2` on CPU, `1` on auto/cuda | Cap concurrent synthesis jobs in the dedicated worker pool |
 | `KOKORO_CUDA_LIB_DIR` | unset | Optional. Use only when compatible CUDA libraries are installed outside the normal dynamic linker search paths |
 | `KOKORO_MODEL_PATH` | `models/kokoro-v1.0.onnx` | Override model path |
 | `KOKORO_VOICES_PATH` | `models/voices-v1.0.bin` | Override voices path |
@@ -186,9 +187,13 @@ KOKORO_RELOAD=0
 KOKORO_FFMPEG_TIMEOUT_SEC=20
 KOKORO_PROVIDER=auto
 KOKORO_STRICT_PROVIDER=0
+# Optional synthesis concurrency cap. Defaults to 2 on CPU, 1 on auto/cuda.
+# KOKORO_SYNTH_WORKERS=2
 # Only set when CUDA 12.x libs are in a non-standard location
 # KOKORO_CUDA_LIB_DIR=/opt/cuda-12.9/lib64
 ```
+
+`KOKORO_SYNTH_WORKERS` is intentionally conservative by default. CPU mode can benefit from a small amount of parallelism, but GPU mode should usually stay at `1` unless you have measured that additional concurrent jobs improve throughput on your hardware. If you expect concurrent CPU-only requests on a higher-core machine, `KOKORO_SYNTH_WORKERS=3` is a reasonable first tuning step to benchmark.
 
 Development reload:
 

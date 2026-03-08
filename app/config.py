@@ -96,8 +96,25 @@ def get_ffmpeg_timeout_seconds() -> float:
     return timeout
 
 
+def get_synthesis_workers(*, default: int) -> int:
+    raw_workers = os.getenv("KOKORO_SYNTH_WORKERS", str(default)).strip()
+    try:
+        workers = int(raw_workers)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"KOKORO_SYNTH_WORKERS must be a positive integer, got {raw_workers!r}."
+        ) from exc
+    if workers < 1:
+        raise RuntimeError(
+            f"KOKORO_SYNTH_WORKERS must be greater than 0, got {workers}."
+        )
+    return workers
+
+
 def get_runtime_provider_mode() -> ProviderMode:
-    raw_provider = os.getenv("KOKORO_PROVIDER", DEFAULT_RUNTIME_PROVIDER).strip().lower()
+    raw_provider = (
+        os.getenv("KOKORO_PROVIDER", DEFAULT_RUNTIME_PROVIDER).strip().lower()
+    )
     if raw_provider in {"auto", "cpu", "cuda"}:
         return cast(ProviderMode, raw_provider)
     raise RuntimeError(
