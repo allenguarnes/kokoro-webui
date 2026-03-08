@@ -38,6 +38,10 @@ T = TypeVar("T")
 
 def create_app() -> FastAPI:
     requested_provider = config.get_runtime_provider_mode()
+    runtime_status = runtime.get_runtime_status()
+    active_runtime_provider = (
+        runtime_status.active_providers[0] if runtime_status.active_providers else None
+    )
     default_synthesis_workers = 2 if requested_provider == "cpu" else 1
     synthesis_workers = config.get_synthesis_workers(default=default_synthesis_workers)
     default_synthesis_queue = synthesis_workers * 4
@@ -49,6 +53,7 @@ def create_app() -> FastAPI:
     )
     scheduler_policy = build_scheduler_policy(
         requested_provider=requested_provider,
+        active_provider=active_runtime_provider,
         worker_limit=synthesis_workers,
         queue_limit=synthesis_queue_limit,
         allow_experimental_gpu_concurrency=allow_experimental_gpu_concurrency,
@@ -79,6 +84,8 @@ def create_app() -> FastAPI:
             "worker_limit": metrics.worker_limit,
             "queue_limit": metrics.queue_limit,
             "capacity_limit": metrics.capacity_limit,
+            "interactive_reserve_slots": metrics.interactive_reserve_slots,
+            "stream_capacity_limit": metrics.stream_capacity_limit,
             "reserved_jobs": metrics.reserved_jobs,
             "active_jobs": metrics.active_jobs,
             "queued_jobs": metrics.queued_jobs,
@@ -95,11 +102,18 @@ def create_app() -> FastAPI:
     def scheduler_payload() -> dict[str, object]:
         return {
             "requested_provider": scheduler_policy.requested_provider,
+            "active_provider": scheduler_policy.active_provider,
             "runtime_kind": scheduler_policy.runtime_kind,
             "execution_model": scheduler_policy.execution_model,
-            "supported_execution_models": ["shared-runtime", "session-pool"],
+            "supported_execution_models": [scheduler_policy.execution_model],
+            "planned_execution_models": (
+                ["session-pool"]
+                if scheduler_policy.execution_model != "session-pool"
+                else []
+            ),
             "worker_limit": scheduler_policy.worker_limit,
             "queue_limit": scheduler_policy.queue_limit,
+            "interactive_reserve_slots": scheduler_policy.interactive_reserve_slots,
             "prefers_serial_workers": scheduler_policy.prefers_serial_workers,
             "experimental_gpu_concurrency": (
                 scheduler_policy.experimental_gpu_concurrency
@@ -108,15 +122,26 @@ def create_app() -> FastAPI:
             "warning": scheduler_policy.warning,
         }
 
-    async def run_synthesis_task(
-        function: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+    async def run_interactive_synthesis_task(
+        function: Callable[P, T],
+        *args: P.args,
+        **kwargs: P.kwargs,
     ) -> T:
-        return await synthesis_scheduler.run(function, *args, **kwargs)
+        return await synthesis_scheduler.run_interactive(function, *args, **kwargs)
+
+    async def run_stream_synthesis_task(
+        function: Callable[P, T],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> T:
+        return await synthesis_scheduler.run_stream(function, *args, **kwargs)
 
     async def synthesize_chunk_async(
         payload: SynthesisRequest, text: str
     ) -> RenderedChunk:
-        return await run_synthesis_task(audio.synthesize_chunk, payload, text)
+        return await run_interactive_synthesis_task(
+            audio.synthesize_chunk, payload, text
+        )
 
     @app.get("/")
     async def index() -> FileResponse:
@@ -311,7 +336,7 @@ def create_app() -> FastAPI:
     async def build_chunk_event_async(
         payload: ChunkedSynthesisRequest, chunk: str, index: int, total_chunks: int
     ) -> tuple[dict[str, object], bytes]:
-        return await run_synthesis_task(
+        return await run_stream_synthesis_task(
             build_chunk_event,
             payload,
             chunk,

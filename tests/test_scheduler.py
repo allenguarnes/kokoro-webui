@@ -15,6 +15,7 @@ class SchedulerPolicyTests(unittest.TestCase):
     def test_cpu_policy_allows_parallel_workers(self) -> None:
         policy = build_scheduler_policy(
             requested_provider="cpu",
+            active_provider="CPUExecutionProvider",
             worker_limit=3,
             queue_limit=12,
         )
@@ -26,9 +27,23 @@ class SchedulerPolicyTests(unittest.TestCase):
         self.assertIn("worker pool", policy.concurrency_note)
         self.assertIsNone(policy.warning)
 
-    def test_gpu_policy_warns_when_auto_mode_uses_multiple_workers(self) -> None:
+    def test_gpu_policy_blocks_when_auto_resolves_to_gpu_without_opt_in(self) -> None:
+        with self.assertRaises(RuntimeError) as context:
+            _ = build_scheduler_policy(
+                requested_provider="auto",
+                active_provider="CUDAExecutionProvider",
+                worker_limit=2,
+                queue_limit=8,
+            )
+
+        self.assertIn("active runtime provider is GPU-backed", str(context.exception))
+
+    def test_gpu_policy_warns_when_auto_workers_exceed_one_without_active_gpu(
+        self,
+    ) -> None:
         policy = build_scheduler_policy(
             requested_provider="auto",
+            active_provider=None,
             worker_limit=2,
             queue_limit=8,
         )
@@ -44,6 +59,7 @@ class SchedulerPolicyTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as context:
             _ = build_scheduler_policy(
                 requested_provider="cuda",
+                active_provider="CUDAExecutionProvider",
                 worker_limit=2,
                 queue_limit=8,
             )
@@ -53,6 +69,7 @@ class SchedulerPolicyTests(unittest.TestCase):
     def test_cuda_policy_allows_multiple_workers_with_opt_in(self) -> None:
         policy = build_scheduler_policy(
             requested_provider="cuda",
+            active_provider="CUDAExecutionProvider",
             worker_limit=2,
             queue_limit=8,
             allow_experimental_gpu_concurrency=True,
@@ -69,6 +86,7 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_scheduler_snapshot_tracks_active_and_queued_jobs(self) -> None:
         policy = build_scheduler_policy(
             requested_provider="cpu",
+            active_provider="CPUExecutionProvider",
             worker_limit=1,
             queue_limit=1,
         )
@@ -83,11 +101,15 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             return "done"
 
         try:
-            first_task = asyncio.create_task(scheduler.run(blocking_job, "first"))
+            first_task = asyncio.create_task(
+                scheduler.run_interactive(blocking_job, "first")
+            )
             while not started.is_set():
                 await asyncio.sleep(0.01)
 
-            second_task = asyncio.create_task(scheduler.run(blocking_job, "second"))
+            second_task = asyncio.create_task(
+                scheduler.run_interactive(blocking_job, "second")
+            )
             await asyncio.sleep(0.05)
 
             metrics = scheduler.snapshot()
@@ -100,7 +122,7 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(metrics.queue_wait_samples, 1)
 
             with self.assertRaises(SynthesisOverloadedError):
-                _ = await scheduler.run(blocking_job, "third")
+                _ = await scheduler.run_interactive(blocking_job, "third")
 
             release.set()
             self.assertEqual(await first_task, "done")
@@ -116,5 +138,51 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(final_metrics.queue_wait_samples, 2)
             self.assertGreater(final_metrics.queue_wait_max_ms, 0.0)
             self.assertGreater(final_metrics.queue_wait_avg_ms, 0.0)
+        finally:
+            scheduler.shutdown()
+
+    async def test_stream_jobs_leave_reserved_capacity_for_interactive_jobs(
+        self,
+    ) -> None:
+        policy = build_scheduler_policy(
+            requested_provider="cpu",
+            active_provider="CPUExecutionProvider",
+            worker_limit=1,
+            queue_limit=1,
+        )
+        scheduler = SynthesisScheduler(policy=policy)
+        first_started = threading.Event()
+        release = threading.Event()
+
+        def blocking_job(label: str) -> str:
+            if label == "stream-1":
+                first_started.set()
+            _ = release.wait(timeout=2.0)
+            return label
+
+        try:
+            first_stream = asyncio.create_task(
+                scheduler.run_stream(blocking_job, "stream-1")
+            )
+            while not first_started.is_set():
+                await asyncio.sleep(0.01)
+
+            with self.assertRaises(SynthesisOverloadedError):
+                _ = await scheduler.run_stream(blocking_job, "stream-2")
+
+            interactive_job = asyncio.create_task(
+                scheduler.run_interactive(blocking_job, "interactive-1")
+            )
+            await asyncio.sleep(0.05)
+
+            metrics = scheduler.snapshot()
+            self.assertEqual(metrics.interactive_reserve_slots, 1)
+            self.assertEqual(metrics.stream_capacity_limit, 1)
+            self.assertEqual(metrics.reserved_jobs, 2)
+            self.assertEqual(metrics.queued_jobs, 1)
+
+            release.set()
+            self.assertEqual(await first_stream, "stream-1")
+            self.assertEqual(await interactive_job, "interactive-1")
         finally:
             scheduler.shutdown()

@@ -325,20 +325,6 @@ items.append((
 ))
 
 try:
-    scheduler_policy = build_scheduler_policy(
-        requested_provider=requested_provider,
-        worker_limit=synthesis_workers,
-        queue_limit=synthesis_queue,
-        allow_experimental_gpu_concurrency=allow_experimental_gpu_concurrency,
-    )
-except Exception as exc:
-    items.append(('scheduler', 'error', str(exc)))
-else:
-    items.append(('scheduler', 'ok', scheduler_policy.execution_model))
-    if scheduler_policy.warning:
-        items.append(('scheduler-warn', 'warn', scheduler_policy.warning))
-
-try:
     status = get_runtime_status()
 except Exception as exc:
     items.append(('runtime', 'error', str(exc)))
@@ -369,6 +355,22 @@ else:
             items.append(('cuda', 'warn', 'CUDAExecutionProvider unavailable; runtime will use CPU'))
     if status.active_providers == ['CPUExecutionProvider'] and 'KOKORO_SYNTH_WORKERS' not in os.environ:
         items.append(('cpu-tuning', 'ok', 'default worker cap is conservative; try KOKORO_SYNTH_WORKERS=3 on higher-core CPUs if serving concurrent requests'))
+
+    active_provider = status.active_providers[0] if status.active_providers else None
+    try:
+        scheduler_policy = build_scheduler_policy(
+            requested_provider=requested_provider,
+            active_provider=active_provider,
+            worker_limit=synthesis_workers,
+            queue_limit=synthesis_queue,
+            allow_experimental_gpu_concurrency=allow_experimental_gpu_concurrency,
+        )
+    except Exception as exc:
+        items.append(('scheduler', 'error', str(exc)))
+    else:
+        items.append(('scheduler', 'ok', scheduler_policy.execution_model))
+        if scheduler_policy.warning:
+            items.append(('scheduler-warn', 'warn', scheduler_policy.warning))
 
 for label, level, detail in items:
     print(f'{label}\t{level}\t{detail}')

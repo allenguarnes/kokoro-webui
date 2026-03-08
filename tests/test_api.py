@@ -51,6 +51,7 @@ class ApiIntegrationTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.existing_path = Path(__file__)
+        runtime.clear_runtime_caches()
         self.patch_stack = ExitStack()
         _ = self.patch_stack.enter_context(
             patch.object(config, "get_runtime_provider_mode", return_value="cpu")
@@ -160,7 +161,11 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertIsInstance(scheduler["concurrency_note"], str)
         self.assertEqual(
             scheduler["supported_execution_models"],
-            ["shared-runtime", "session-pool"],
+            ["shared-runtime"],
+        )
+        self.assertEqual(
+            scheduler["planned_execution_models"],
+            ["session-pool"],
         )
 
     def test_health_reports_runtime_error_as_not_ready(self) -> None:

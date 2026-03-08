@@ -12,6 +12,7 @@ P = ParamSpec("P")
 T = TypeVar("T")
 SchedulerRuntimeKind = Literal["cpu", "gpu"]
 SchedulerExecutionModel = Literal["shared-runtime", "session-pool"]
+SchedulerTaskClass = Literal["interactive", "stream"]
 
 
 class SynthesisOverloadedError(RuntimeError):
@@ -21,10 +22,12 @@ class SynthesisOverloadedError(RuntimeError):
 @dataclass(frozen=True)
 class SchedulerPolicy:
     requested_provider: str
+    active_provider: str | None
     runtime_kind: SchedulerRuntimeKind
     execution_model: SchedulerExecutionModel
     worker_limit: int
     queue_limit: int
+    interactive_reserve_slots: int
     prefers_serial_workers: bool
     experimental_gpu_concurrency: bool
     concurrency_note: str
@@ -36,6 +39,8 @@ class SchedulerMetrics:
     worker_limit: int
     queue_limit: int
     capacity_limit: int
+    interactive_reserve_slots: int
+    stream_capacity_limit: int
     reserved_jobs: int
     active_jobs: int
     queued_jobs: int
@@ -99,17 +104,30 @@ def build_execution_backend(policy: SchedulerPolicy) -> ExecutionBackend:
 def build_scheduler_policy(
     *,
     requested_provider: str,
+    active_provider: str | None,
     worker_limit: int,
     queue_limit: int,
     allow_experimental_gpu_concurrency: bool = False,
 ) -> SchedulerPolicy:
-    if requested_provider == "cpu":
+    capacity_limit = worker_limit + queue_limit
+    interactive_reserve_slots = 1 if capacity_limit > 1 else 0
+    runtime_kind: SchedulerRuntimeKind
+    if active_provider == "CPUExecutionProvider" or (
+        active_provider is None and requested_provider == "cpu"
+    ):
+        runtime_kind = "cpu"
+    else:
+        runtime_kind = "gpu"
+
+    if runtime_kind == "cpu":
         return SchedulerPolicy(
             requested_provider=requested_provider,
+            active_provider=active_provider,
             runtime_kind="cpu",
             execution_model="shared-runtime",
             worker_limit=worker_limit,
             queue_limit=queue_limit,
+            interactive_reserve_slots=interactive_reserve_slots,
             prefers_serial_workers=False,
             experimental_gpu_concurrency=False,
             concurrency_note=(
@@ -119,12 +137,12 @@ def build_scheduler_policy(
         )
 
     if (
-        requested_provider == "cuda"
+        active_provider in {"CUDAExecutionProvider", "TensorrtExecutionProvider"}
         and worker_limit > 1
         and not allow_experimental_gpu_concurrency
     ):
         raise RuntimeError(
-            "KOKORO_SYNTH_WORKERS > 1 is blocked when KOKORO_PROVIDER=cuda because the current GPU path shares one runtime session. "
+            "KOKORO_SYNTH_WORKERS > 1 is blocked when the active runtime provider is GPU-backed because the current path shares one runtime session. "
             + "Set KOKORO_ALLOW_EXPERIMENTAL_CUDA_CONCURRENCY=1 only if you are intentionally benchmarking shared-session GPU concurrency."
         )
 
@@ -134,14 +152,16 @@ def build_scheduler_policy(
         if allow_experimental_gpu_concurrency:
             warning = "Experimental shared-session GPU concurrency is enabled. Benchmark latency, throughput, and VRAM usage before treating this as production-safe."
         else:
-            warning = "GPU-preferred mode currently shares one runtime session. If this resolves to CUDA, KOKORO_SYNTH_WORKERS > 1 is an experimental tuning path."
+            warning = "GPU-preferred mode currently shares one runtime session. If the runtime resolves to a GPU provider, KOKORO_SYNTH_WORKERS > 1 is an experimental tuning path."
 
     return SchedulerPolicy(
         requested_provider=requested_provider,
+        active_provider=active_provider,
         runtime_kind="gpu",
         execution_model="shared-runtime",
         worker_limit=worker_limit,
         queue_limit=queue_limit,
+        interactive_reserve_slots=interactive_reserve_slots,
         prefers_serial_workers=True,
         experimental_gpu_concurrency=experimental_gpu_concurrency,
         concurrency_note=(
@@ -158,12 +178,21 @@ class SynthesisScheduler:
         self.worker_limit: int = policy.worker_limit
         self.queue_limit: int = policy.queue_limit
         self.capacity_limit: int = self.worker_limit + self.queue_limit
+        self.interactive_reserve_slots: int = policy.interactive_reserve_slots
+        self.stream_capacity_limit: int = (
+            self.capacity_limit - self.interactive_reserve_slots
+        )
         self._backend: ExecutionBackend = build_execution_backend(policy)
         self._admission_tokens: asyncio.Queue[None] = asyncio.Queue(
             maxsize=self.capacity_limit
         )
         for _ in range(self.capacity_limit):
             self._admission_tokens.put_nowait(None)
+        self._stream_tokens: asyncio.Queue[None] = asyncio.Queue(
+            maxsize=self.stream_capacity_limit
+        )
+        for _ in range(self.stream_capacity_limit):
+            self._stream_tokens.put_nowait(None)
         self._reserved_jobs: int = 0
         self._active_jobs: int = 0
         self._admitted_jobs_total: int = 0
@@ -186,6 +215,8 @@ class SynthesisScheduler:
             worker_limit=self.worker_limit,
             queue_limit=self.queue_limit,
             capacity_limit=self.capacity_limit,
+            interactive_reserve_slots=self.interactive_reserve_slots,
+            stream_capacity_limit=self.stream_capacity_limit,
             reserved_jobs=self._reserved_jobs,
             active_jobs=self._active_jobs,
             queued_jobs=queued_jobs,
@@ -199,12 +230,28 @@ class SynthesisScheduler:
             queue_wait_samples=self._queue_wait_samples,
         )
 
-    async def run(
-        self, function: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+    async def _run(
+        self,
+        task_class: SchedulerTaskClass,
+        function: Callable[P, T],
+        *args: P.args,
+        **kwargs: P.kwargs,
     ) -> T:
+        stream_reserved = False
+        if task_class == "stream":
+            try:
+                _ = self._stream_tokens.get_nowait()
+                stream_reserved = True
+            except asyncio.QueueEmpty as exc:
+                self._rejected_jobs_total += 1
+                raise SynthesisOverloadedError(
+                    "Synthesis queue is full. Try again shortly."
+                ) from exc
         try:
             token = self._admission_tokens.get_nowait()
         except asyncio.QueueEmpty as exc:
+            if stream_reserved:
+                self._stream_tokens.put_nowait(None)
             self._rejected_jobs_total += 1
             raise SynthesisOverloadedError(
                 "Synthesis queue is full. Try again shortly."
@@ -230,6 +277,24 @@ class SynthesisScheduler:
             self._reserved_jobs -= 1
             self._completed_jobs_total += 1
             self._admission_tokens.put_nowait(token)
+            if stream_reserved:
+                self._stream_tokens.put_nowait(None)
+
+    async def run_interactive(
+        self,
+        function: Callable[P, T],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> T:
+        return await self._run("interactive", function, *args, **kwargs)
+
+    async def run_stream(
+        self,
+        function: Callable[P, T],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> T:
+        return await self._run("stream", function, *args, **kwargs)
 
     def shutdown(self) -> None:
         self._backend.shutdown()
