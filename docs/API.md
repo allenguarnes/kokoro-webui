@@ -21,7 +21,7 @@ This server exposes two API groups:
 
 ### OpenAI-Compatible Endpoints
 
-- [OpenAI-Compatible Endpoints](#openai-compatible-endpoints)
+- [OpenAI Compatibility](#openai-compatibility)
 - [`GET /v1/models`](#get-v1models)
 - [`GET /v1/models/{model_id}`](#get-v1modelsmodel_id)
 - [`POST /v1/audio/speech`](#post-v1audiospeech)
@@ -396,7 +396,7 @@ Streams the same message types as `/api/speak-stream`, but over WebSocket.
 
 The server sends the same `meta`, `chunk`, `error`, and `done` shapes documented for `/api/speak-stream`.
 
-## OpenAI-Compatible Endpoints
+## OpenAI Compatibility
 
 Most OpenAI-compatible clients expect the base URL to already include `/v1`, for example:
 
