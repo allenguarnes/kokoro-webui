@@ -5,18 +5,18 @@ This project includes two internal tools for performance tuning:
 - `scripts/tune_runtime.py`: interactive tuning loop
 - `scripts/benchmark_runtime.py`: raw benchmark harness
 
-Use the interactive tuner first. Use the raw benchmark script when you want one-shot summaries or machine-readable JSON.
+Use the interactive tuner first. Use the raw benchmark script when you want one-shot summaries or JSON output.
 
 ## Goals
 
-The tuning flow is designed to answer questions like:
+The tuning flow is meant to answer questions like:
 
 - Does `KOKORO_SYNTH_WORKERS` help on this machine?
 - Does the answer change between CPU and CUDA?
 - Does a setting help one-shot synthesis but hurt streaming?
 - Are we reducing queue wait at the cost of worse end-user latency?
 
-The tool is intentionally concurrency-aware. Worker-pool changes only matter under contention, so the tuner defaults to concurrent HTTP benchmark batches instead of serial single-request runs.
+The tool is intentionally concurrency-aware. Worker-pool changes only matter under load, so the tuner defaults to concurrent HTTP benchmark batches instead of serial single-request runs.
 
 ## What To Tune
 
@@ -164,7 +164,7 @@ Bad candidate:
 - but `mean_ms` and `p95_ms` get worse
 - or streaming throughput drops
 
-That usually means the system is admitting more work sooner, but the concurrent jobs are interfering with each other enough that real user-facing performance is worse.
+That usually means the system is admitting more work sooner, but the jobs are interfering with each other enough that real user-facing performance is worse.
 
 ## Built-in Recommendation
 
@@ -185,7 +185,7 @@ Possible outcomes:
 - `KEEP PREVIOUS`
 - `CONTINUE TESTING`
 
-Treat this as an informed heuristic, not an oracle.
+Treat this as a heuristic, not a final answer.
 
 ## Optional LLM Recommendation
 
@@ -224,7 +224,7 @@ uv run python scripts/tune_runtime.py \
 
 If no LLM settings are provided, the tuner behaves normally with no LLM calls.
 
-If the LLM request fails, the benchmark result still completes and the script prints a warning instead of aborting.
+If the LLM request fails, the benchmark still completes and the script prints a warning instead of aborting.
 
 ## Current Limitation
 
@@ -235,7 +235,7 @@ When `--concurrency > 1`, concurrent benchmark mode currently supports HTTP endp
 
 WebSocket benchmark cases such as `stream_ws_wav_pitch0` are currently limited to `--concurrency 1`.
 
-The tuner now validates this up front and stops immediately with a clear message instead of failing deep in the benchmark run.
+The tuner validates this up front and stops immediately with a clear message instead of failing later in the run.
 
 ## Suggested Workflow
 
@@ -254,4 +254,4 @@ For shared-runtime CUDA mode:
 - `workers > 1` is experimental
 - more workers can reduce queue wait while still making real request latency worse
 
-That is exactly why the tuning tools exist: to measure the tradeoff instead of guessing from core count or GPU presence.
+That is why the tuning tools exist: to measure the tradeoff instead of guessing from core count or GPU presence.

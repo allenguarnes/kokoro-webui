@@ -90,7 +90,7 @@ Returns lightweight readiness and queue status.
 
 ## `GET /api/capabilities`
 
-Returns the richer runtime/configuration surface used by the Web UI.
+Returns the full runtime and configuration surface used by the Web UI.
 
 ### Response
 
@@ -161,7 +161,7 @@ Returns the richer runtime/configuration surface used by the Web UI.
 | `websocket_streaming` | Whether the runtime can serve WebSocket streaming |
 | `synthesis_workers` | Number of active synthesis worker threads |
 | `synthesis_queue_limit` | Number of queued jobs allowed behind active workers |
-| `scheduler` | Provider-aware scheduling policy used by the backend |
+| `scheduler` | Provider-aware scheduling policy currently used by the backend |
 | `queue.queue_wait_*` | Recent and cumulative wait-time indicators for admitted jobs |
 
 ## `POST /api/speak`

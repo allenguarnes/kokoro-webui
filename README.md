@@ -6,7 +6,7 @@
 
 Local text-to-speech server and browser UI powered by Kokoro ONNX.
 
-Kokoro WebUI provides:
+Kokoro WebUI includes:
 - Native synthesis endpoints (`/api/*`)
 - OpenAI-compatible speech endpoints (`/v1/*`)
 - Streaming over NDJSON and WebSocket
@@ -39,21 +39,23 @@ Request flow:
 
 ## Quick Start
 
-### 1) Install dependencies
+This is the shortest path to a working local install.
 
-CPU-only baseline:
+### 1. Install dependencies
+
+CPU-only:
 
 ```bash
 uv sync
 ```
 
-Recommended Linux/server stack:
+Linux/server stack:
 
 ```bash
 uv sync --extra server
 ```
 
-Optional NVIDIA GPU runtime:
+NVIDIA GPU runtime:
 
 ```bash
 uv sync --extra gpu
@@ -65,7 +67,7 @@ Linux + NVIDIA GPU:
 uv sync --extra server --extra gpu
 ```
 
-### 2) Add model files
+### 2. Add model files
 
 Place these files in `models/`:
 
@@ -74,44 +76,43 @@ models/kokoro-v1.0.onnx
 models/voices-v1.0.bin
 ```
 
-Model source:
+Download source:
 [model-files-v1.0 release](https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.0)
 
-### 3) Run the server
+### 3. Start the server
 
 ```bash
 ./scripts/run-server.sh
 ```
 
-Quiet startup:
+Then open `http://127.0.0.1:8000`
+
+Useful variants:
 
 ```bash
 ./scripts/run-server.sh --quiet-checks
-```
-
-Preflight only:
-
-```bash
 ./scripts/run-server.sh --check-only
 ```
 
-Open: `http://127.0.0.1:8000`
-
-`./scripts/run-server.sh` is the Unix-like shell helper. It loads `.env`, prepends `KOKORO_CUDA_LIB_DIR` to `LD_LIBRARY_PATH` when set, prints a prerequisite preflight summary, and then starts the app.
+`./scripts/run-server.sh` is the Unix-like launcher. It loads `.env`, adds `KOKORO_CUDA_LIB_DIR` to `LD_LIBRARY_PATH` when needed, runs a preflight check, and then starts the app.
 
 Useful flags:
 - `--quiet-checks`: start without printing the preflight summary
 - `--check-only`: print the preflight summary and exit without starting the server
 
-## Runtime Requirements
+## Advanced Configuration
 
-### Required
+Use this section once the basic setup is working.
+
+### Runtime Requirements
+
+Required:
 
 - Python `3.12` or `3.13`
 - `uv`
 - Model files listed above
 
-### Optional (feature-dependent)
+Optional, depending on features:
 
 - `ffmpeg`
   - Required for `opus` output
@@ -135,7 +136,7 @@ Useful flags:
 > [!WARNING]
 > If `ffmpeg` is missing, requests using `format: opus` fail with HTTP 400.
 
-## GPU Runtime
+### GPU Runtime
 
 GPU support is optional and best-effort.
 
@@ -176,7 +177,7 @@ If CUDA is requested explicitly and you want startup to fail instead of falling 
 KOKORO_PROVIDER=cuda KOKORO_STRICT_PROVIDER=1 ./scripts/run-server.sh
 ```
 
-## Configuration
+### Configuration
 
 The app auto-loads `.env` (if present).
 
@@ -216,11 +217,11 @@ KOKORO_STRICT_PROVIDER=0
 # KOKORO_CUDA_LIB_DIR=/opt/cuda-12.9/lib64
 ```
 
-`KOKORO_SYNTH_WORKERS` is intentionally conservative by default. CPU mode can benefit from a small amount of parallelism, but GPU mode should usually stay at `1` unless you have measured that additional concurrent jobs improve throughput on your hardware. If you expect concurrent CPU-only requests on a higher-core machine, `KOKORO_SYNTH_WORKERS=3` is a reasonable first tuning step to benchmark.
+`KOKORO_SYNTH_WORKERS` is intentionally conservative by default. CPU mode can benefit from a small amount of parallelism. GPU mode should usually stay at `1` unless you have measured a real gain on your hardware. On a higher-core CPU-only machine, `KOKORO_SYNTH_WORKERS=3` is a reasonable first value to test.
 
 `KOKORO_SYNTH_QUEUE` controls how many additional synthesis jobs can wait behind the active workers before the server starts rejecting overload with `503`. That is useful once the app is serving multiple users instead of only local, single-user traffic.
 
-`/api/health` now also reports queue wait-time metrics so you can tell the difference between “idle,” “busy but healthy,” and “saturating with growing wait time.”
+`/api/health` also reports queue wait-time metrics so you can tell the difference between idle, busy, and saturated behavior.
 
 The scheduler is now provider-aware at the policy level:
 - CPU mode allows a small shared-runtime worker pool
@@ -228,11 +229,15 @@ The scheduler is now provider-aware at the policy level:
 
 If you explicitly force `KOKORO_PROVIDER=cuda`, the server now blocks `KOKORO_SYNTH_WORKERS > 1` by default. Use `KOKORO_ALLOW_EXPERIMENTAL_CUDA_CONCURRENCY=1` only when you are intentionally benchmarking shared-session GPU concurrency.
 
+### API and Tuning Docs
+
+- API reference: [docs/API.md](/mnt/data/Work/Personal/kokoro-webui/docs/API.md)
+- Tuning guide: [docs/TUNING.md](/mnt/data/Work/Personal/kokoro-webui/docs/TUNING.md)
+
 Tuning tools:
 
 - `scripts/tune_runtime.py` is the interactive tuner for `KOKORO_SYNTH_WORKERS` and future performance knobs.
 - `scripts/benchmark_runtime.py` is the raw benchmark harness.
-- Full tuning guide: [docs/TUNING.md](/mnt/data/Work/Personal/kokoro-webui/docs/TUNING.md)
 
 Examples:
 
