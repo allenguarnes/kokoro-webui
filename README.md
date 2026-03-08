@@ -228,6 +228,21 @@ The scheduler is now provider-aware at the policy level:
 
 If you explicitly force `KOKORO_PROVIDER=cuda`, the server now blocks `KOKORO_SYNTH_WORKERS > 1` by default. Use `KOKORO_ALLOW_EXPERIMENTAL_CUDA_CONCURRENCY=1` only when you are intentionally benchmarking shared-session GPU concurrency.
 
+Tuning tools:
+
+- `scripts/tune_runtime.py` is the interactive tuner for `KOKORO_SYNTH_WORKERS` and future performance knobs.
+- `scripts/benchmark_runtime.py` is the raw benchmark harness.
+- Full tuning guide: [docs/TUNING.md](/mnt/data/Work/Personal/kokoro-webui/docs/TUNING.md)
+
+Examples:
+
+```bash
+uv run python scripts/tune_runtime.py --provider cpu
+uv run python scripts/tune_runtime.py --provider auto --cuda-lib-dir /opt/cuda-12.9/lib64
+uv run python scripts/tune_runtime.py --provider auto --concurrency 8 --cuda-lib-dir /opt/cuda-12.9/lib64
+uv run python scripts/benchmark_runtime.py --providers cpu auto --concurrency 4 --cuda-lib-dir /opt/cuda-12.9/lib64
+```
+
 Development reload:
 
 ```bash

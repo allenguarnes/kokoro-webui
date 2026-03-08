@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import statistics
@@ -12,8 +13,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import cast
 
+import httpx
 from httpx import Response
 from starlette.testclient import TestClient
+from starlette.types import ASGIApp
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_STREAM_TEXT = (
@@ -48,11 +51,16 @@ class CaseSummary:
     endpoint: str
     format: str
     pitch: float
+    concurrency: int
     iterations: int
+    request_count: int
     mean_ms: float
+    p95_ms: float
     median_ms: float
     min_ms: float
     max_ms: float
+    mean_batch_ms: float
+    throughput_rps: float
     mean_audio_bytes: int
     mean_wire_bytes: int
     mean_audio_duration_sec: float
@@ -69,6 +77,14 @@ class ProviderRun:
     provider_fallback: bool
     provider_error: str | None
     runtime_error: str | None
+    concurrency: int
+    synthesis_workers: int
+    synthesis_queue_limit: int
+    scheduler_execution_model: str
+    queue_rejected_jobs_total: int
+    queue_wait_avg_ms: float
+    queue_wait_max_ms: float
+    queue_wait_samples: int
     cases: list[CaseSummary]
 
 
@@ -77,8 +93,10 @@ class CliArgs:
     child: bool
     iterations: int
     warmup: int
+    concurrency: int
     providers: list[str]
     cuda_lib_dir: str | None
+    cases: list[str] | None
 
 
 CASES: tuple[BenchmarkCase, ...] = (
@@ -149,9 +167,17 @@ def build_payload(case: BenchmarkCase) -> dict[str, object]:
 
 
 def summarize_case(
-    case: BenchmarkCase, samples: list[SampleResult], iterations: int
+    case: BenchmarkCase,
+    samples: list[SampleResult],
+    iterations: int,
+    concurrency: int,
+    batch_elapsed_values: list[float],
 ) -> CaseSummary:
     elapsed_values = [sample.elapsed_ms for sample in samples]
+    sorted_elapsed = sorted(elapsed_values)
+    p95_index = max(
+        0, min(len(sorted_elapsed) - 1, int(len(sorted_elapsed) * 0.95) - 1)
+    )
     mean_audio_bytes = round(statistics.fmean(sample.audio_bytes for sample in samples))
     mean_wire_bytes = round(statistics.fmean(sample.wire_bytes for sample in samples))
     mean_audio_duration_sec = statistics.fmean(
@@ -169,11 +195,18 @@ def summarize_case(
         endpoint=case.endpoint,
         format=case.format,
         pitch=case.pitch,
+        concurrency=concurrency,
         iterations=iterations,
+        request_count=len(samples),
         mean_ms=round(statistics.fmean(elapsed_values), 2),
+        p95_ms=round(sorted_elapsed[p95_index], 2),
         median_ms=round(statistics.median(elapsed_values), 2),
         min_ms=round(min(elapsed_values), 2),
         max_ms=round(max(elapsed_values), 2),
+        mean_batch_ms=round(statistics.fmean(batch_elapsed_values), 2),
+        throughput_rps=round(len(samples) / (sum(batch_elapsed_values) / 1000), 2)
+        if batch_elapsed_values and sum(batch_elapsed_values) > 0
+        else 0.0,
         mean_audio_bytes=mean_audio_bytes,
         mean_wire_bytes=mean_wire_bytes,
         mean_audio_duration_sec=round(mean_audio_duration_sec, 3),
@@ -183,6 +216,41 @@ def summarize_case(
         if realtime_values
         else None,
     )
+
+
+def select_cases(case_names: list[str] | None) -> tuple[BenchmarkCase, ...]:
+    if case_names is None:
+        return CASES
+    cases_by_name = {case.name: case for case in CASES}
+    selected: list[BenchmarkCase] = []
+    for case_name in case_names:
+        case = cases_by_name.get(case_name)
+        if case is None:
+            available = ", ".join(sorted(cases_by_name))
+            raise SystemExit(
+                f"Unknown case {case_name!r}. Available cases: {available}"
+            )
+        selected.append(case)
+    return tuple(selected)
+
+
+def validate_case_selection(
+    case_names: list[str] | None, concurrency: int
+) -> tuple[BenchmarkCase, ...]:
+    selected = select_cases(case_names)
+    if concurrency <= 1:
+        return selected
+    websocket_cases = [
+        case.name for case in selected if case.endpoint == "/ws/speak-stream"
+    ]
+    if websocket_cases:
+        websocket_list = ", ".join(websocket_cases)
+        message = (
+            "Concurrent benchmark mode currently supports HTTP endpoints only when "
+            f"--concurrency > 1. Remove these websocket cases or rerun with --concurrency 1: {websocket_list}"
+        )
+        raise SystemExit(message)
+    return selected
 
 
 def run_case_http_speak(client: TestClient, case: BenchmarkCase) -> SampleResult:
@@ -235,6 +303,89 @@ def run_case_http_stream(client: TestClient, case: BenchmarkCase) -> SampleResul
     )
 
 
+async def run_case_http_speak_async(
+    client: httpx.AsyncClient, case: BenchmarkCase
+) -> SampleResult:
+    payload = build_payload(case)
+    started = time.perf_counter()
+    response = await client.post(case.endpoint, json=payload)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    _ = response.raise_for_status()
+    audio_bytes = response.content
+    duration_header = cast(str | None, response.headers.get("x-audio-duration"))
+    duration_sec = float(duration_header) if duration_header else 0.0
+    return SampleResult(
+        elapsed_ms=elapsed_ms,
+        wire_bytes=len(audio_bytes),
+        audio_bytes=len(audio_bytes),
+        audio_duration_sec=duration_sec,
+        chunk_count=1,
+        synth_ms_sum=elapsed_ms,
+    )
+
+
+async def run_case_http_stream_async(
+    client: httpx.AsyncClient, case: BenchmarkCase
+) -> SampleResult:
+    payload = build_payload(case)
+    started = time.perf_counter()
+    response = await client.post(case.endpoint, json=payload)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    _ = response.raise_for_status()
+    wire_bytes = len(response.content)
+    audio_bytes = 0
+    audio_duration_sec = 0.0
+    chunk_count = 0
+    synth_ms_sum = 0.0
+    for line in response.text.splitlines():
+        if not line.strip():
+            continue
+        event = as_object_mapping(cast(object, json.loads(line)))
+        if get_string(event, "type") != "chunk":
+            continue
+        chunk_count += 1
+        audio_bytes += get_int(event, "bytes")
+        audio_duration_sec += get_float(event, "duration_sec")
+        synth_ms_sum += get_float(event, "synth_ms")
+    return SampleResult(
+        elapsed_ms=elapsed_ms,
+        wire_bytes=wire_bytes,
+        audio_bytes=audio_bytes,
+        audio_duration_sec=audio_duration_sec,
+        chunk_count=chunk_count,
+        synth_ms_sum=synth_ms_sum,
+    )
+
+
+async def run_http_case_concurrent(
+    app: ASGIApp, case: BenchmarkCase, iterations: int, warmup: int, concurrency: int
+) -> tuple[list[SampleResult], list[float]]:
+    transport = httpx.ASGITransport(app=app)
+    runner = (
+        run_case_http_speak_async
+        if case.endpoint == "/api/speak"
+        else run_case_http_stream_async
+    )
+    samples: list[SampleResult] = []
+    batch_elapsed_values: list[float] = []
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://benchmark.local",
+    ) as client:
+        for _ in range(warmup):
+            _ = await asyncio.gather(
+                *(runner(client, case) for _ in range(concurrency))
+            )
+        for _ in range(iterations):
+            started = time.perf_counter()
+            batch_results = await asyncio.gather(
+                *(runner(client, case) for _ in range(concurrency))
+            )
+            batch_elapsed_values.append((time.perf_counter() - started) * 1000)
+            samples.extend(batch_results)
+    return samples, batch_elapsed_values
+
+
 def run_case_websocket(client: TestClient, case: BenchmarkCase) -> SampleResult:
     payload = build_payload(case)
     started = time.perf_counter()
@@ -270,46 +421,95 @@ def run_case_websocket(client: TestClient, case: BenchmarkCase) -> SampleResult:
     )
 
 
-def run_provider_benchmark(iterations: int, warmup: int) -> ProviderRun:
+def run_provider_benchmark(
+    iterations: int,
+    warmup: int,
+    concurrency: int,
+    case_names: list[str] | None = None,
+) -> ProviderRun:
     import app.main as main
     import app.runtime as runtime
 
     runtime.clear_runtime_caches()
     client = TestClient(main.app)
     try:
+        capabilities: Response = client.get("/api/capabilities")
+        _ = capabilities.raise_for_status()
+        capabilities_payload = as_object_mapping(cast(object, capabilities.json()))
+        case_summaries: list[CaseSummary] = []
+        selected_cases = validate_case_selection(case_names, concurrency)
+        for case in selected_cases:
+            if concurrency > 1:
+                if case.endpoint == "/ws/speak-stream":
+                    message = (
+                        "Concurrent benchmark mode currently supports HTTP endpoints only. "
+                        "Use /api/speak or /api/speak-stream cases when concurrency > 1."
+                    )
+                    raise SystemExit(message)
+                samples, batch_elapsed_values = asyncio.run(
+                    run_http_case_concurrent(
+                        main.app, case, iterations, warmup, concurrency
+                    )
+                )
+            else:
+                runner = (
+                    run_case_http_speak
+                    if case.endpoint == "/api/speak"
+                    else run_case_http_stream
+                    if case.endpoint == "/api/speak-stream"
+                    else run_case_websocket
+                )
+                for _ in range(warmup):
+                    _ = runner(client, case)
+                samples = [runner(client, case) for _ in range(iterations)]
+                batch_elapsed_values = [sample.elapsed_ms for sample in samples]
+            case_summaries.append(
+                summarize_case(
+                    case,
+                    samples,
+                    iterations,
+                    concurrency,
+                    batch_elapsed_values,
+                )
+            )
         health: Response = client.get("/api/health")
         _ = health.raise_for_status()
         health_payload = as_object_mapping(cast(object, health.json()))
-        case_summaries: list[CaseSummary] = []
-        for case in CASES:
-            runner = (
-                run_case_http_speak
-                if case.endpoint == "/api/speak"
-                else run_case_http_stream
-                if case.endpoint == "/api/speak-stream"
-                else run_case_websocket
-            )
-            for _ in range(warmup):
-                _ = runner(client, case)
-            samples = [runner(client, case) for _ in range(iterations)]
-            case_summaries.append(summarize_case(case, samples, iterations))
+        queue_payload = as_object_mapping(health_payload.get("queue") or {})
     finally:
         client.close()
         runtime.clear_runtime_caches()
 
     return ProviderRun(
-        requested_provider=get_string(health_payload, "requested_provider") or "",
-        active_provider=get_string(health_payload, "active_provider"),
-        active_providers=get_string_list(health_payload, "active_providers"),
-        provider_fallback=get_bool(health_payload, "provider_fallback"),
-        provider_error=get_string(health_payload, "provider_error"),
-        runtime_error=get_string(health_payload, "runtime_error"),
+        requested_provider=get_string(capabilities_payload, "requested_provider") or "",
+        active_provider=get_string(capabilities_payload, "active_provider"),
+        active_providers=get_string_list(capabilities_payload, "active_providers"),
+        provider_fallback=get_bool(capabilities_payload, "provider_fallback"),
+        provider_error=get_string(capabilities_payload, "provider_error"),
+        runtime_error=get_string(capabilities_payload, "runtime_error"),
+        concurrency=concurrency,
+        synthesis_workers=get_int(capabilities_payload, "synthesis_workers"),
+        synthesis_queue_limit=get_int(capabilities_payload, "synthesis_queue_limit"),
+        scheduler_execution_model=get_string(
+            as_object_mapping(capabilities_payload.get("scheduler") or {}),
+            "execution_model",
+        )
+        or "",
+        queue_rejected_jobs_total=get_int(queue_payload, "rejected_jobs_total"),
+        queue_wait_avg_ms=get_float(queue_payload, "queue_wait_avg_ms"),
+        queue_wait_max_ms=get_float(queue_payload, "queue_wait_max_ms"),
+        queue_wait_samples=get_int(queue_payload, "queue_wait_samples"),
         cases=case_summaries,
     )
 
 
 def child_main(args: CliArgs) -> int:
-    result = run_provider_benchmark(iterations=args.iterations, warmup=args.warmup)
+    result = run_provider_benchmark(
+        iterations=args.iterations,
+        warmup=args.warmup,
+        concurrency=args.concurrency,
+        case_names=args.cases,
+    )
     print(json.dumps(asdict(result)))
     return 0
 
@@ -338,13 +538,22 @@ def print_report(results: list[ProviderRun]) -> None:
         print(
             f"\nProvider request={result.requested_provider} active={provider_label}{suffix}"
         )
+        print(
+            f"workers={result.synthesis_workers} queue={result.synthesis_queue_limit} execution={result.scheduler_execution_model} concurrency={result.concurrency}"
+        )
         if result.provider_error:
             print(f"Provider error: {result.provider_error}")
         if result.runtime_error:
             print(f"Runtime error: {result.runtime_error}")
         print(
+            f"Queue wait avg={result.queue_wait_avg_ms:.2f}ms max={result.queue_wait_max_ms:.2f}ms samples={result.queue_wait_samples} rejected={result.queue_rejected_jobs_total}"
+        )
+        print(
             "case".ljust(28),
             "mean_ms".rjust(9),
+            "p95_ms".rjust(9),
+            "batch_ms".rjust(9),
+            "req/s".rjust(8),
             "rtf".rjust(6),
             "audio_kb".rjust(10),
             "wire_kb".rjust(9),
@@ -360,6 +569,9 @@ def print_report(results: list[ProviderRun]) -> None:
             print(
                 case.name.ljust(28),
                 f"{case.mean_ms:9.2f}",
+                f"{case.p95_ms:9.2f}",
+                f"{case.mean_batch_ms:9.2f}",
+                f"{case.throughput_rps:8.2f}",
                 f"{rtf:>6}",
                 f"{case.mean_audio_bytes / 1024:10.1f}",
                 f"{case.mean_wire_bytes / 1024:9.1f}",
@@ -374,11 +586,16 @@ def case_summary_from_json(payload: Mapping[str, object]) -> CaseSummary:
         endpoint=get_string(payload, "endpoint") or "",
         format=get_string(payload, "format") or "",
         pitch=get_float(payload, "pitch"),
+        concurrency=get_int(payload, "concurrency", default=1),
         iterations=get_int(payload, "iterations"),
+        request_count=get_int(payload, "request_count", default=1),
         mean_ms=get_float(payload, "mean_ms"),
+        p95_ms=get_float(payload, "p95_ms"),
         median_ms=get_float(payload, "median_ms"),
         min_ms=get_float(payload, "min_ms"),
         max_ms=get_float(payload, "max_ms"),
+        mean_batch_ms=get_float(payload, "mean_batch_ms"),
+        throughput_rps=get_float(payload, "throughput_rps"),
         mean_audio_bytes=get_int(payload, "mean_audio_bytes"),
         mean_wire_bytes=get_int(payload, "mean_wire_bytes"),
         mean_audio_duration_sec=get_float(payload, "mean_audio_duration_sec"),
@@ -400,6 +617,15 @@ def provider_run_from_json(payload: Mapping[str, object]) -> ProviderRun:
         provider_fallback=get_bool(payload, "provider_fallback"),
         provider_error=get_string(payload, "provider_error"),
         runtime_error=get_string(payload, "runtime_error"),
+        concurrency=get_int(payload, "concurrency", default=1),
+        synthesis_workers=get_int(payload, "synthesis_workers"),
+        synthesis_queue_limit=get_int(payload, "synthesis_queue_limit"),
+        scheduler_execution_model=get_string(payload, "scheduler_execution_model")
+        or "",
+        queue_rejected_jobs_total=get_int(payload, "queue_rejected_jobs_total"),
+        queue_wait_avg_ms=get_float(payload, "queue_wait_avg_ms"),
+        queue_wait_max_ms=get_float(payload, "queue_wait_max_ms"),
+        queue_wait_samples=get_int(payload, "queue_wait_samples"),
         cases=[
             case_summary_from_json(as_object_mapping(item))
             for item in as_object_list(payload.get("cases"))
@@ -419,7 +645,11 @@ def parent_main(args: CliArgs) -> int:
             str(args.iterations),
             "--warmup",
             str(args.warmup),
+            "--concurrency",
+            str(args.concurrency),
         ]
+        if args.cases is not None:
+            command.extend(["--cases", *args.cases])
         completed = subprocess.run(
             command,
             check=False,
@@ -451,6 +681,12 @@ def parse_args() -> CliArgs:
     _ = parser.add_argument("--iterations", type=int, default=3)
     _ = parser.add_argument("--warmup", type=int, default=1)
     _ = parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Number of simultaneous requests per iteration batch.",
+    )
+    _ = parser.add_argument(
         "--providers",
         nargs="+",
         default=["cpu", "auto"],
@@ -461,12 +697,20 @@ def parse_args() -> CliArgs:
         default=None,
         help="Optional CUDA 12 library directory for GPU-capable runs.",
     )
+    _ = parser.add_argument(
+        "--cases",
+        nargs="+",
+        default=None,
+        help="Optional subset of case names to benchmark.",
+    )
     namespace = parser.parse_args()
     providers_obj = cast(object, namespace.providers)
     child_obj = cast(object, namespace.child)
     iterations_obj = cast(object, namespace.iterations)
     warmup_obj = cast(object, namespace.warmup)
+    concurrency_obj = cast(object, namespace.concurrency)
     cuda_lib_dir_obj = cast(object, namespace.cuda_lib_dir)
+    cases_obj = cast(object, namespace.cases)
     providers_raw = providers_obj
     if not isinstance(providers_raw, list):
         raise SystemExit("--providers must be a list of strings")
@@ -481,15 +725,30 @@ def parse_args() -> CliArgs:
         raise SystemExit("--iterations must resolve to an integer")
     if not isinstance(warmup_obj, int):
         raise SystemExit("--warmup must resolve to an integer")
+    if not isinstance(concurrency_obj, int):
+        raise SystemExit("--concurrency must resolve to an integer")
     cuda_lib_dir = cuda_lib_dir_obj
     if cuda_lib_dir is not None and not isinstance(cuda_lib_dir, str):
         raise SystemExit("--cuda-lib-dir must be a string when provided")
+    cases: list[str] | None
+    if cases_obj is None:
+        cases = None
+    else:
+        if not isinstance(cases_obj, list):
+            raise SystemExit("--cases must be a list of strings")
+        cases = []
+        for case_obj in cast(list[object], cases_obj):
+            if not isinstance(case_obj, str):
+                raise SystemExit("--cases must be a list of strings")
+            cases.append(case_obj)
     return CliArgs(
         child=child_obj,
         iterations=iterations_obj,
         warmup=warmup_obj,
+        concurrency=concurrency_obj,
         providers=providers,
         cuda_lib_dir=cuda_lib_dir,
+        cases=cases,
     )
 
 
@@ -499,6 +758,8 @@ def main() -> int:
         raise SystemExit("--iterations must be at least 1")
     if args.warmup < 0:
         raise SystemExit("--warmup must be 0 or greater")
+    if args.concurrency < 1:
+        raise SystemExit("--concurrency must be at least 1")
     return child_main(args) if args.child else parent_main(args)
 
 
