@@ -32,8 +32,6 @@ import {
   resetPlaybackState,
 } from "./playback.js";
 
-const API_KEY_STORAGE_KEY = "kokoro_api_key";
-
 class AuthRequiredError extends Error {
   constructor(message = "Authentication failed.") {
     super(message);
@@ -58,17 +56,8 @@ function apiFetch(input, init = {}) {
   return fetch(input, { ...init, headers });
 }
 
-function storeApiKey(apiKey) {
-  window.sessionStorage.setItem(API_KEY_STORAGE_KEY, apiKey);
-}
-
-function removeStoredApiKey() {
-  window.sessionStorage.removeItem(API_KEY_STORAGE_KEY);
-}
-
 function handleAuthFailure(message = "Authentication failed.") {
   appState.apiKey = null;
-  removeStoredApiKey();
   setUiLocked(true);
   setAuthPanelState(true, message, true);
   setStatus(message, true);
@@ -92,26 +81,9 @@ export async function initializeAccess() {
     return;
   }
 
-  const storedApiKey = window.sessionStorage.getItem(API_KEY_STORAGE_KEY);
-  if (!storedApiKey) {
-    setUiLocked(true);
-    setAuthPanelState(true, "Enter the configured API key to use this server.");
-    setStatus("API key required.", true);
-    return;
-  }
-
-  appState.apiKey = storedApiKey;
-  try {
-    await loadHealth();
-    setUiLocked(false);
-    setAuthPanelState(false);
-  } catch (error) {
-    if (error instanceof AuthRequiredError) {
-      handleAuthFailure("Authentication failed.");
-      return;
-    }
-    throw error;
-  }
+  setUiLocked(true);
+  setAuthPanelState(true, "Enter the configured API key to use this server.");
+  setStatus("API key required.", true);
 }
 
 export async function submitApiKey(apiKey) {
@@ -125,7 +97,6 @@ export async function submitApiKey(apiKey) {
   setAuthPanelState(true, "Validating API key...", false, false);
   try {
     await loadHealth();
-    storeApiKey(trimmedKey);
     setUiLocked(false);
     setAuthPanelState(false);
     setStatus("Authenticated. Ready for synthesis");
@@ -147,7 +118,6 @@ export async function submitApiKey(apiKey) {
 
 export function clearApiKey() {
   appState.apiKey = null;
-  removeStoredApiKey();
   setUiLocked(true);
   setAuthPanelState(true, "Enter the configured API key to use this server.");
   setStatus("API key cleared.");

@@ -13,7 +13,10 @@ This server exposes two API groups:
 - When `KOKORO_REQUIRE_AUTH=1`, all non-static API routes require an API key.
 - HTTP routes accept either `Authorization: Bearer <key>` or `X-API-Key: <key>`.
 - `WS /ws/speak-stream` accepts the bearer header during handshake and also supports an `api_key` field in the first WebSocket message for browser clients that cannot set custom headers.
+- Query-string API keys are intentionally not supported.
+- Repeated auth failures are throttled per client identity and return `429` with a `Retry-After` header.
 - `GET /api/public-config` is intentionally public so the built-in Web UI can discover whether auth is required before calling protected routes.
+- The built-in Web UI keeps the API key in memory only. Reloading the page requires entering it again.
 
 ## Quick Links
 

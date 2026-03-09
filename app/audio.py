@@ -6,7 +6,7 @@ import struct
 import subprocess
 from collections.abc import Callable
 from functools import lru_cache
-from typing import cast
+from typing import TypeAlias, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -21,7 +21,7 @@ except ImportError as exc:  # pragma: no cover
     raise RuntimeError("soundfile is required to run this app.") from exc
 
 
-Float32Array = npt.NDArray[np.float32]
+Float32Array: TypeAlias = npt.NDArray[np.float32]
 
 
 def run_ffmpeg_bytes(

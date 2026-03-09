@@ -1,15 +1,18 @@
 # pyright: reportUnusedFunction=false, reportUnusedCallResult=false
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
 import hmac
 import io
 import json
 import re
+import threading
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import ParamSpec, TypeVar, cast
+from typing import ParamSpec, Protocol, TypeVar, cast, runtime_checkable
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,11 +40,23 @@ T = TypeVar("T")
 _OPENAI_STREAM_TARGET_CHARS = 360
 
 
+@runtime_checkable
+class HeaderLookup(Protocol):
+    def get(self, key: str, default: str = "") -> str | None: ...
+
+
 def create_app() -> FastAPI:
     web_ui_enabled = config.get_web_ui_enabled()
     require_auth = config.get_require_auth()
     configured_api_key = config.get_api_key()
     allowed_origins = config.get_allowed_origins()
+    auth_failure_limit = config.get_auth_failure_limit()
+    auth_failure_window_sec = config.get_auth_failure_window_seconds()
+    auth_failure_max_buckets = config.get_auth_failure_max_buckets()
+    trust_proxy_headers = config.get_trust_proxy_headers()
+    ws_auth_handshake_timeout_sec = (
+        config.get_websocket_auth_handshake_timeout_seconds()
+    )
     requested_provider = config.get_runtime_provider_mode()
     runtime_status = runtime.get_runtime_status()
     active_runtime_provider = (
@@ -84,12 +99,94 @@ def create_app() -> FastAPI:
     if web_ui_enabled:
         app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
 
+    auth_failures: dict[str, list[float]] = {}
+    auth_failures_lock = threading.Lock()
+    auth_failures_tick = 0
+
     def is_valid_api_key(candidate: str | None) -> bool:
         if not require_auth:
             return True
         if candidate is None or configured_api_key is None:
             return False
         return hmac.compare_digest(candidate, configured_api_key)
+
+    def prune_failure_timestamps(timestamps: list[float], now: float) -> list[float]:
+        cutoff = now - auth_failure_window_sec
+        return [timestamp for timestamp in timestamps if timestamp >= cutoff]
+
+    def auth_identifier_from_host(
+        host: str | None, forwarded: str | None = None
+    ) -> str:
+        selected = forwarded if forwarded else host
+        cleaned = (selected or "").strip()
+        return cleaned or "unknown-client"
+
+    def get_forwarded_host(headers: object) -> str | None:
+        if not trust_proxy_headers:
+            return None
+        if not isinstance(headers, HeaderLookup):
+            return None
+        get_header = headers.get
+        forwarded_for = (get_header("X-Forwarded-For", "") or "").strip()
+        if forwarded_for:
+            first = forwarded_for.split(",", 1)[0].strip()
+            if first:
+                return first
+        real_ip = (get_header("X-Real-IP", "") or "").strip()
+        if real_ip:
+            return real_ip
+        return None
+
+    def auth_bucket_id(source_id: str, candidate: str | None) -> str:
+        if candidate:
+            fingerprint = hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:16]
+        else:
+            fingerprint = "none"
+        return f"{source_id}|{fingerprint}"
+
+    def compact_auth_failures(now: float) -> None:
+        if not auth_failures:
+            return
+        for client_id in list(auth_failures.keys()):
+            timestamps = prune_failure_timestamps(auth_failures[client_id], now)
+            if timestamps:
+                auth_failures[client_id] = timestamps
+            else:
+                auth_failures.pop(client_id, None)
+
+        if len(auth_failures) <= auth_failure_max_buckets:
+            return
+
+        overflow = len(auth_failures) - auth_failure_max_buckets
+        oldest = sorted(auth_failures.items(), key=lambda item: item[1][-1])[:overflow]
+        for client_id, _ in oldest:
+            auth_failures.pop(client_id, None)
+
+    def record_auth_failure(client_id: str) -> int:
+        nonlocal auth_failures_tick
+        if auth_failure_limit <= 0:
+            return 0
+        now = time.monotonic()
+        with auth_failures_lock:
+            auth_failures_tick += 1
+            if (
+                auth_failures_tick % 64 == 0
+                or len(auth_failures) >= auth_failure_max_buckets
+            ):
+                compact_auth_failures(now)
+            timestamps = prune_failure_timestamps(auth_failures.get(client_id, []), now)
+            timestamps.append(now)
+            auth_failures[client_id] = timestamps
+            return len(timestamps)
+
+    def clear_auth_failures(client_id: str) -> None:
+        with auth_failures_lock:
+            auth_failures.pop(client_id, None)
+
+    def auth_failure_throttled(failure_count: int) -> bool:
+        if auth_failure_limit <= 0:
+            return False
+        return failure_count > auth_failure_limit
 
     def extract_http_api_key(request: Request) -> str | None:
         auth_header = request.headers.get("Authorization", "").strip()
@@ -99,6 +196,13 @@ def create_app() -> FastAPI:
         api_key_header = request.headers.get("X-API-Key", "").strip()
         return api_key_header or None
 
+    def extract_http_client_id(request: Request) -> str:
+        forwarded_host = get_forwarded_host(request.headers)
+        return auth_identifier_from_host(
+            request.client.host if request.client else None,
+            forwarded_host,
+        )
+
     def http_auth_exception() -> HTTPException:
         return HTTPException(
             status_code=401,
@@ -106,12 +210,35 @@ def create_app() -> FastAPI:
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    def http_rate_limit_exception() -> HTTPException:
+        return HTTPException(
+            status_code=429,
+            detail="Too many authentication failures. Try again later.",
+            headers={"Retry-After": str(max(1, int(auth_failure_window_sec)))},
+        )
+
     def ensure_http_auth(request: Request) -> None:
-        if is_valid_api_key(extract_http_api_key(request)):
+        candidate = extract_http_api_key(request)
+        client_id = extract_http_client_id(request)
+        bucket_id = auth_bucket_id(client_id, candidate)
+        if is_valid_api_key(candidate):
+            clear_auth_failures(bucket_id)
             return
+        failure_count = record_auth_failure(bucket_id)
+        if auth_failure_throttled(failure_count):
+            raise http_rate_limit_exception()
         raise http_auth_exception()
 
-    def openai_auth_error_response() -> JSONResponse:
+    def openai_auth_error_response(status_code: int = 401) -> JSONResponse:
+        if status_code == 429:
+            response = openai_compat.openai_error_response(
+                429,
+                "Too many authentication failures. Try again later.",
+                error_type="rate_limit_error",
+                code="rate_limit_exceeded",
+            )
+            response.headers["Retry-After"] = str(max(1, int(auth_failure_window_sec)))
+            return response
         response = openai_compat.openai_error_response(
             401,
             "Authentication failed.",
@@ -121,6 +248,18 @@ def create_app() -> FastAPI:
         response.headers["WWW-Authenticate"] = "Bearer"
         return response
 
+    def openai_auth_error_for_request(request: Request) -> JSONResponse | None:
+        candidate = extract_http_api_key(request)
+        client_id = extract_http_client_id(request)
+        bucket_id = auth_bucket_id(client_id, candidate)
+        if is_valid_api_key(candidate):
+            clear_auth_failures(bucket_id)
+            return None
+        failure_count = record_auth_failure(bucket_id)
+        if auth_failure_throttled(failure_count):
+            return openai_auth_error_response(429)
+        return openai_auth_error_response(401)
+
     def extract_websocket_api_key(
         websocket: WebSocket, message_payload: object
     ) -> str | None:
@@ -129,9 +268,6 @@ def create_app() -> FastAPI:
             token = auth_header[7:].strip()
             if token:
                 return token
-        query_token = websocket.query_params.get("api_key", "").strip()
-        if query_token:
-            return query_token
         if isinstance(message_payload, dict):
             message_map = cast(dict[str, object], message_payload)
             message_token = message_map.get("api_key")
@@ -140,6 +276,27 @@ def create_app() -> FastAPI:
                 if cleaned:
                     return cleaned
         return None
+
+    def extract_websocket_client_id(websocket: WebSocket) -> str:
+        forwarded_host = get_forwarded_host(websocket.headers)
+        return auth_identifier_from_host(
+            websocket.client.host if websocket.client else None,
+            forwarded_host,
+        )
+
+    def websocket_auth_error_detail(
+        websocket: WebSocket, message_payload: object
+    ) -> str | None:
+        candidate = extract_websocket_api_key(websocket, message_payload)
+        client_id = extract_websocket_client_id(websocket)
+        bucket_id = auth_bucket_id(client_id, candidate)
+        if is_valid_api_key(candidate):
+            clear_auth_failures(bucket_id)
+            return None
+        failure_count = record_auth_failure(bucket_id)
+        if auth_failure_throttled(failure_count):
+            return "Too many authentication failures. Try again later."
+        return "Authentication failed."
 
     def queue_payload() -> dict[str, int | float]:
         metrics = synthesis_scheduler.snapshot()
@@ -314,8 +471,9 @@ def create_app() -> FastAPI:
 
     @app.get("/v1/models", include_in_schema=False)
     async def openai_list_models(request: Request) -> JSONResponse:
-        if not is_valid_api_key(extract_http_api_key(request)):
-            return openai_auth_error_response()
+        auth_error = openai_auth_error_for_request(request)
+        if auth_error is not None:
+            return auth_error
         payload: OpenAIModelListResponse = {
             "object": "list",
             "data": [openai_compat.openai_model_object()],
@@ -324,8 +482,9 @@ def create_app() -> FastAPI:
 
     @app.get("/v1/models/{model_id}", include_in_schema=False)
     async def openai_retrieve_model(model_id: str, request: Request) -> JSONResponse:
-        if not is_valid_api_key(extract_http_api_key(request)):
-            return openai_auth_error_response()
+        auth_error = openai_auth_error_for_request(request)
+        if auth_error is not None:
+            return auth_error
         if model_id != config.OPENAI_COMPAT_MODEL:
             return openai_compat.openai_error_response(
                 404,
@@ -339,8 +498,9 @@ def create_app() -> FastAPI:
     async def openai_create_speech(
         payload: OpenAISpeechRequest, request: Request
     ) -> Response:
-        if not is_valid_api_key(extract_http_api_key(request)):
-            return openai_auth_error_response()
+        auth_error = openai_auth_error_for_request(request)
+        if auth_error is not None:
+            return auth_error
         try:
             synth_request = openai_compat.build_openai_synthesis_request(payload)
         except SynthesisOverloadedError as exc:
@@ -611,11 +771,15 @@ def create_app() -> FastAPI:
     async def ws_speak_stream(websocket: WebSocket) -> None:
         await websocket.accept()
         try:
-            raw_payload = await websocket.receive_text()
+            raw_payload = await asyncio.wait_for(
+                websocket.receive_text(),
+                timeout=ws_auth_handshake_timeout_sec,
+            )
             payload_data = cast(object, json.loads(raw_payload))
-            if not is_valid_api_key(extract_websocket_api_key(websocket, payload_data)):
+            auth_error_detail = websocket_auth_error_detail(websocket, payload_data)
+            if auth_error_detail is not None:
                 await websocket.send_text(
-                    json.dumps({"type": "error", "detail": "Authentication failed."})
+                    json.dumps({"type": "error", "detail": auth_error_detail})
                 )
                 return
             if isinstance(payload_data, dict):
@@ -685,6 +849,9 @@ def create_app() -> FastAPI:
             await websocket.send_text(
                 json.dumps({"type": "done", "total_chunks": total_chunks})
             )
+        except asyncio.TimeoutError:
+            await websocket.close(code=1008, reason="Authentication timeout.")
+            return
         except WebSocketDisconnect:
             return
         except Exception as exc:

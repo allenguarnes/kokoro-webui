@@ -14,6 +14,7 @@ from unittest.mock import patch
 import httpx
 import numpy as np
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 import app.api as api
 import app.audio as audio
@@ -62,7 +63,9 @@ class ApiIntegrationTests(unittest.TestCase):
 
     def get_client(self) -> TestClient:
         client = self.client
-        assert client is not None
+        if client is None:
+            client = TestClient(api.create_app())
+            self.client = client
         return client
 
     @override
@@ -106,12 +109,48 @@ class ApiIntegrationTests(unittest.TestCase):
             )
         )
         _ = self.patch_stack.enter_context(
+            patch.object(runtime, "load_voice_names", return_value=["af_heart"])
+        )
+        _ = self.patch_stack.enter_context(
+            patch.object(
+                runtime,
+                "get_current_process_gpu_usage",
+                return_value=GpuProcessUsage(
+                    pid=1234,
+                    available=False,
+                    used_bytes=None,
+                    used_megabytes=None,
+                    source=None,
+                    error=None,
+                ),
+            )
+        )
+        _ = self.patch_stack.enter_context(
             patch.object(config, "get_synthesis_workers", return_value=2)
         )
         _ = self.patch_stack.enter_context(
             patch.object(config, "get_synthesis_queue_limit", return_value=8)
         )
-        self.client = TestClient(api.create_app())
+        _ = self.patch_stack.enter_context(
+            patch.object(config, "get_auth_failure_limit", return_value=5)
+        )
+        _ = self.patch_stack.enter_context(
+            patch.object(config, "get_auth_failure_window_seconds", return_value=60.0)
+        )
+        _ = self.patch_stack.enter_context(
+            patch.object(config, "get_auth_failure_max_buckets", return_value=4096)
+        )
+        _ = self.patch_stack.enter_context(
+            patch.object(config, "get_trust_proxy_headers", return_value=False)
+        )
+        _ = self.patch_stack.enter_context(
+            patch.object(
+                config,
+                "get_websocket_auth_handshake_timeout_seconds",
+                return_value=5.0,
+            )
+        )
+        self.client = None
         audio.ffmpeg_supports_rubberband.cache_clear()
         runtime.clear_runtime_caches()
 
@@ -376,12 +415,21 @@ class ApiIntegrationTests(unittest.TestCase):
             patch.object(config, "get_api_key", return_value="secret-key"),
         ):
             test_app = api.create_app()
-            with TestClient(test_app) as client:
-                unauthorized = client.get("/api/health")
-                authorized = client.get(
-                    "/api/health",
-                    headers={"Authorization": "Bearer secret-key"},
-                )
+
+            async def run_test() -> tuple[httpx.Response, httpx.Response]:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    unauthorized = await client.get("/api/health")
+                    authorized = await client.get(
+                        "/api/health",
+                        headers={"Authorization": "Bearer secret-key"},
+                    )
+                    return unauthorized, authorized
+
+            unauthorized, authorized = asyncio.run(run_test())
 
         self.assertEqual(unauthorized.status_code, 401)
         self.assertEqual(authorized.status_code, 200)
@@ -392,12 +440,21 @@ class ApiIntegrationTests(unittest.TestCase):
             patch.object(config, "get_api_key", return_value="secret-key"),
         ):
             test_app = api.create_app()
-            with TestClient(test_app) as client:
-                unauthorized = client.get("/v1/models")
-                authorized = client.get(
-                    "/v1/models",
-                    headers={"Authorization": "Bearer secret-key"},
-                )
+
+            async def run_test() -> tuple[httpx.Response, httpx.Response]:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    unauthorized = await client.get("/v1/models")
+                    authorized = await client.get(
+                        "/v1/models",
+                        headers={"Authorization": "Bearer secret-key"},
+                    )
+                    return unauthorized, authorized
+
+            unauthorized, authorized = asyncio.run(run_test())
 
         self.assertEqual(unauthorized.status_code, 401)
         unauthorized_payload = cast(dict[str, object], unauthorized.json())
@@ -562,7 +619,8 @@ class ApiIntegrationTests(unittest.TestCase):
             patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk),
         ):
             test_app = api.create_app()
-            with TestClient(test_app) as client:
+            client = TestClient(test_app)
+            try:
                 with client.websocket_connect("/ws/speak-stream") as websocket:
                     websocket.send_text(json.dumps(request_payload))
                     meta = cast(dict[str, object], json.loads(websocket.receive_text()))
@@ -571,17 +629,195 @@ class ApiIntegrationTests(unittest.TestCase):
                     )
                     audio_bytes = websocket.receive_bytes()
                     done = cast(dict[str, object], json.loads(websocket.receive_text()))
+            finally:
+                client.close()
 
         self.assertEqual(meta["type"], "meta")
         self.assertEqual(chunk["type"], "chunk")
         self.assertEqual(audio_bytes, b"af_heart|0.0|opus|Hello over websocket.")
         self.assertEqual(done["type"], "done")
 
+    def test_websocket_stream_rejects_query_string_api_key(self) -> None:
+        request_payload = {
+            "text": "Hello over websocket.",
+            "voice": "af_heart",
+            "speed": 1.0,
+            "pitch": 0.0,
+            "lang": "en-us",
+            "format": "opus",
+            "target_chunk_chars": 120,
+        }
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk),
+        ):
+            test_app = api.create_app()
+            client = TestClient(test_app)
+            try:
+                with client.websocket_connect(
+                    "/ws/speak-stream?api_key=secret-key"
+                ) as websocket:
+                    websocket.send_text(json.dumps(request_payload))
+                    error = cast(
+                        dict[str, object], json.loads(websocket.receive_text())
+                    )
+            finally:
+                client.close()
+
+        self.assertEqual(error["type"], "error")
+        self.assertEqual(error["detail"], "Authentication failed.")
+
+    def test_auth_failures_are_rate_limited(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(config, "get_auth_failure_limit", return_value=2),
+            patch.object(config, "get_auth_failure_window_seconds", return_value=60.0),
+        ):
+            test_app = api.create_app()
+
+            async def run_test() -> tuple[
+                httpx.Response,
+                httpx.Response,
+                httpx.Response,
+                httpx.Response,
+            ]:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    first = await client.get(
+                        "/api/health", headers={"Authorization": "Bearer wrong-token"}
+                    )
+                    second = await client.get(
+                        "/api/health", headers={"Authorization": "Bearer wrong-token"}
+                    )
+                    third = await client.get(
+                        "/api/health",
+                        headers={"Authorization": "Bearer wrong-token"},
+                    )
+                    valid = await client.get(
+                        "/api/health",
+                        headers={"Authorization": "Bearer secret-key"},
+                    )
+                    return first, second, third, valid
+
+            first, second, third, valid = asyncio.run(run_test())
+
+        self.assertEqual(first.status_code, 401)
+        self.assertEqual(second.status_code, 401)
+        self.assertEqual(third.status_code, 429)
+        self.assertEqual(third.headers.get("retry-after"), "60")
+        self.assertEqual(valid.status_code, 200)
+
+    def test_openai_auth_rate_limit_returns_retry_after(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(config, "get_auth_failure_limit", return_value=1),
+            patch.object(config, "get_auth_failure_window_seconds", return_value=30.0),
+        ):
+            test_app = api.create_app()
+
+            async def run_test() -> tuple[httpx.Response, httpx.Response]:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    first = await client.get(
+                        "/v1/models",
+                        headers={"Authorization": "Bearer invalid"},
+                    )
+                    second = await client.get(
+                        "/v1/models",
+                        headers={"Authorization": "Bearer invalid"},
+                    )
+                    return first, second
+
+            first, second = asyncio.run(run_test())
+
+        self.assertEqual(first.status_code, 401)
+        self.assertEqual(second.status_code, 429)
+        self.assertEqual(second.headers.get("retry-after"), "30")
+
+    def test_auth_throttle_uses_forwarded_identity_when_trusted(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(config, "get_auth_failure_limit", return_value=1),
+            patch.object(config, "get_auth_failure_window_seconds", return_value=60.0),
+            patch.object(config, "get_trust_proxy_headers", return_value=True),
+        ):
+            test_app = api.create_app()
+
+            async def run_test() -> tuple[
+                httpx.Response, httpx.Response, httpx.Response
+            ]:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    first = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "1.1.1.1",
+                        },
+                    )
+                    second = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "2.2.2.2",
+                        },
+                    )
+                    third = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "1.1.1.1",
+                        },
+                    )
+                    return first, second, third
+
+            first, second, third = asyncio.run(run_test())
+
+        self.assertEqual(first.status_code, 401)
+        self.assertEqual(second.status_code, 401)
+        self.assertEqual(third.status_code, 429)
+
+    def test_websocket_auth_handshake_timeout_closes_connection(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch("asyncio.wait_for", side_effect=asyncio.TimeoutError),
+        ):
+            test_app = api.create_app()
+            client = TestClient(test_app)
+            try:
+                with client.websocket_connect("/ws/speak-stream") as websocket:
+                    with self.assertRaises(WebSocketDisconnect):
+                        _ = websocket.receive_text()
+            finally:
+                client.close()
+
     def test_root_is_unavailable_when_web_ui_is_disabled(self) -> None:
         with patch.object(config, "get_web_ui_enabled", return_value=False):
             test_app = api.create_app()
-            with TestClient(test_app) as client:
-                response = client.get("/")
+
+            async def run_test() -> httpx.Response:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    return await client.get("/")
+
+            response = asyncio.run(run_test())
 
         self.assertEqual(response.status_code, 404)
 

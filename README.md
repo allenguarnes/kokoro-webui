@@ -110,6 +110,7 @@ KOKORO_API_KEY=change-me
 ```
 
 When auth is enabled, the Web UI stays locked until the key is entered. API clients should send `Authorization: Bearer <key>`.
+The built-in Web UI keeps the key in memory only. Reloading the page requires entering it again.
 
 ## Advanced Configuration
 
@@ -206,6 +207,11 @@ The app auto-loads `.env` (if present).
 | `KOKORO_ENABLE_WEB_UI` | `1` | Serve the built-in Web UI. Set `0` for headless/API-only mode |
 | `KOKORO_REQUIRE_AUTH` | `0` | Require API key auth for all non-static API routes |
 | `KOKORO_API_KEY` | unset | Shared API key used for HTTP bearer auth and WebSocket auth |
+| `KOKORO_AUTH_FAILURE_LIMIT` | `5` | Max failed auth attempts per client within the throttle window before `429` responses begin |
+| `KOKORO_AUTH_FAILURE_WINDOW_SEC` | `60` | Auth failure throttle window in seconds |
+| `KOKORO_AUTH_FAILURE_MAX_BUCKETS` | `4096` | Upper bound for in-memory auth-failure buckets |
+| `KOKORO_TRUST_PROXY_HEADERS` | `0` | Trust `X-Forwarded-For` / `X-Real-IP` for auth-throttle client identity (enable only behind a trusted proxy) |
+| `KOKORO_WS_AUTH_HANDSHAKE_TIMEOUT_SEC` | `5` | Timeout for the first WebSocket auth payload before closing the connection |
 | `KOKORO_ALLOWED_ORIGINS` | unset | Optional comma-separated browser allowlist for cross-origin clients |
 | `KOKORO_FFMPEG_TIMEOUT_SEC` | `20` | Timeout for ffmpeg/rubberband subprocess work |
 | `KOKORO_FORMATS` | all supported formats | Optional comma-separated subset of enabled output formats, for example `wav`, `pcm`, or `wav,pcm,opus` |
@@ -229,6 +235,16 @@ KOKORO_RELOAD=0
 KOKORO_ENABLE_WEB_UI=1
 KOKORO_REQUIRE_AUTH=0
 # KOKORO_API_KEY=change-me
+# Optional auth throttle. Set 0 to disable.
+# KOKORO_AUTH_FAILURE_LIMIT=5
+# KOKORO_AUTH_FAILURE_WINDOW_SEC=60
+# Optional upper bound for in-memory auth-failure buckets.
+# KOKORO_AUTH_FAILURE_MAX_BUCKETS=4096
+# Trust X-Forwarded-For / X-Real-IP for auth-throttle identity.
+# Keep disabled unless running behind a trusted proxy.
+# KOKORO_TRUST_PROXY_HEADERS=0
+# WebSocket auth handshake timeout in seconds.
+# KOKORO_WS_AUTH_HANDSHAKE_TIMEOUT_SEC=5
 # KOKORO_ALLOWED_ORIGINS=http://127.0.0.1:8000,http://localhost:8000
 KOKORO_FFMPEG_TIMEOUT_SEC=20
 # KOKORO_FORMATS=wav,pcm,opus
@@ -254,7 +270,9 @@ If `KOKORO_FORMATS` is narrowed to a single value, the Web UI locks the format c
 
 `KOKORO_ENABLE_WEB_UI=0` turns the process into an API-only server. In that mode the static site is not served, but the API and OpenAI-compatible routes still work.
 
-If `KOKORO_REQUIRE_AUTH=1`, every non-static API route requires the configured key. HTTP routes accept `Authorization: Bearer <key>` or `X-API-Key`. The WebSocket route accepts the bearer header during handshake and also supports a first-message `api_key` fallback for browser clients.
+If `KOKORO_REQUIRE_AUTH=1`, every non-static API route requires the configured key. HTTP routes accept `Authorization: Bearer <key>` or `X-API-Key`. The WebSocket route accepts the bearer header during handshake and also supports a first-message `api_key` fallback for browser clients. Query-string API keys are intentionally not supported.
+
+The server throttles repeated failed auth attempts per client and returns `429` with `Retry-After` once the threshold is crossed. Valid credentials still succeed immediately even after prior failures.
 
 If you want a browser app on another origin to call this server, set `KOKORO_ALLOWED_ORIGINS` explicitly. Leaving it unset keeps browser access same-origin only, which is the safer default once auth is enabled.
 

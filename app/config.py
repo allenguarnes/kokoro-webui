@@ -53,6 +53,11 @@ DEFAULT_SERVER_PORT = 8000
 DEFAULT_FFMPEG_TIMEOUT_SEC = 20.0
 DEFAULT_RUNTIME_PROVIDER: ProviderMode = "auto"
 DEFAULT_ENABLE_WEB_UI = True
+DEFAULT_AUTH_FAILURE_LIMIT = 5
+DEFAULT_AUTH_FAILURE_WINDOW_SEC = 60.0
+DEFAULT_AUTH_FAILURE_MAX_BUCKETS = 4096
+DEFAULT_TRUST_PROXY_HEADERS = False
+DEFAULT_WS_AUTH_HANDSHAKE_TIMEOUT_SEC = 5.0
 
 
 def parse_bool_env(value: str | None, *, default: bool = False) -> bool:
@@ -115,6 +120,82 @@ def get_allowed_origins() -> list[str]:
         if value not in origins:
             origins.append(value)
     return origins
+
+
+def get_auth_failure_limit() -> int:
+    raw_limit = os.getenv(
+        "KOKORO_AUTH_FAILURE_LIMIT", str(DEFAULT_AUTH_FAILURE_LIMIT)
+    ).strip()
+    try:
+        limit = int(raw_limit)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"KOKORO_AUTH_FAILURE_LIMIT must be a non-negative integer, got {raw_limit!r}."
+        ) from exc
+    if limit < 0:
+        raise RuntimeError(
+            f"KOKORO_AUTH_FAILURE_LIMIT must be 0 or greater, got {limit}."
+        )
+    return limit
+
+
+def get_auth_failure_window_seconds() -> float:
+    raw_window = os.getenv(
+        "KOKORO_AUTH_FAILURE_WINDOW_SEC", str(DEFAULT_AUTH_FAILURE_WINDOW_SEC)
+    ).strip()
+    try:
+        window = float(raw_window)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"KOKORO_AUTH_FAILURE_WINDOW_SEC must be a positive number, got {raw_window!r}."
+        ) from exc
+    if window <= 0:
+        raise RuntimeError(
+            f"KOKORO_AUTH_FAILURE_WINDOW_SEC must be greater than 0, got {window}."
+        )
+    return window
+
+
+def get_auth_failure_max_buckets() -> int:
+    raw_limit = os.getenv(
+        "KOKORO_AUTH_FAILURE_MAX_BUCKETS", str(DEFAULT_AUTH_FAILURE_MAX_BUCKETS)
+    ).strip()
+    try:
+        limit = int(raw_limit)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"KOKORO_AUTH_FAILURE_MAX_BUCKETS must be a positive integer, got {raw_limit!r}."
+        ) from exc
+    if limit < 1:
+        raise RuntimeError(
+            f"KOKORO_AUTH_FAILURE_MAX_BUCKETS must be greater than 0, got {limit}."
+        )
+    return limit
+
+
+def get_trust_proxy_headers() -> bool:
+    return parse_bool_env(
+        os.getenv("KOKORO_TRUST_PROXY_HEADERS"),
+        default=DEFAULT_TRUST_PROXY_HEADERS,
+    )
+
+
+def get_websocket_auth_handshake_timeout_seconds() -> float:
+    raw_timeout = os.getenv(
+        "KOKORO_WS_AUTH_HANDSHAKE_TIMEOUT_SEC",
+        str(DEFAULT_WS_AUTH_HANDSHAKE_TIMEOUT_SEC),
+    ).strip()
+    try:
+        timeout = float(raw_timeout)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"KOKORO_WS_AUTH_HANDSHAKE_TIMEOUT_SEC must be a positive number, got {raw_timeout!r}."
+        ) from exc
+    if timeout <= 0:
+        raise RuntimeError(
+            f"KOKORO_WS_AUTH_HANDSHAKE_TIMEOUT_SEC must be greater than 0, got {timeout}."
+        )
+    return timeout
 
 
 def get_ffmpeg_timeout_seconds() -> float:
