@@ -12,7 +12,8 @@ This server exposes two API groups:
 - Auth is optional and controlled by server configuration.
 - When `KOKORO_REQUIRE_AUTH=1`, all non-static API routes require an API key.
 - HTTP routes accept either `Authorization: Bearer <key>` or `X-API-Key: <key>`.
-- `WS /ws/speak-stream` accepts the bearer header during handshake and also supports an `api_key` field in the first WebSocket message for browser clients that cannot set custom headers.
+- `WS /ws/speak-stream` accepts the bearer header during handshake for non-browser clients.
+- The built-in Web UI uses `POST /api/ws-token` to issue a short-lived one-time token and sends that `ws_token` in the first WebSocket message instead of the long-lived API key.
 - Query-string API keys are intentionally not supported.
 - Repeated auth failures are throttled per client identity and return `429` with a `Retry-After` header.
 - `GET /api/public-config` is intentionally public so the built-in Web UI can discover whether auth is required before calling protected routes.
@@ -89,7 +90,25 @@ Returns the minimum public configuration needed by the built-in Web UI before au
   "web_ui_enabled": true,
   "auth_required": true,
   "auth_scheme": "bearer",
-  "websocket_auth": "header-or-first-message"
+  "websocket_auth": "header-or-session-token"
+}
+```
+
+### `POST /api/ws-token`
+
+Issue a short-lived one-time WebSocket session token. This is mainly used by the built-in Web UI when auth is enabled.
+
+Headers:
+
+- `Authorization: Bearer <api-key>` or `X-API-Key: <api-key>`
+
+Response body:
+
+```json
+{
+  "token": "base64url-token",
+  "token_type": "ws",
+  "expires_in": 30
 }
 ```
 
