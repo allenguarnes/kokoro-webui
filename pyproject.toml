@@ -37,4 +37,5 @@ include = [
 dev = [
     "basedpyright>=1.38.2",
     "httpx>=0.28.1",
+    "ruff>=0.15.5",
 ]
