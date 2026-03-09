@@ -1,6 +1,15 @@
 import { initializeApiExamples } from "./js/api-docs.js";
-import { exportAudio, loadHealth, synthesize } from "./js/api-client.js";
 import {
+  clearApiKey,
+  exportAudio,
+  initializeAccess,
+  submitApiKey,
+  synthesize,
+} from "./js/api-client.js";
+import {
+  authApiKeyInput,
+  authClearButton,
+  authForm,
   chips,
   exportButton,
   formatInput,
@@ -54,6 +63,16 @@ transportInput.addEventListener("change", syncTransportModeText);
 textInput.addEventListener("input", updateTextStats);
 themeToggle.addEventListener("click", toggleTheme);
 exportButton.addEventListener("click", exportAudio);
+authForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await submitApiKey(authApiKeyInput.value);
+});
+authClearButton?.addEventListener("click", () => {
+  if (authApiKeyInput) {
+    authApiKeyInput.value = "";
+  }
+  clearApiKey();
+});
 
 stopButton.addEventListener("click", () => {
   resetPlaybackState();
@@ -95,7 +114,7 @@ window.addEventListener("DOMContentLoaded", () => {
   updateFormatControlState();
   syncTransportModeText();
   refreshCustomSelect(transportInput);
-  loadHealth();
+  initializeAccess();
 });
 
 window.addEventListener("pagehide", handlePageExit);

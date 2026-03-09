@@ -242,10 +242,14 @@ import platform
 from pathlib import Path
 
 from app.config import (
+    get_allowed_origins,
+    get_api_key,
     get_allow_experimental_cuda_concurrency,
+    get_require_auth,
     get_runtime_provider_mode,
     get_synthesis_queue_limit,
     get_synthesis_workers,
+    get_web_ui_enabled,
 )
 from app.scheduler import build_scheduler_policy
 from app.runtime import get_runtime_status
@@ -284,6 +288,33 @@ model_path = Path(os.getenv('KOKORO_MODEL_PATH', root / 'models' / 'kokoro-v1.0.
 voices_path = Path(os.getenv('KOKORO_VOICES_PATH', root / 'models' / 'voices-v1.0.bin'))
 items.append(('model', 'ok' if model_path.exists() else 'error', str(model_path)))
 items.append(('voices', 'ok' if voices_path.exists() else 'error', str(voices_path)))
+
+web_ui_enabled = get_web_ui_enabled()
+items.append(('web-ui', 'ok', 'enabled' if web_ui_enabled else 'disabled (headless/api mode)'))
+
+require_auth = get_require_auth()
+items.append(('auth', 'ok', 'required' if require_auth else 'disabled'))
+
+allowed_origins = get_allowed_origins()
+if allowed_origins:
+    items.append(('cors', 'ok', ', '.join(allowed_origins)))
+elif require_auth:
+    items.append(('cors', 'warn', 'no cross-origin browser access configured; set KOKORO_ALLOWED_ORIGINS for a browser client on another origin'))
+else:
+    items.append(('cors', 'ok', 'same-origin only'))
+
+try:
+    configured_api_key = get_api_key()
+except Exception as exc:
+    configured_api_key = None
+    items.append(('api-key', 'error', str(exc)))
+else:
+    if require_auth:
+        items.append(('api-key', 'ok', 'configured'))
+    elif configured_api_key:
+        items.append(('api-key', 'ok', 'configured (inactive until auth is enabled)'))
+    else:
+        items.append(('api-key', 'ok', 'not configured'))
 
 requested_provider = 'auto'
 try:

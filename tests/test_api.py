@@ -74,6 +74,18 @@ class ApiIntegrationTests(unittest.TestCase):
             patch.object(config, "get_runtime_provider_mode", return_value="cpu")
         )
         _ = self.patch_stack.enter_context(
+            patch.object(config, "get_web_ui_enabled", return_value=True)
+        )
+        _ = self.patch_stack.enter_context(
+            patch.object(config, "get_require_auth", return_value=False)
+        )
+        _ = self.patch_stack.enter_context(
+            patch.object(config, "get_api_key", return_value=None)
+        )
+        _ = self.patch_stack.enter_context(
+            patch.object(config, "get_allowed_origins", return_value=[])
+        )
+        _ = self.patch_stack.enter_context(
             patch.object(
                 runtime,
                 "get_runtime_status",
@@ -171,6 +183,15 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertIn("queue_wait_avg_ms", queue)
         self.assertIn("queue_wait_max_ms", queue)
         self.assertIn("queue_wait_samples", queue)
+
+    def test_public_config_reports_auth_and_ui_flags(self) -> None:
+        response = self.get_client().get("/api/public-config")
+
+        self.assertEqual(response.status_code, 200)
+        payload = cast(dict[str, object], response.json())
+        self.assertTrue(payload["web_ui_enabled"])
+        self.assertFalse(payload["auth_required"])
+        self.assertEqual(payload["auth_scheme"], "none")
 
     def test_capabilities_reports_runtime_and_formats(self) -> None:
         fake_status = RuntimeStatus(
@@ -349,6 +370,41 @@ class ApiIntegrationTests(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_health_requires_auth_when_enabled(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+        ):
+            test_app = api.create_app()
+            with TestClient(test_app) as client:
+                unauthorized = client.get("/api/health")
+                authorized = client.get(
+                    "/api/health",
+                    headers={"Authorization": "Bearer secret-key"},
+                )
+
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(authorized.status_code, 200)
+
+    def test_openai_models_requires_bearer_auth_when_enabled(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+        ):
+            test_app = api.create_app()
+            with TestClient(test_app) as client:
+                unauthorized = client.get("/v1/models")
+                authorized = client.get(
+                    "/v1/models",
+                    headers={"Authorization": "Bearer secret-key"},
+                )
+
+        self.assertEqual(unauthorized.status_code, 401)
+        unauthorized_payload = cast(dict[str, object], unauthorized.json())
+        error = cast(dict[str, object], unauthorized_payload["error"])
+        self.assertEqual(error["message"], "Authentication failed.")
+        self.assertEqual(authorized.status_code, 200)
+
     def test_native_speak_returns_audio_headers(self) -> None:
         request_payload = {
             "text": "Hello from test.",
@@ -488,6 +544,46 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(chunk["format"], "opus")
         self.assertEqual(audio_bytes, b"af_heart|0.0|opus|Hello over websocket.")
         self.assertEqual(done["type"], "done")
+
+    def test_websocket_stream_accepts_api_key_in_first_message(self) -> None:
+        request_payload = {
+            "text": "Hello over websocket.",
+            "voice": "af_heart",
+            "speed": 1.0,
+            "pitch": 0.0,
+            "lang": "en-us",
+            "format": "opus",
+            "target_chunk_chars": 120,
+            "api_key": "secret-key",
+        }
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk),
+        ):
+            test_app = api.create_app()
+            with TestClient(test_app) as client:
+                with client.websocket_connect("/ws/speak-stream") as websocket:
+                    websocket.send_text(json.dumps(request_payload))
+                    meta = cast(dict[str, object], json.loads(websocket.receive_text()))
+                    chunk = cast(
+                        dict[str, object], json.loads(websocket.receive_text())
+                    )
+                    audio_bytes = websocket.receive_bytes()
+                    done = cast(dict[str, object], json.loads(websocket.receive_text()))
+
+        self.assertEqual(meta["type"], "meta")
+        self.assertEqual(chunk["type"], "chunk")
+        self.assertEqual(audio_bytes, b"af_heart|0.0|opus|Hello over websocket.")
+        self.assertEqual(done["type"], "done")
+
+    def test_root_is_unavailable_when_web_ui_is_disabled(self) -> None:
+        with patch.object(config, "get_web_ui_enabled", return_value=False):
+            test_app = api.create_app()
+            with TestClient(test_app) as client:
+                response = client.get("/")
+
+        self.assertEqual(response.status_code, 404)
 
     def test_openai_speech_accepts_voice_pitch_suffix(self) -> None:
         captured_requests: list[SynthesisRequest] = []

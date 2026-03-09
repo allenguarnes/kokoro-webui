@@ -3,6 +3,27 @@
         grid-template-columns: 1fr;
     }
 
+    .panel-auth {
+        width: min(34rem, calc(100% - 1.4rem));
+    }
+
+    .shell-auth-locked .workspace {
+        padding-top: calc(10.4rem * var(--space-multiplier));
+    }
+
+    .auth-form {
+        width: 100%;
+        grid-template-columns: 1fr;
+    }
+
+    .field-auth {
+        width: 100%;
+    }
+
+    .auth-actions {
+        justify-content: start;
+    }
+
     .controls {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
@@ -20,6 +41,60 @@
     .topbar {
         align-items: start;
         flex-direction: column;
+        gap: 0.55rem;
+    }
+
+    .panel-auth {
+        position: relative;
+        top: auto;
+        left: auto;
+        transform: none;
+        width: 100%;
+        gap: calc(0.72rem * var(--space-multiplier));
+        margin-top: calc(0.2rem * var(--space-multiplier));
+        padding: calc(0.8rem * var(--space-multiplier))
+            calc(0.82rem * var(--space-multiplier))
+            calc(0.78rem * var(--space-multiplier));
+        border-radius: 20px;
+    }
+
+    .shell-auth-locked .workspace {
+        padding-top: 0;
+    }
+
+    .auth-kicker {
+        font-size: 0.64rem;
+        letter-spacing: 0.12em;
+    }
+
+    .auth-title {
+        font-size: 1.42rem;
+        line-height: 1.06;
+    }
+
+    .auth-text {
+        font-size: 0.86rem;
+        line-height: 1.46;
+    }
+
+    .auth-note {
+        display: none;
+    }
+
+    .auth-form {
+        gap: calc(0.55rem * var(--space-multiplier));
+    }
+
+    .field-auth input {
+        min-height: 2.5rem;
+        padding: 0.5rem 0.68rem;
+        font-size: 0.88rem;
+    }
+
+    .auth-message {
+        min-height: 1.05rem;
+        font-size: 0.7rem;
+        line-height: 1.4;
     }
 
     .topbar-meta {
@@ -48,6 +123,17 @@
 
     .actions {
         flex-direction: column;
+    }
+
+    .auth-actions {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0.45rem;
+    }
+
+    .button-auth-primary,
+    .auth-actions .button-ghost {
+        width: 100%;
     }
 
     .playback-row {

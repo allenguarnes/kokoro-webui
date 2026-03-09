@@ -206,6 +206,11 @@ button {
         center / contain no-repeat;
 }
 
+.icon-key {
+    mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='black' d='M7 14a5 5 0 1 1 4.9-6H22v4h-2v2h-2v2h-3.1A5 5 0 0 1 7 14m0-2a3 3 0 1 0 0-6a3 3 0 0 0 0 6'/></svg>")
+        center / contain no-repeat;
+}
+
 .icon-spark {
     mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><g fill='none' stroke='black' stroke-linecap='round' stroke-linejoin='round' stroke-width='2'><path fill='black' d='M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594zM20 2v4m2-2h-4'/><circle fill='black' cx='4' cy='20' r='2'/></g></svg>")
         center / contain no-repeat;
@@ -269,6 +274,25 @@ button {
     color: var(--ink);
     border-color: rgba(204, 86, 97, 0.34);
     background: var(--accent-soft);
+    transform: none;
+    outline: none;
+}
+
+.button-auth-primary {
+    min-width: 8.5rem;
+    background: linear-gradient(145deg, #cc5661 0%, #af4550 100%);
+    color: #fff6f8;
+    font-weight: 600;
+    box-shadow: 0 10px 22px rgba(175, 69, 80, 0.2);
+}
+
+.button-auth-primary:hover,
+.button-auth-primary:focus-visible {
+    border-color: rgba(255, 236, 241, 0.18);
+    background: linear-gradient(145deg, #d5636f 0%, #bb4f5b 100%);
+    box-shadow:
+        0 10px 22px rgba(175, 69, 80, 0.24),
+        0 0 0 1px rgba(204, 86, 97, 0.18);
     transform: none;
     outline: none;
 }

@@ -52,6 +52,7 @@ DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 8000
 DEFAULT_FFMPEG_TIMEOUT_SEC = 20.0
 DEFAULT_RUNTIME_PROVIDER: ProviderMode = "auto"
+DEFAULT_ENABLE_WEB_UI = True
 
 
 def parse_bool_env(value: str | None, *, default: bool = False) -> bool:
@@ -78,6 +79,42 @@ def get_server_port() -> int:
     if port < 1 or port > 65535:
         raise RuntimeError(f"KOKORO_PORT must be between 1 and 65535, got {port}.")
     return port
+
+
+def get_web_ui_enabled() -> bool:
+    return parse_bool_env(
+        os.getenv("KOKORO_ENABLE_WEB_UI"),
+        default=DEFAULT_ENABLE_WEB_UI,
+    )
+
+
+def get_require_auth() -> bool:
+    return parse_bool_env(os.getenv("KOKORO_REQUIRE_AUTH"), default=False)
+
+
+def get_api_key() -> str | None:
+    value = os.getenv("KOKORO_API_KEY")
+    cleaned = value.strip() if value is not None else ""
+    if not cleaned:
+        if get_require_auth():
+            raise RuntimeError("KOKORO_API_KEY must be set when KOKORO_REQUIRE_AUTH=1.")
+        return None
+    return cleaned
+
+
+def get_allowed_origins() -> list[str]:
+    raw_origins = os.getenv("KOKORO_ALLOWED_ORIGINS")
+    if raw_origins is None or not raw_origins.strip():
+        return []
+
+    origins: list[str] = []
+    for token in raw_origins.split(","):
+        value = token.strip()
+        if not value:
+            continue
+        if value not in origins:
+            origins.append(value)
+    return origins
 
 
 def get_ffmpeg_timeout_seconds() -> float:

@@ -16,8 +16,10 @@ import {
   populateVoices,
   refreshCustomSelect,
   setBusy,
+  setAuthPanelState,
   setStatus,
   setSystemStatus,
+  setUiLocked,
   syncTransportModeText,
   updateFormatControlState,
   updateQueueMonitorLayout,
@@ -30,12 +32,136 @@ import {
   resetPlaybackState,
 } from "./playback.js";
 
-export async function loadHealth() {
+const API_KEY_STORAGE_KEY = "kokoro_api_key";
+
+class AuthRequiredError extends Error {
+  constructor(message = "Authentication failed.") {
+    super(message);
+    this.name = "AuthRequiredError";
+  }
+}
+
+function authHeaders() {
+  if (!appState.apiKey) {
+    return {};
+  }
+  return {
+    Authorization: `Bearer ${appState.apiKey}`,
+  };
+}
+
+function apiFetch(input, init = {}) {
+  const headers = new Headers(init.headers || {});
+  Object.entries(authHeaders()).forEach(([key, value]) => {
+    headers.set(key, value);
+  });
+  return fetch(input, { ...init, headers });
+}
+
+function storeApiKey(apiKey) {
+  window.sessionStorage.setItem(API_KEY_STORAGE_KEY, apiKey);
+}
+
+function removeStoredApiKey() {
+  window.sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+}
+
+function handleAuthFailure(message = "Authentication failed.") {
+  appState.apiKey = null;
+  removeStoredApiKey();
+  setUiLocked(true);
+  setAuthPanelState(true, message, true);
+  setStatus(message, true);
+}
+
+async function loadPublicConfig() {
+  const response = await fetch("/api/public-config");
+  if (!response.ok) {
+    throw new Error("Unable to load public configuration.");
+  }
+  return response.json();
+}
+
+export async function initializeAccess() {
+  const publicConfig = await loadPublicConfig();
+  appState.authRequired = publicConfig.auth_required === true;
+  if (!appState.authRequired) {
+    setAuthPanelState(false);
+    setUiLocked(false);
+    await loadHealth();
+    return;
+  }
+
+  const storedApiKey = window.sessionStorage.getItem(API_KEY_STORAGE_KEY);
+  if (!storedApiKey) {
+    setUiLocked(true);
+    setAuthPanelState(true, "Enter the configured API key to use this server.");
+    setStatus("API key required.", true);
+    return;
+  }
+
+  appState.apiKey = storedApiKey;
   try {
-    const [healthResponse, capabilitiesResponse] = await Promise.all([
-      fetch("/api/health"),
-      fetch("/api/capabilities"),
-    ]);
+    await loadHealth();
+    setUiLocked(false);
+    setAuthPanelState(false);
+  } catch (error) {
+    if (error instanceof AuthRequiredError) {
+      handleAuthFailure("Authentication failed.");
+      return;
+    }
+    throw error;
+  }
+}
+
+export async function submitApiKey(apiKey) {
+  const trimmedKey = String(apiKey || "").trim();
+  if (!trimmedKey) {
+    setAuthPanelState(true, "Enter an API key.", true);
+    return false;
+  }
+
+  appState.apiKey = trimmedKey;
+  setAuthPanelState(true, "Validating API key...", false, false);
+  try {
+    await loadHealth();
+    storeApiKey(trimmedKey);
+    setUiLocked(false);
+    setAuthPanelState(false);
+    setStatus("Authenticated. Ready for synthesis");
+    return true;
+  } catch (error) {
+    if (error instanceof AuthRequiredError) {
+      handleAuthFailure("Authentication failed.");
+      return false;
+    }
+    appState.apiKey = null;
+    setAuthPanelState(
+      true,
+      error.message || "Unable to reach the backend.",
+      true,
+    );
+    return false;
+  }
+}
+
+export function clearApiKey() {
+  appState.apiKey = null;
+  removeStoredApiKey();
+  setUiLocked(true);
+  setAuthPanelState(true, "Enter the configured API key to use this server.");
+  setStatus("API key cleared.");
+}
+
+export async function loadHealth() {
+  const [healthResponse, capabilitiesResponse] = await Promise.all([
+    apiFetch("/api/health"),
+    apiFetch("/api/capabilities"),
+  ]);
+  if (healthResponse.status === 401 || capabilitiesResponse.status === 401) {
+    throw new AuthRequiredError();
+  }
+  try {
     const health = await healthResponse.json();
     const capabilities = await capabilitiesResponse.json();
     populateVoices(capabilities.voices || []);
@@ -136,7 +262,10 @@ export async function loadHealth() {
       return;
     }
     setStatus(`Missing runtime files: ${health.missing.join(", ")}`, true);
-  } catch (_error) {
+  } catch (error) {
+    if (error instanceof AuthRequiredError) {
+      throw error;
+    }
     updateQueueMonitorLayout(null);
     gpuVram.textContent = "--";
     setSystemStatus(false, false);
@@ -189,7 +318,9 @@ export async function synthesize(event) {
     }
   } catch (error) {
     appState.lastExportRequest = null;
-    if (error.name !== "AbortError") {
+    if (error.name === "AuthRequiredError") {
+      handleAuthFailure(error.message || "Authentication failed.");
+    } else if (error.name !== "AbortError") {
       setStatus(error.message || "Synthesis failed.", true);
     }
     genTime.textContent = "--";
@@ -209,7 +340,7 @@ export async function exportAudio() {
   exportButtonLabel.textContent = "Exporting...";
 
   try {
-    const response = await fetch("/api/speak", {
+    const response = await apiFetch("/api/speak", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -217,6 +348,9 @@ export async function exportAudio() {
       body: JSON.stringify(appState.lastExportRequest),
     });
 
+    if (response.status === 401) {
+      throw new AuthRequiredError();
+    }
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
       throw new Error(payload.detail || "Export failed.");
@@ -235,7 +369,11 @@ export async function exportAudio() {
       `Exported ${appState.lastExportRequest.format.toUpperCase()} download.`,
     );
   } catch (error) {
-    setStatus(error.message || "Export failed.", true);
+    if (error instanceof AuthRequiredError) {
+      handleAuthFailure(error.message || "Authentication failed.");
+    } else {
+      setStatus(error.message || "Export failed.", true);
+    }
   } finally {
     exportButtonLabel.textContent = "Export Audio";
     exportButton.disabled = !appState.lastExportRequest;

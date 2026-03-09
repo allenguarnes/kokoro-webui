@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import base64
+import hmac
 import io
 import json
 import re
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import ParamSpec, TypeVar
+from typing import ParamSpec, TypeVar, cast
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +38,10 @@ _OPENAI_STREAM_TARGET_CHARS = 360
 
 
 def create_app() -> FastAPI:
+    web_ui_enabled = config.get_web_ui_enabled()
+    require_auth = config.get_require_auth()
+    configured_api_key = config.get_api_key()
+    allowed_origins = config.get_allowed_origins()
     requested_provider = config.get_runtime_provider_mode()
     runtime_status = runtime.get_runtime_status()
     active_runtime_provider = (
@@ -72,11 +77,69 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Kokoro WebUI", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=allowed_origins,
         allow_methods=["*"],
-        allow_headers=["*"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key"],
     )
-    app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
+    if web_ui_enabled:
+        app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
+
+    def is_valid_api_key(candidate: str | None) -> bool:
+        if not require_auth:
+            return True
+        if candidate is None or configured_api_key is None:
+            return False
+        return hmac.compare_digest(candidate, configured_api_key)
+
+    def extract_http_api_key(request: Request) -> str | None:
+        auth_header = request.headers.get("Authorization", "").strip()
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+            return token or None
+        api_key_header = request.headers.get("X-API-Key", "").strip()
+        return api_key_header or None
+
+    def http_auth_exception() -> HTTPException:
+        return HTTPException(
+            status_code=401,
+            detail="Authentication failed.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    def ensure_http_auth(request: Request) -> None:
+        if is_valid_api_key(extract_http_api_key(request)):
+            return
+        raise http_auth_exception()
+
+    def openai_auth_error_response() -> JSONResponse:
+        response = openai_compat.openai_error_response(
+            401,
+            "Authentication failed.",
+            error_type="invalid_request_error",
+            code="invalid_api_key",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+
+    def extract_websocket_api_key(
+        websocket: WebSocket, message_payload: object
+    ) -> str | None:
+        auth_header = websocket.headers.get("Authorization", "").strip()
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+            if token:
+                return token
+        query_token = websocket.query_params.get("api_key", "").strip()
+        if query_token:
+            return query_token
+        if isinstance(message_payload, dict):
+            message_map = cast(dict[str, object], message_payload)
+            message_token = message_map.get("api_key")
+            if isinstance(message_token, str):
+                cleaned = message_token.strip()
+                if cleaned:
+                    return cleaned
+        return None
 
     def queue_payload() -> dict[str, int | float]:
         metrics = synthesis_scheduler.snapshot()
@@ -157,16 +220,30 @@ def create_app() -> FastAPI:
             audio.synthesize_pcm_chunk, payload, text
         )
 
-    @app.get("/")
-    async def index() -> FileResponse:
-        return FileResponse(config.STATIC_DIR / "index.html")
+    if web_ui_enabled:
 
-    @app.get("/favicon.ico", include_in_schema=False)
-    async def favicon() -> FileResponse:
-        return FileResponse(config.STATIC_DIR / "favicon.ico")
+        @app.get("/")
+        async def index() -> FileResponse:
+            return FileResponse(config.STATIC_DIR / "index.html")
+
+        @app.get("/favicon.ico", include_in_schema=False)
+        async def favicon() -> FileResponse:
+            return FileResponse(config.STATIC_DIR / "favicon.ico")
+
+    @app.get("/api/public-config")
+    async def public_config() -> JSONResponse:
+        return JSONResponse(
+            {
+                "web_ui_enabled": web_ui_enabled,
+                "auth_required": require_auth,
+                "auth_scheme": "bearer" if require_auth else "none",
+                "websocket_auth": "header-or-first-message" if require_auth else "none",
+            }
+        )
 
     @app.get("/api/health")
-    async def health() -> JSONResponse:
+    async def health(request: Request) -> JSONResponse:
+        ensure_http_auth(request)
         missing: list[str] = []
         if not runtime.kokoro_runtime_available():
             missing.append("kokoro-onnx")
@@ -202,7 +279,8 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/api/capabilities")
-    async def capabilities() -> JSONResponse:
+    async def capabilities(request: Request) -> JSONResponse:
+        ensure_http_auth(request)
         runtime_status = runtime.get_runtime_status()
         available_formats = config.get_available_formats()
         return JSONResponse(
@@ -235,7 +313,9 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/v1/models", include_in_schema=False)
-    async def openai_list_models() -> JSONResponse:
+    async def openai_list_models(request: Request) -> JSONResponse:
+        if not is_valid_api_key(extract_http_api_key(request)):
+            return openai_auth_error_response()
         payload: OpenAIModelListResponse = {
             "object": "list",
             "data": [openai_compat.openai_model_object()],
@@ -243,7 +323,9 @@ def create_app() -> FastAPI:
         return JSONResponse(payload)
 
     @app.get("/v1/models/{model_id}", include_in_schema=False)
-    async def openai_retrieve_model(model_id: str) -> JSONResponse:
+    async def openai_retrieve_model(model_id: str, request: Request) -> JSONResponse:
+        if not is_valid_api_key(extract_http_api_key(request)):
+            return openai_auth_error_response()
         if model_id != config.OPENAI_COMPAT_MODEL:
             return openai_compat.openai_error_response(
                 404,
@@ -257,6 +339,8 @@ def create_app() -> FastAPI:
     async def openai_create_speech(
         payload: OpenAISpeechRequest, request: Request
     ) -> Response:
+        if not is_valid_api_key(extract_http_api_key(request)):
+            return openai_auth_error_response()
         try:
             synth_request = openai_compat.build_openai_synthesis_request(payload)
         except SynthesisOverloadedError as exc:
@@ -345,7 +429,8 @@ def create_app() -> FastAPI:
         )
 
     @app.post("/api/speak")
-    async def speak(payload: SynthesisRequest) -> StreamingResponse:
+    async def speak(payload: SynthesisRequest, request: Request) -> StreamingResponse:
+        ensure_http_auth(request)
         try:
             rendered = await synthesize_chunk_async(payload, payload.text)
         except SynthesisOverloadedError as exc:
@@ -371,7 +456,10 @@ def create_app() -> FastAPI:
         )
 
     @app.post("/api/chunk-plan")
-    async def chunk_plan(payload: ChunkMetadataRequest) -> JSONResponse:
+    async def chunk_plan(
+        payload: ChunkMetadataRequest, request: Request
+    ) -> JSONResponse:
+        ensure_http_auth(request)
         chunks = runtime.split_text_into_chunks(
             payload.text, payload.target_chunk_chars
         )
@@ -442,6 +530,7 @@ def create_app() -> FastAPI:
     async def speak_stream(
         payload: ChunkedSynthesisRequest, request: Request
     ) -> StreamingResponse:
+        ensure_http_auth(request)
         chunks = runtime.split_text_into_chunks(
             payload.text, payload.target_chunk_chars
         )
@@ -523,7 +612,16 @@ def create_app() -> FastAPI:
         await websocket.accept()
         try:
             raw_payload = await websocket.receive_text()
-            payload = ChunkedSynthesisRequest.model_validate_json(raw_payload)
+            payload_data = cast(object, json.loads(raw_payload))
+            if not is_valid_api_key(extract_websocket_api_key(websocket, payload_data)):
+                await websocket.send_text(
+                    json.dumps({"type": "error", "detail": "Authentication failed."})
+                )
+                return
+            if isinstance(payload_data, dict):
+                payload_map = cast(dict[str, object], payload_data)
+                payload_map.pop("api_key", None)
+            payload = ChunkedSynthesisRequest.model_validate(payload_data)
             chunks = runtime.split_text_into_chunks(
                 payload.text, payload.target_chunk_chars
             )

@@ -7,10 +7,20 @@ This server exposes two API groups:
 - Native Kokoro WebUI routes under `/api/*` plus `ws://.../ws/*`
 - OpenAI-compatible routes under `/v1/*`
 
+## Authentication
+
+- Auth is optional and controlled by server configuration.
+- When `KOKORO_REQUIRE_AUTH=1`, all non-static API routes require an API key.
+- HTTP routes accept either `Authorization: Bearer <key>` or `X-API-Key: <key>`.
+- `WS /ws/speak-stream` accepts the bearer header during handshake and also supports an `api_key` field in the first WebSocket message for browser clients that cannot set custom headers.
+- `GET /api/public-config` is intentionally public so the built-in Web UI can discover whether auth is required before calling protected routes.
+
 ## Quick Links
 
 ### Native Endpoints
 
+- [Authentication](#authentication)
+- [`GET /api/public-config`](#get-apipublic-config)
 - [Common Native Fields](#common-native-fields)
 - [`GET /api/health`](#get-apihealth)
 - [`GET /api/capabilities`](#get-apicapabilities)
@@ -34,6 +44,7 @@ This server exposes two API groups:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
+| `GET` | `/api/public-config` | Public UI bootstrap config |
 | `GET` | `/api/health` | Readiness and queue status |
 | `GET` | `/api/capabilities` | Runtime capabilities, voices, formats, and limits |
 | `POST` | `/api/speak` | Render one audio response |
@@ -63,6 +74,21 @@ Notes:
 - `opus_bitrate` matters only when `format` is `opus`.
 - `wav_sample_rate` matters when `format` is `wav` or `pcm`.
 - `/api/capabilities.formats` is the authoritative list of formats enabled on this server.
+
+### `GET /api/public-config`
+
+Returns the minimum public configuration needed by the built-in Web UI before authentication.
+
+### Response
+
+```json
+{
+  "web_ui_enabled": true,
+  "auth_required": true,
+  "auth_scheme": "bearer",
+  "websocket_auth": "header-or-first-message"
+}
+```
 
 ### `GET /api/health`
 
@@ -407,6 +433,8 @@ Most OpenAI-compatible clients expect the base URL to already include `/v1`, for
 - `http://127.0.0.1:8000/v1`
 
 That is usually the correct setting for external integrations. If you point those clients at `http://127.0.0.1:8000` instead, many of them will append `/models` or `/audio/speech` on their own and miss the compatibility routes.
+
+If auth is enabled, use the same bearer key you use for the native API.
 
 | Method | Path | Purpose |
 | --- | --- | --- |

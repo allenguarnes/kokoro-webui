@@ -1,5 +1,12 @@
 import {
+  appShell,
+  appWorkspace,
   audioDuration,
+  authApiKeyInput,
+  authClearButton,
+  authMessage,
+  authPanel,
+  authUnlockButton,
   charStatCard,
   charCount,
   chunkTargetInput,
@@ -315,6 +322,66 @@ export function setStatus(message, isError = false) {
   statusText.textContent = message;
   errorText.hidden = !isError;
   errorText.textContent = isError ? message : "";
+}
+
+export function setAuthPanelState(
+  visible,
+  message = "",
+  isError = false,
+  clearVisible = true,
+) {
+  if (authPanel) {
+    authPanel.hidden = !visible;
+  }
+  appShell?.classList.toggle("shell-auth-locked", visible);
+  appWorkspace?.classList.toggle("workspace-locked", visible);
+  if (authMessage) {
+    authMessage.textContent = message;
+    authMessage.classList.toggle("auth-message-error", isError);
+  }
+  if (authClearButton) {
+    authClearButton.hidden = !visible || !clearVisible;
+  }
+  if (authApiKeyInput) {
+    authApiKeyInput.disabled = !visible;
+    if (visible) {
+      window.requestAnimationFrame(() => {
+        authApiKeyInput.focus();
+        authApiKeyInput.select();
+      });
+    }
+  }
+  if (authUnlockButton) {
+    authUnlockButton.disabled = !visible;
+  }
+}
+
+export function setUiLocked(locked) {
+  appShell?.classList.toggle("shell-ui-locked", locked);
+  appWorkspace?.classList.toggle("workspace-ui-locked", locked);
+  [
+    textInput,
+    voiceInput,
+    langInput,
+    transportInput,
+    formatInput,
+    formatQualityInput,
+    speedInput,
+    pitchInput,
+    chunkTargetInput,
+    pauseMsInput,
+    submitButton,
+    exportButton,
+  ].forEach((control) => {
+    control.disabled = locked;
+  });
+  if (!locked) {
+    refreshCustomSelect(voiceInput);
+    refreshCustomSelect(langInput);
+    refreshCustomSelect(transportInput);
+    refreshCustomSelect(formatInput);
+    refreshCustomSelect(formatQualityInput);
+  }
 }
 
 export function setBusy(isBusy) {

@@ -1,4 +1,6 @@
 export const appState = {
+  authRequired: false,
+  apiKey: null,
   currentObjectUrl: null,
   playbackToken: 0,
   chunkState: null,

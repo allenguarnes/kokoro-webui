@@ -102,6 +102,15 @@ Useful flags:
 - `--quiet-checks`: start without printing the preflight summary
 - `--check-only`: print the preflight summary and exit without starting the server
 
+Optional local auth:
+
+```dotenv
+KOKORO_REQUIRE_AUTH=1
+KOKORO_API_KEY=change-me
+```
+
+When auth is enabled, the Web UI stays locked until the key is entered. API clients should send `Authorization: Bearer <key>`.
+
 ## Advanced Configuration
 
 Use this section once the basic setup is working.
@@ -194,6 +203,10 @@ The app auto-loads `.env` (if present).
 | `KOKORO_HOST` | `127.0.0.1` | Bind host |
 | `KOKORO_PORT` | `8000` | Bind port |
 | `KOKORO_RELOAD` | `0` | Development auto-reload |
+| `KOKORO_ENABLE_WEB_UI` | `1` | Serve the built-in Web UI. Set `0` for headless/API-only mode |
+| `KOKORO_REQUIRE_AUTH` | `0` | Require API key auth for all non-static API routes |
+| `KOKORO_API_KEY` | unset | Shared API key used for HTTP bearer auth and WebSocket auth |
+| `KOKORO_ALLOWED_ORIGINS` | unset | Optional comma-separated browser allowlist for cross-origin clients |
 | `KOKORO_FFMPEG_TIMEOUT_SEC` | `20` | Timeout for ffmpeg/rubberband subprocess work |
 | `KOKORO_FORMATS` | all supported formats | Optional comma-separated subset of enabled output formats, for example `wav`, `pcm`, or `wav,pcm,opus` |
 | `KOKORO_PROVIDER` | `auto` | Runtime selection: `auto`, `cpu`, or `cuda` |
@@ -213,6 +226,10 @@ Example `.env`:
 KOKORO_HOST=127.0.0.1
 KOKORO_PORT=8000
 KOKORO_RELOAD=0
+KOKORO_ENABLE_WEB_UI=1
+KOKORO_REQUIRE_AUTH=0
+# KOKORO_API_KEY=change-me
+# KOKORO_ALLOWED_ORIGINS=http://127.0.0.1:8000,http://localhost:8000
 KOKORO_FFMPEG_TIMEOUT_SEC=20
 # KOKORO_FORMATS=wav,pcm,opus
 KOKORO_PROVIDER=auto
@@ -234,6 +251,12 @@ KOKORO_STRICT_PROVIDER=0
 `/api/health` also reports queue wait-time metrics so you can tell the difference between idle, busy, and saturated behavior.
 
 If `KOKORO_FORMATS` is narrowed to a single value, the Web UI locks the format control to that server-configured format.
+
+`KOKORO_ENABLE_WEB_UI=0` turns the process into an API-only server. In that mode the static site is not served, but the API and OpenAI-compatible routes still work.
+
+If `KOKORO_REQUIRE_AUTH=1`, every non-static API route requires the configured key. HTTP routes accept `Authorization: Bearer <key>` or `X-API-Key`. The WebSocket route accepts the bearer header during handshake and also supports a first-message `api_key` fallback for browser clients.
+
+If you want a browser app on another origin to call this server, set `KOKORO_ALLOWED_ORIGINS` explicitly. Leaving it unset keeps browser access same-origin only, which is the safer default once auth is enabled.
 
 The scheduler is now provider-aware at the policy level:
 - CPU mode allows a small shared-runtime worker pool

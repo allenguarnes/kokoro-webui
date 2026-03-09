@@ -153,6 +153,15 @@ function notifyQueue(state) {
   }
 }
 
+function buildAuthHeaders() {
+  if (!appState.apiKey) {
+    return {};
+  }
+  return {
+    Authorization: `Bearer ${appState.apiKey}`,
+  };
+}
+
 async function waitForQueue(state, token) {
   if (
     token !== appState.playbackToken ||
@@ -173,11 +182,17 @@ export async function readStreamIntoQueue(state, token) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      ...buildAuthHeaders(),
     },
     body: JSON.stringify(buildSynthesisPayload()),
     signal: appState.streamAbortController.signal,
   });
 
+  if (response.status === 401) {
+    const error = new Error("Authentication failed.");
+    error.name = "AuthRequiredError";
+    throw error;
+  }
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
     throw new Error(payload.detail || "Streaming synthesis failed.");
@@ -252,7 +267,11 @@ export function readWebSocketIntoQueue(state, token) {
     appState.activeSocket = socket;
 
     socket.onopen = () => {
-      socket.send(JSON.stringify(buildSynthesisPayload()));
+      const payload = buildSynthesisPayload();
+      if (appState.apiKey) {
+        payload.api_key = appState.apiKey;
+      }
+      socket.send(JSON.stringify(payload));
     };
 
     socket.onmessage = (event) => {
