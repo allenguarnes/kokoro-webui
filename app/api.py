@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import hmac
 import io
 import json
 import re
+import secrets
 import threading
 import time
 from collections.abc import AsyncIterator, Callable
@@ -57,6 +57,8 @@ def create_app() -> FastAPI:
     ws_auth_handshake_timeout_sec = (
         config.get_websocket_auth_handshake_timeout_seconds()
     )
+    ws_session_token_ttl_sec = config.get_websocket_session_token_ttl_seconds()
+    ws_session_token_max_tokens = config.get_websocket_session_token_max_tokens()
     requested_provider = config.get_runtime_provider_mode()
     runtime_status = runtime.get_runtime_status()
     active_runtime_provider = (
@@ -102,6 +104,48 @@ def create_app() -> FastAPI:
     auth_failures: dict[str, list[float]] = {}
     auth_failures_lock = threading.Lock()
     auth_failures_tick = 0
+    ws_session_tokens: dict[str, tuple[float, str]] = {}
+    ws_session_tokens_lock = threading.Lock()
+
+    def prune_ws_session_tokens(now: float) -> None:
+        if not ws_session_tokens:
+            return
+        for token, (expires_at, _) in list(ws_session_tokens.items()):
+            if expires_at <= now:
+                ws_session_tokens.pop(token, None)
+
+    def compact_ws_session_tokens(now: float) -> None:
+        prune_ws_session_tokens(now)
+        if len(ws_session_tokens) <= ws_session_token_max_tokens:
+            return
+
+        overflow = len(ws_session_tokens) - ws_session_token_max_tokens
+        oldest = sorted(ws_session_tokens.items(), key=lambda item: item[1][0])[
+            :overflow
+        ]
+        for token, _ in oldest:
+            ws_session_tokens.pop(token, None)
+
+    def issue_ws_session_token(client_id: str) -> tuple[str, int]:
+        now = time.monotonic()
+        token = secrets.token_urlsafe(24)
+        expires_in = max(1, int(ws_session_token_ttl_sec))
+        with ws_session_tokens_lock:
+            ws_session_tokens[token] = (now + ws_session_token_ttl_sec, client_id)
+            compact_ws_session_tokens(now)
+        return token, expires_in
+
+    def consume_ws_session_token(candidate: str | None, client_id: str) -> bool:
+        if not candidate:
+            return False
+        now = time.monotonic()
+        with ws_session_tokens_lock:
+            compact_ws_session_tokens(now)
+            token_entry = ws_session_tokens.pop(candidate, None)
+        if token_entry is None:
+            return False
+        expires_at, bound_client_id = token_entry
+        return expires_at > now and hmac.compare_digest(bound_client_id, client_id)
 
     def is_valid_api_key(candidate: str | None) -> bool:
         if not require_auth:
@@ -137,12 +181,8 @@ def create_app() -> FastAPI:
             return real_ip
         return None
 
-    def auth_bucket_id(source_id: str, candidate: str | None) -> str:
-        if candidate:
-            fingerprint = hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:16]
-        else:
-            fingerprint = "none"
-        return f"{source_id}|{fingerprint}"
+    def auth_bucket_id(source_id: str) -> str:
+        return source_id
 
     def compact_auth_failures(now: float) -> None:
         if not auth_failures:
@@ -220,7 +260,7 @@ def create_app() -> FastAPI:
     def ensure_http_auth(request: Request) -> None:
         candidate = extract_http_api_key(request)
         client_id = extract_http_client_id(request)
-        bucket_id = auth_bucket_id(client_id, candidate)
+        bucket_id = auth_bucket_id(client_id)
         if is_valid_api_key(candidate):
             clear_auth_failures(bucket_id)
             return
@@ -251,7 +291,7 @@ def create_app() -> FastAPI:
     def openai_auth_error_for_request(request: Request) -> JSONResponse | None:
         candidate = extract_http_api_key(request)
         client_id = extract_http_client_id(request)
-        bucket_id = auth_bucket_id(client_id, candidate)
+        bucket_id = auth_bucket_id(client_id)
         if is_valid_api_key(candidate):
             clear_auth_failures(bucket_id)
             return None
@@ -260,22 +300,23 @@ def create_app() -> FastAPI:
             return openai_auth_error_response(429)
         return openai_auth_error_response(401)
 
-    def extract_websocket_api_key(
-        websocket: WebSocket, message_payload: object
-    ) -> str | None:
+    def extract_websocket_api_key(websocket: WebSocket) -> str | None:
         auth_header = websocket.headers.get("Authorization", "").strip()
         if auth_header.lower().startswith("bearer "):
             token = auth_header[7:].strip()
             if token:
                 return token
-        if isinstance(message_payload, dict):
-            message_map = cast(dict[str, object], message_payload)
-            message_token = message_map.get("api_key")
-            if isinstance(message_token, str):
-                cleaned = message_token.strip()
-                if cleaned:
-                    return cleaned
         return None
+
+    def extract_websocket_session_token(message_payload: object) -> str | None:
+        if not isinstance(message_payload, dict):
+            return None
+        message_map = cast(dict[str, object], message_payload)
+        message_token = message_map.get("ws_token")
+        if not isinstance(message_token, str):
+            return None
+        cleaned = message_token.strip()
+        return cleaned or None
 
     def extract_websocket_client_id(websocket: WebSocket) -> str:
         forwarded_host = get_forwarded_host(websocket.headers)
@@ -287,9 +328,13 @@ def create_app() -> FastAPI:
     def websocket_auth_error_detail(
         websocket: WebSocket, message_payload: object
     ) -> str | None:
-        candidate = extract_websocket_api_key(websocket, message_payload)
         client_id = extract_websocket_client_id(websocket)
-        bucket_id = auth_bucket_id(client_id, candidate)
+        if require_auth:
+            ws_token = extract_websocket_session_token(message_payload)
+            if consume_ws_session_token(ws_token, client_id):
+                return None
+        candidate = extract_websocket_api_key(websocket)
+        bucket_id = auth_bucket_id(client_id)
         if is_valid_api_key(candidate):
             clear_auth_failures(bucket_id)
             return None
@@ -394,7 +439,21 @@ def create_app() -> FastAPI:
                 "web_ui_enabled": web_ui_enabled,
                 "auth_required": require_auth,
                 "auth_scheme": "bearer" if require_auth else "none",
-                "websocket_auth": "header-or-first-message" if require_auth else "none",
+                "websocket_auth": (
+                    "header-or-session-token" if require_auth else "none"
+                ),
+            }
+        )
+
+    @app.post("/api/ws-token")
+    async def issue_websocket_token(request: Request) -> JSONResponse:
+        ensure_http_auth(request)
+        token, expires_in = issue_ws_session_token(extract_http_client_id(request))
+        return JSONResponse(
+            {
+                "token": token,
+                "token_type": "ws",
+                "expires_in": expires_in,
             }
         )
 
@@ -507,8 +566,10 @@ def create_app() -> FastAPI:
             return openai_compat.openai_error_response(503, str(exc))
         except ValueError as exc:
             return openai_compat.openai_error_response(400, str(exc))
-        except Exception as exc:
-            return openai_compat.openai_error_response(400, str(exc))
+        except Exception:
+            return openai_compat.openai_error_response(
+                500, "Synthesis failed.", error_type="server_error"
+            )
 
         if synth_request.format in {"wav", "pcm"}:
             chunks = runtime.split_text_into_chunks(
@@ -532,8 +593,10 @@ def create_app() -> FastAPI:
                 ) = await synthesize_pcm_stream_chunk_async(synth_request, chunks[0])
             except SynthesisOverloadedError as exc:
                 return openai_compat.openai_error_response(503, str(exc))
-            except Exception as exc:
-                return openai_compat.openai_error_response(400, str(exc))
+            except Exception:
+                return openai_compat.openai_error_response(
+                    500, "Synthesis failed.", error_type="server_error"
+                )
 
             async def wav_stream() -> AsyncIterator[bytes]:
                 if synth_request.format == "wav":
@@ -574,8 +637,10 @@ def create_app() -> FastAPI:
             rendered = await synthesize_chunk_async(synth_request, synth_request.text)
         except SynthesisOverloadedError as exc:
             return openai_compat.openai_error_response(503, str(exc))
-        except Exception as exc:
-            return openai_compat.openai_error_response(400, str(exc))
+        except Exception:
+            return openai_compat.openai_error_response(
+                500, "Synthesis failed.", error_type="server_error"
+            )
 
         headers = {
             "X-OpenAI-Compatible": config.OPENAI_COMPAT_MODEL,
@@ -596,7 +661,7 @@ def create_app() -> FastAPI:
         except SynthesisOverloadedError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=500, detail="Synthesis failed.") from exc
 
         headers = {
             "Content-Disposition": f'inline; filename="{rendered["filename"]}"',
@@ -727,28 +792,28 @@ def create_app() -> FastAPI:
                     event, audio_bytes = await build_chunk_event_async(
                         payload, chunk, index, total_chunks
                     )
-                except SynthesisOverloadedError as exc:
+                except SynthesisOverloadedError:
                     if await request.is_disconnected():
                         return
                     yield (
                         json.dumps(
                             {
                                 "type": "error",
-                                "detail": str(exc),
+                                "detail": "Streaming synthesis failed.",
                                 "chunk_index": index,
                             }
                         )
                         + "\n"
                     ).encode("utf-8")
                     return
-                except Exception as exc:
+                except Exception:
                     if await request.is_disconnected():
                         return
                     yield (
                         json.dumps(
                             {
                                 "type": "error",
-                                "detail": str(exc),
+                                "detail": "Streaming synthesis failed.",
                                 "chunk_index": index,
                             }
                         )
@@ -778,13 +843,12 @@ def create_app() -> FastAPI:
             payload_data = cast(object, json.loads(raw_payload))
             auth_error_detail = websocket_auth_error_detail(websocket, payload_data)
             if auth_error_detail is not None:
-                await websocket.send_text(
-                    json.dumps({"type": "error", "detail": auth_error_detail})
-                )
+                await websocket.close(code=1008, reason=auth_error_detail)
                 return
             if isinstance(payload_data, dict):
                 payload_map = cast(dict[str, object], payload_data)
                 payload_map.pop("api_key", None)
+                payload_map.pop("ws_token", None)
             payload = ChunkedSynthesisRequest.model_validate(payload_data)
             chunks = runtime.split_text_into_chunks(
                 payload.text, payload.target_chunk_chars
@@ -832,12 +896,12 @@ def create_app() -> FastAPI:
                         )
                     )
                     return
-                except Exception as exc:
+                except Exception:
                     await websocket.send_text(
                         json.dumps(
                             {
                                 "type": "error",
-                                "detail": str(exc),
+                                "detail": "Streaming synthesis failed.",
                                 "chunk_index": index,
                             }
                         )
@@ -854,7 +918,14 @@ def create_app() -> FastAPI:
             return
         except WebSocketDisconnect:
             return
-        except Exception as exc:
-            await websocket.send_text(json.dumps({"type": "error", "detail": str(exc)}))
+        except Exception:
+            await websocket.send_text(
+                json.dumps({"type": "error", "detail": "Streaming synthesis failed."})
+            )
+        finally:
+            try:
+                await websocket.close()
+            except RuntimeError:
+                pass
 
     return app

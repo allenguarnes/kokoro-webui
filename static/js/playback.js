@@ -162,6 +162,24 @@ function buildAuthHeaders() {
   };
 }
 
+async function issueWebSocketToken() {
+  const response = await fetch("/api/ws-token", {
+    method: "POST",
+    headers: buildAuthHeaders(),
+  });
+  if (response.status === 401) {
+    const error = new Error("Authentication failed.");
+    error.name = "AuthRequiredError";
+    throw error;
+  }
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.detail || "Unable to issue WebSocket token.");
+  }
+  const payload = await response.json();
+  return payload.token;
+}
+
 async function waitForQueue(state, token) {
   if (
     token !== appState.playbackToken ||
@@ -266,12 +284,17 @@ export function readWebSocketIntoQueue(state, token) {
     socket.binaryType = "arraybuffer";
     appState.activeSocket = socket;
 
-    socket.onopen = () => {
-      const payload = buildSynthesisPayload();
-      if (appState.apiKey) {
-        payload.api_key = appState.apiKey;
+    socket.onopen = async () => {
+      try {
+        const payload = buildSynthesisPayload();
+        if (appState.authRequired) {
+          payload.ws_token = await issueWebSocketToken();
+        }
+        socket.send(JSON.stringify(payload));
+      } catch (error) {
+        socket.close(1000, "ws-token-failed");
+        reject(error);
       }
-      socket.send(JSON.stringify(payload));
     };
 
     socket.onmessage = (event) => {
@@ -321,7 +344,21 @@ export function readWebSocketIntoQueue(state, token) {
       reject(new Error("WebSocket transport failed."));
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
+      if (
+        token === appState.playbackToken &&
+        appState.chunkState &&
+        !state.streamDone &&
+        !state.streamError &&
+        event.code !== 1000
+      ) {
+        state.streamError =
+          event.reason ||
+          (event.code === 1008
+            ? "Authentication failed."
+            : "WebSocket streaming failed.");
+        notifyQueue(state);
+      }
       if (
         token === appState.playbackToken &&
         appState.chunkState &&

@@ -58,6 +58,8 @@ DEFAULT_AUTH_FAILURE_WINDOW_SEC = 60.0
 DEFAULT_AUTH_FAILURE_MAX_BUCKETS = 4096
 DEFAULT_TRUST_PROXY_HEADERS = False
 DEFAULT_WS_AUTH_HANDSHAKE_TIMEOUT_SEC = 5.0
+DEFAULT_WS_SESSION_TOKEN_TTL_SEC = 30.0
+DEFAULT_WS_SESSION_TOKEN_MAX_TOKENS = 1024
 
 
 def parse_bool_env(value: str | None, *, default: bool = False) -> bool:
@@ -196,6 +198,42 @@ def get_websocket_auth_handshake_timeout_seconds() -> float:
             f"KOKORO_WS_AUTH_HANDSHAKE_TIMEOUT_SEC must be greater than 0, got {timeout}."
         )
     return timeout
+
+
+def get_websocket_session_token_ttl_seconds() -> float:
+    raw_ttl = os.getenv(
+        "KOKORO_WS_SESSION_TOKEN_TTL_SEC",
+        str(DEFAULT_WS_SESSION_TOKEN_TTL_SEC),
+    ).strip()
+    try:
+        ttl = float(raw_ttl)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"KOKORO_WS_SESSION_TOKEN_TTL_SEC must be a positive number, got {raw_ttl!r}."
+        ) from exc
+    if ttl <= 0:
+        raise RuntimeError(
+            f"KOKORO_WS_SESSION_TOKEN_TTL_SEC must be greater than 0, got {ttl}."
+        )
+    return ttl
+
+
+def get_websocket_session_token_max_tokens() -> int:
+    raw_limit = os.getenv(
+        "KOKORO_WS_SESSION_TOKEN_MAX_TOKENS",
+        str(DEFAULT_WS_SESSION_TOKEN_MAX_TOKENS),
+    ).strip()
+    try:
+        limit = int(raw_limit)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"KOKORO_WS_SESSION_TOKEN_MAX_TOKENS must be a positive integer, got {raw_limit!r}."
+        ) from exc
+    if limit < 1:
+        raise RuntimeError(
+            f"KOKORO_WS_SESSION_TOKEN_MAX_TOKENS must be greater than 0, got {limit}."
+        )
+    return limit
 
 
 def get_ffmpeg_timeout_seconds() -> float:

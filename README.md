@@ -206,12 +206,14 @@ The app auto-loads `.env` (if present).
 | `KOKORO_RELOAD` | `0` | Development auto-reload |
 | `KOKORO_ENABLE_WEB_UI` | `1` | Serve the built-in Web UI. Set `0` for headless/API-only mode |
 | `KOKORO_REQUIRE_AUTH` | `0` | Require API key auth for all non-static API routes |
-| `KOKORO_API_KEY` | unset | Shared API key used for HTTP bearer auth and WebSocket auth |
+| `KOKORO_API_KEY` | unset | Shared API key used for HTTP bearer auth and for issuing short-lived WebSocket session tokens |
 | `KOKORO_AUTH_FAILURE_LIMIT` | `5` | Max failed auth attempts per client within the throttle window before `429` responses begin |
 | `KOKORO_AUTH_FAILURE_WINDOW_SEC` | `60` | Auth failure throttle window in seconds |
 | `KOKORO_AUTH_FAILURE_MAX_BUCKETS` | `4096` | Upper bound for in-memory auth-failure buckets |
 | `KOKORO_TRUST_PROXY_HEADERS` | `0` | Trust `X-Forwarded-For` / `X-Real-IP` for auth-throttle client identity (enable only behind a trusted proxy) |
 | `KOKORO_WS_AUTH_HANDSHAKE_TIMEOUT_SEC` | `5` | Timeout for the first WebSocket auth payload before closing the connection |
+| `KOKORO_WS_SESSION_TOKEN_TTL_SEC` | `30` | Lifetime in seconds for one-time WebSocket session tokens issued to the built-in Web UI |
+| `KOKORO_WS_SESSION_TOKEN_MAX_TOKENS` | `1024` | Upper bound for in-memory pending WebSocket session tokens |
 | `KOKORO_ALLOWED_ORIGINS` | unset | Optional comma-separated browser allowlist for cross-origin clients |
 | `KOKORO_FFMPEG_TIMEOUT_SEC` | `20` | Timeout for ffmpeg/rubberband subprocess work |
 | `KOKORO_FORMATS` | all supported formats | Optional comma-separated subset of enabled output formats, for example `wav`, `pcm`, or `wav,pcm,opus` |
@@ -270,7 +272,7 @@ If `KOKORO_FORMATS` is narrowed to a single value, the Web UI locks the format c
 
 `KOKORO_ENABLE_WEB_UI=0` turns the process into an API-only server. In that mode the static site is not served, but the API and OpenAI-compatible routes still work.
 
-If `KOKORO_REQUIRE_AUTH=1`, every non-static API route requires the configured key. HTTP routes accept `Authorization: Bearer <key>` or `X-API-Key`. The WebSocket route accepts the bearer header during handshake and also supports a first-message `api_key` fallback for browser clients. Query-string API keys are intentionally not supported.
+If `KOKORO_REQUIRE_AUTH=1`, every non-static API route requires the configured key. HTTP routes accept `Authorization: Bearer <key>` or `X-API-Key`. The WebSocket route accepts the bearer header during handshake for non-browser clients. The built-in Web UI issues a short-lived one-time WebSocket session token over authenticated HTTP and sends that token in the first WebSocket message instead of the long-lived API key. Those session tokens are bound to the issuing client identity, expire automatically, and are capped in memory. Query-string API keys are intentionally not supported.
 
 The server throttles repeated failed auth attempts per client and returns `429` with `Retry-After` once the threshold is crossed. Valid credentials still succeed immediately even after prior failures.
 

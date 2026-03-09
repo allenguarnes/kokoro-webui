@@ -3,18 +3,25 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import socket
 import subprocess
 import threading
+import time
 import unittest
-from contextlib import ExitStack
+import warnings
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
 import httpx
 import numpy as np
+import uvicorn
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
+from websockets.exceptions import ConnectionClosed
+from websockets.sync.client import connect as websocket_connect
 
 import app.api as api
 import app.audio as audio
@@ -54,6 +61,53 @@ def make_pcm_chunk(
     sample_rate = 24000
     duration_sec = float(len(samples) / sample_rate)
     return samples, sample_rate, duration_sec
+
+
+@contextmanager
+def run_live_server(test_app: FastAPI) -> Iterator[dict[str, str]]:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(5)
+    port = cast(int, sock.getsockname()[1])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        server = uvicorn.Server(
+            uvicorn.Config(
+                test_app,
+                host="127.0.0.1",
+                port=port,
+                log_level="warning",
+                loop="asyncio",
+                lifespan="on",
+            )
+        )
+
+    def serve() -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            asyncio.run(server.serve(sockets=[sock]))
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5.0
+    while not server.started and thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not server.started:
+        server.should_exit = True
+        thread.join(timeout=2.0)
+        sock.close()
+        raise RuntimeError("Timed out waiting for live test server startup.")
+
+    try:
+        yield {
+            "http": f"http://127.0.0.1:{port}",
+            "ws": f"ws://127.0.0.1:{port}",
+        }
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5.0)
+        sock.close()
 
 
 class ApiIntegrationTests(unittest.TestCase):
@@ -231,6 +285,29 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertTrue(payload["web_ui_enabled"])
         self.assertFalse(payload["auth_required"])
         self.assertEqual(payload["auth_scheme"], "none")
+
+    def test_public_config_reports_websocket_session_token_auth_when_enabled(
+        self,
+    ) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+        ):
+            test_app = api.create_app()
+
+            async def run_test() -> httpx.Response:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    return await client.get("/api/public-config")
+
+            response = asyncio.run(run_test())
+
+        payload = cast(dict[str, object], response.json())
+        self.assertTrue(payload["auth_required"])
+        self.assertEqual(payload["websocket_auth"], "header-or-session-token")
 
     def test_capabilities_reports_runtime_and_formats(self) -> None:
         fake_status = RuntimeStatus(
@@ -589,12 +666,13 @@ class ApiIntegrationTests(unittest.TestCase):
             "target_chunk_chars": 120,
         }
         with patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk):
-            with self.get_client().websocket_connect("/ws/speak-stream") as websocket:
-                websocket.send_text(json.dumps(request_payload))
-                meta = cast(dict[str, object], json.loads(websocket.receive_text()))
-                chunk = cast(dict[str, object], json.loads(websocket.receive_text()))
-                audio_bytes = websocket.receive_bytes()
-                done = cast(dict[str, object], json.loads(websocket.receive_text()))
+            with run_live_server(api.create_app()) as endpoints:
+                with websocket_connect(f"{endpoints['ws']}/ws/speak-stream") as ws:
+                    ws.send(json.dumps(request_payload))
+                    meta = cast(dict[str, object], json.loads(cast(str, ws.recv())))
+                    chunk = cast(dict[str, object], json.loads(cast(str, ws.recv())))
+                    audio_bytes = cast(bytes, ws.recv())
+                    done = cast(dict[str, object], json.loads(cast(str, ws.recv())))
 
         self.assertEqual(meta["type"], "meta")
         self.assertEqual(chunk["type"], "chunk")
@@ -602,7 +680,39 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(audio_bytes, b"af_heart|0.0|opus|Hello over websocket.")
         self.assertEqual(done["type"], "done")
 
-    def test_websocket_stream_accepts_api_key_in_first_message(self) -> None:
+    def test_issue_ws_token_requires_http_auth(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+        ):
+            test_app = api.create_app()
+
+            async def run_test() -> tuple[httpx.Response, httpx.Response]:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    invalid = await client.post(
+                        "/api/ws-token",
+                        headers={"Authorization": "Bearer wrong-token"},
+                    )
+                    valid = await client.post(
+                        "/api/ws-token",
+                        headers={"Authorization": "Bearer secret-key"},
+                    )
+                    return invalid, valid
+
+            invalid, valid = asyncio.run(run_test())
+
+        self.assertEqual(invalid.status_code, 401)
+        self.assertEqual(valid.status_code, 200)
+        payload = cast(dict[str, object], valid.json())
+        self.assertEqual(payload["token_type"], "ws")
+        self.assertIsInstance(payload["token"], str)
+        self.assertGreater(cast(int, payload["expires_in"]), 0)
+
+    def test_websocket_stream_accepts_ws_token_in_first_message(self) -> None:
         request_payload = {
             "text": "Hello over websocket.",
             "voice": "af_heart",
@@ -611,7 +721,6 @@ class ApiIntegrationTests(unittest.TestCase):
             "lang": "en-us",
             "format": "opus",
             "target_chunk_chars": 120,
-            "api_key": "secret-key",
         }
         with (
             patch.object(config, "get_require_auth", return_value=True),
@@ -619,23 +728,65 @@ class ApiIntegrationTests(unittest.TestCase):
             patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk),
         ):
             test_app = api.create_app()
-            client = TestClient(test_app)
-            try:
-                with client.websocket_connect("/ws/speak-stream") as websocket:
-                    websocket.send_text(json.dumps(request_payload))
-                    meta = cast(dict[str, object], json.loads(websocket.receive_text()))
-                    chunk = cast(
-                        dict[str, object], json.loads(websocket.receive_text())
-                    )
-                    audio_bytes = websocket.receive_bytes()
-                    done = cast(dict[str, object], json.loads(websocket.receive_text()))
-            finally:
-                client.close()
+            with run_live_server(test_app) as endpoints:
+                token_response = httpx.post(
+                    f"{endpoints['http']}/api/ws-token",
+                    headers={"Authorization": "Bearer secret-key"},
+                    timeout=5.0,
+                )
+                ws_token = cast(str, token_response.json()["token"])
+                with websocket_connect(f"{endpoints['ws']}/ws/speak-stream") as ws:
+                    ws.send(json.dumps({**request_payload, "ws_token": ws_token}))
+                    meta = cast(dict[str, object], json.loads(cast(str, ws.recv())))
+                    chunk = cast(dict[str, object], json.loads(cast(str, ws.recv())))
+                    audio_bytes = cast(bytes, ws.recv())
+                    done = cast(dict[str, object], json.loads(cast(str, ws.recv())))
 
         self.assertEqual(meta["type"], "meta")
         self.assertEqual(chunk["type"], "chunk")
         self.assertEqual(audio_bytes, b"af_heart|0.0|opus|Hello over websocket.")
         self.assertEqual(done["type"], "done")
+
+    def test_websocket_stream_rejects_reused_ws_token(self) -> None:
+        request_payload = {
+            "text": "Hello over websocket.",
+            "voice": "af_heart",
+            "speed": 1.0,
+            "pitch": 0.0,
+            "lang": "en-us",
+            "format": "opus",
+            "target_chunk_chars": 120,
+        }
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk),
+        ):
+            test_app = api.create_app()
+            with run_live_server(test_app) as endpoints:
+                token_response = httpx.post(
+                    f"{endpoints['http']}/api/ws-token",
+                    headers={"Authorization": "Bearer secret-key"},
+                    timeout=5.0,
+                )
+                ws_token = cast(str, token_response.json()["token"])
+                with websocket_connect(f"{endpoints['ws']}/ws/speak-stream") as ws:
+                    ws.send(json.dumps({**request_payload, "ws_token": ws_token}))
+                    _ = ws.recv()
+                    _ = ws.recv()
+                    _ = ws.recv()
+                    _ = ws.recv()
+
+                with self.assertRaises(ConnectionClosed) as closed:
+                    with websocket_connect(f"{endpoints['ws']}/ws/speak-stream") as ws:
+                        ws.send(json.dumps({**request_payload, "ws_token": ws_token}))
+                        _ = ws.recv()
+
+        close_frame = closed.exception.rcvd
+        self.assertIsNotNone(close_frame)
+        if close_frame is None:
+            self.fail("Expected a close frame from the server.")
+        self.assertEqual(close_frame.code, 1008)
 
     def test_websocket_stream_rejects_query_string_api_key(self) -> None:
         request_payload = {
@@ -653,20 +804,89 @@ class ApiIntegrationTests(unittest.TestCase):
             patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk),
         ):
             test_app = api.create_app()
-            client = TestClient(test_app)
-            try:
-                with client.websocket_connect(
-                    "/ws/speak-stream?api_key=secret-key"
-                ) as websocket:
-                    websocket.send_text(json.dumps(request_payload))
-                    error = cast(
-                        dict[str, object], json.loads(websocket.receive_text())
-                    )
-            finally:
-                client.close()
+            with run_live_server(test_app) as endpoints:
+                with self.assertRaises(ConnectionClosed) as closed:
+                    with websocket_connect(
+                        f"{endpoints['ws']}/ws/speak-stream?api_key=secret-key"
+                    ) as ws:
+                        ws.send(json.dumps(request_payload))
+                        _ = ws.recv()
 
-        self.assertEqual(error["type"], "error")
-        self.assertEqual(error["detail"], "Authentication failed.")
+        close_frame = closed.exception.rcvd
+        self.assertIsNotNone(close_frame)
+        if close_frame is None:
+            self.fail("Expected a close frame from the server.")
+        self.assertEqual(close_frame.code, 1008)
+
+    def test_websocket_stream_rejects_api_key_in_first_message(self) -> None:
+        request_payload = {
+            "text": "Hello over websocket.",
+            "voice": "af_heart",
+            "speed": 1.0,
+            "pitch": 0.0,
+            "lang": "en-us",
+            "format": "opus",
+            "target_chunk_chars": 120,
+            "api_key": "secret-key",
+        }
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk),
+        ):
+            test_app = api.create_app()
+            with run_live_server(test_app) as endpoints:
+                with self.assertRaises(ConnectionClosed) as closed:
+                    with websocket_connect(f"{endpoints['ws']}/ws/speak-stream") as ws:
+                        ws.send(json.dumps(request_payload))
+                        _ = ws.recv()
+
+        close_frame = closed.exception.rcvd
+        self.assertIsNotNone(close_frame)
+        if close_frame is None:
+            self.fail("Expected a close frame from the server.")
+        self.assertEqual(close_frame.code, 1008)
+
+    def test_websocket_stream_rejects_session_token_from_other_client(self) -> None:
+        request_payload = {
+            "text": "Hello over websocket.",
+            "voice": "af_heart",
+            "speed": 1.0,
+            "pitch": 0.0,
+            "lang": "en-us",
+            "format": "opus",
+            "target_chunk_chars": 120,
+        }
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(config, "get_trust_proxy_headers", return_value=True),
+            patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk),
+        ):
+            test_app = api.create_app()
+            with run_live_server(test_app) as endpoints:
+                token_response = httpx.post(
+                    f"{endpoints['http']}/api/ws-token",
+                    headers={
+                        "Authorization": "Bearer secret-key",
+                        "X-Forwarded-For": "1.1.1.1",
+                    },
+                    timeout=5.0,
+                )
+                ws_token = cast(str, token_response.json()["token"])
+                with self.assertRaises(ConnectionClosed) as closed:
+                    with websocket_connect(
+                        f"{endpoints['ws']}/ws/speak-stream",
+                        additional_headers={"X-Forwarded-For": "2.2.2.2"},
+                    ) as ws:
+                        ws.send(json.dumps({**request_payload, "ws_token": ws_token}))
+                        _ = ws.recv()
+
+        close_frame = closed.exception.rcvd
+        self.assertIsNotNone(close_frame)
+        if close_frame is None:
+            self.fail("Expected a close frame from the server.")
+        self.assertEqual(close_frame.code, 1008)
 
     def test_auth_failures_are_rate_limited(self) -> None:
         with (
@@ -689,14 +909,14 @@ class ApiIntegrationTests(unittest.TestCase):
                     base_url="http://testserver",
                 ) as client:
                     first = await client.get(
-                        "/api/health", headers={"Authorization": "Bearer wrong-token"}
+                        "/api/health", headers={"Authorization": "Bearer wrong-token-1"}
                     )
                     second = await client.get(
-                        "/api/health", headers={"Authorization": "Bearer wrong-token"}
+                        "/api/health", headers={"Authorization": "Bearer wrong-token-2"}
                     )
                     third = await client.get(
                         "/api/health",
-                        headers={"Authorization": "Bearer wrong-token"},
+                        headers={"Authorization": "Bearer wrong-token-3"},
                     )
                     valid = await client.get(
                         "/api/health",
@@ -729,11 +949,11 @@ class ApiIntegrationTests(unittest.TestCase):
                 ) as client:
                     first = await client.get(
                         "/v1/models",
-                        headers={"Authorization": "Bearer invalid"},
+                        headers={"Authorization": "Bearer invalid-1"},
                     )
                     second = await client.get(
                         "/v1/models",
-                        headers={"Authorization": "Bearer invalid"},
+                        headers={"Authorization": "Bearer invalid-2"},
                     )
                     return first, second
 
@@ -794,16 +1014,60 @@ class ApiIntegrationTests(unittest.TestCase):
         with (
             patch.object(config, "get_require_auth", return_value=True),
             patch.object(config, "get_api_key", return_value="secret-key"),
-            patch("asyncio.wait_for", side_effect=asyncio.TimeoutError),
+            patch.object(
+                config,
+                "get_websocket_auth_handshake_timeout_seconds",
+                return_value=0.01,
+            ),
         ):
             test_app = api.create_app()
-            client = TestClient(test_app)
-            try:
-                with client.websocket_connect("/ws/speak-stream") as websocket:
-                    with self.assertRaises(WebSocketDisconnect):
-                        _ = websocket.receive_text()
-            finally:
-                client.close()
+            with run_live_server(test_app) as endpoints:
+                with self.assertRaises(ConnectionClosed) as closed:
+                    with websocket_connect(f"{endpoints['ws']}/ws/speak-stream") as ws:
+                        time.sleep(0.05)
+                        _ = ws.recv()
+
+        close_frame = closed.exception.rcvd
+        self.assertIsNotNone(close_frame)
+        if close_frame is None:
+            self.fail("Expected a close frame from the server.")
+        self.assertEqual(close_frame.code, 1008)
+
+    def test_internal_speak_error_does_not_leak_exception_text(self) -> None:
+        request_payload = {
+            "text": "Hello over native speak.",
+            "voice": "af_heart",
+            "speed": 1.0,
+            "pitch": 0.0,
+            "lang": "en-us",
+            "format": "wav",
+        }
+        with patch.object(
+            audio, "synthesize_chunk", side_effect=RuntimeError("secret backend detail")
+        ):
+            response = self.get_client().post("/api/speak", json=request_payload)
+
+        self.assertEqual(response.status_code, 500)
+        payload = cast(dict[str, object], response.json())
+        self.assertEqual(payload["detail"], "Synthesis failed.")
+
+    def test_internal_openai_error_does_not_leak_exception_text(self) -> None:
+        request_payload = {
+            "model": "kokoro",
+            "input": "OpenAI compatible request.",
+            "voice": "af_heart",
+            "response_format": "opus",
+            "speed": 1.0,
+        }
+        with patch.object(
+            audio, "synthesize_chunk", side_effect=RuntimeError("secret backend detail")
+        ):
+            response = self.get_client().post("/v1/audio/speech", json=request_payload)
+
+        self.assertEqual(response.status_code, 500)
+        payload = cast(dict[str, object], response.json())
+        error = cast(dict[str, object], payload["error"])
+        self.assertEqual(error["message"], "Synthesis failed.")
 
     def test_root_is_unavailable_when_web_ui_is_disabled(self) -> None:
         with patch.object(config, "get_web_ui_enabled", return_value=False):
