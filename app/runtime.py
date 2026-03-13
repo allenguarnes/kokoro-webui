@@ -132,6 +132,10 @@ class GpuProcessUsage:
     used_megabytes: float | None
     source: str | None
     error: str | None
+    process_group_id: int | None = None
+    group_used_bytes: int | None = None
+    group_used_megabytes: float | None = None
+    group_member_pids: list[int] | None = None
 
 
 _CPU_PROVIDER = "CPUExecutionProvider"
@@ -322,8 +326,37 @@ def _iter_nvml_compute_processes(
     return []
 
 
+def _safe_get_process_group_id(pid: int) -> int | None:
+    try:
+        return os.getpgid(pid)
+    except OSError:
+        return None
+
+
+def _resolve_group_gpu_usage(
+    process_entries: list[tuple[int, int]],
+    process_group_id: int | None,
+) -> tuple[int | None, list[int] | None]:
+    if process_group_id is None:
+        return None, None
+
+    group_used_bytes = 0
+    group_member_pids: set[int] = set()
+    for process_pid, process_used_bytes in process_entries:
+        if process_used_bytes <= 0:
+            continue
+        process_group = _safe_get_process_group_id(process_pid)
+        if process_group != process_group_id:
+            continue
+        group_used_bytes += process_used_bytes
+        group_member_pids.add(process_pid)
+
+    return group_used_bytes, sorted(group_member_pids)
+
+
 def get_current_process_gpu_usage() -> GpuProcessUsage:
     pid = os.getpid()
+    process_group_id = _safe_get_process_group_id(pid)
     active_provider = get_active_runtime_provider()
     if not _is_gpu_runtime_provider(active_provider):
         return GpuProcessUsage(
@@ -333,6 +366,7 @@ def get_current_process_gpu_usage() -> GpuProcessUsage:
             used_megabytes=None,
             source=None,
             error=None,
+            process_group_id=process_group_id,
         )
 
     nvml_module = _load_nvml_module()
@@ -344,6 +378,7 @@ def get_current_process_gpu_usage() -> GpuProcessUsage:
             used_megabytes=None,
             source=None,
             error="pynvml is not installed.",
+            process_group_id=process_group_id,
         )
     try:
         nvml_module.nvmlInit()
@@ -355,10 +390,11 @@ def get_current_process_gpu_usage() -> GpuProcessUsage:
             used_megabytes=None,
             source=None,
             error=_sanitize_runtime_error(exc),
+            process_group_id=process_group_id,
         )
 
     try:
-        used_bytes = 0
+        process_entries: list[tuple[int, int]] = []
         for index in range(nvml_module.nvmlDeviceGetCount()):
             handle = nvml_module.nvmlDeviceGetHandleByIndex(index)
             try:
@@ -367,27 +403,54 @@ def get_current_process_gpu_usage() -> GpuProcessUsage:
                 continue
             for process in processes:
                 process_pid = int(getattr(process, "pid", -1))
-                if process_pid != pid:
+                process_used_bytes = int(getattr(process, "usedGpuMemory", 0))
+                if process_pid <= 0:
                     continue
-                used_bytes += int(getattr(process, "usedGpuMemory", 0))
+                process_entries.append((process_pid, process_used_bytes))
+
+        used_bytes = sum(
+            process_used_bytes
+            for process_pid, process_used_bytes in process_entries
+            if process_pid == pid and process_used_bytes > 0
+        )
+        group_used_bytes, group_member_pids = _resolve_group_gpu_usage(
+            process_entries,
+            process_group_id,
+        )
+        group_used_megabytes = (
+            round(group_used_bytes / (1024 * 1024), 2)
+            if isinstance(group_used_bytes, int)
+            else None
+        )
+        used_megabytes = round(used_bytes / (1024 * 1024), 2)
+        group_available = isinstance(group_used_bytes, int) and group_used_bytes > 0
 
         if used_bytes <= 0:
             return GpuProcessUsage(
                 pid=pid,
-                available=False,
+                available=group_available,
                 used_bytes=0,
                 used_megabytes=0.0,
                 source="nvml",
                 error=None,
+                process_group_id=process_group_id,
+                group_used_bytes=group_used_bytes,
+                group_used_megabytes=group_used_megabytes,
+                group_member_pids=group_member_pids,
             )
 
         return GpuProcessUsage(
             pid=pid,
-            available=True,
+            available=(group_used_bytes if group_used_bytes is not None else used_bytes)
+            > 0,
             used_bytes=used_bytes,
-            used_megabytes=round(used_bytes / (1024 * 1024), 2),
+            used_megabytes=used_megabytes,
             source="nvml",
             error=None,
+            process_group_id=process_group_id,
+            group_used_bytes=group_used_bytes,
+            group_used_megabytes=group_used_megabytes,
+            group_member_pids=group_member_pids,
         )
     except Exception as exc:
         return GpuProcessUsage(
@@ -397,6 +460,7 @@ def get_current_process_gpu_usage() -> GpuProcessUsage:
             used_megabytes=None,
             source=None,
             error=_sanitize_runtime_error(exc),
+            process_group_id=process_group_id,
         )
     finally:
         try:

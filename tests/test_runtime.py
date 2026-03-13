@@ -230,9 +230,11 @@ class RuntimeSelectionTests(unittest.TestCase):
                 0: [
                     FakeNvmlProcess(pid=999, used_gpu_memory=128),
                     FakeNvmlProcess(pid=4242, used_gpu_memory=64 * 1024 * 1024),
+                    FakeNvmlProcess(pid=5000, used_gpu_memory=16 * 1024 * 1024),
                 ],
                 1: [
                     FakeNvmlProcess(pid=4242, used_gpu_memory=32 * 1024 * 1024),
+                    FakeNvmlProcess(pid=7777, used_gpu_memory=8 * 1024 * 1024),
                 ],
             }
         )
@@ -244,6 +246,16 @@ class RuntimeSelectionTests(unittest.TestCase):
                 return_value="CUDAExecutionProvider",
             ),
             patch("app.runtime.os.getpid", return_value=4242),
+            patch(
+                "app.runtime.os.getpgid",
+                side_effect=lambda process_pid: (
+                    55
+                    if process_pid in {4242, 5000}
+                    else 66
+                    if process_pid == 7777
+                    else 99
+                ),
+            ),
         ):
             usage = runtime.get_current_process_gpu_usage()
 
@@ -251,6 +263,10 @@ class RuntimeSelectionTests(unittest.TestCase):
         self.assertEqual(usage.pid, 4242)
         self.assertEqual(usage.used_bytes, 96 * 1024 * 1024)
         self.assertEqual(usage.used_megabytes, 96.0)
+        self.assertEqual(usage.process_group_id, 55)
+        self.assertEqual(usage.group_used_bytes, 112 * 1024 * 1024)
+        self.assertEqual(usage.group_used_megabytes, 112.0)
+        self.assertEqual(usage.group_member_pids, [4242, 5000])
         self.assertEqual(usage.source, "nvml")
         self.assertIsNone(usage.error)
         self.assertEqual(fake_nvml.init_calls, 1)
@@ -272,6 +288,36 @@ class RuntimeSelectionTests(unittest.TestCase):
         self.assertEqual(usage.pid, 4242)
         self.assertIsNone(usage.used_bytes)
         self.assertIsNone(usage.error)
+
+    def test_process_gpu_usage_marks_available_when_group_has_memory(self) -> None:
+        fake_nvml = FakeNvml(
+            {
+                0: [
+                    FakeNvmlProcess(pid=5000, used_gpu_memory=256 * 1024 * 1024),
+                ],
+            }
+        )
+        with (
+            patch.object(runtime, "_load_nvml_module", return_value=fake_nvml),
+            patch.object(
+                runtime,
+                "get_active_runtime_provider",
+                return_value="CUDAExecutionProvider",
+            ),
+            patch("app.runtime.os.getpid", return_value=4242),
+            patch(
+                "app.runtime.os.getpgid",
+                side_effect=lambda process_pid: (
+                    77 if process_pid in {4242, 5000} else 11
+                ),
+            ),
+        ):
+            usage = runtime.get_current_process_gpu_usage()
+
+        self.assertTrue(usage.available)
+        self.assertEqual(usage.used_bytes, 0)
+        self.assertEqual(usage.group_used_bytes, 256 * 1024 * 1024)
+        self.assertEqual(usage.group_member_pids, [5000])
 
 
 if __name__ == "__main__":

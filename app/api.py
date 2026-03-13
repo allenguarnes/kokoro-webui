@@ -484,9 +484,13 @@ def create_app() -> FastAPI:
                 "runtime_error": runtime_status.runtime_error,
                 "gpu": {
                     "process_pid": gpu_usage.pid,
+                    "process_group_id": gpu_usage.process_group_id,
                     "available": gpu_usage.available,
                     "process_vram_used_bytes": gpu_usage.used_bytes,
                     "process_vram_used_mb": gpu_usage.used_megabytes,
+                    "process_group_vram_used_bytes": gpu_usage.group_used_bytes,
+                    "process_group_vram_used_mb": gpu_usage.group_used_megabytes,
+                    "process_group_member_pids": gpu_usage.group_member_pids,
                     "source": gpu_usage.source,
                     "error": gpu_usage.error,
                 },

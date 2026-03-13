@@ -246,6 +246,10 @@ class ApiIntegrationTests(unittest.TestCase):
                     used_megabytes=64.0,
                     source="nvml",
                     error=None,
+                    process_group_id=77,
+                    group_used_bytes=96 * 1024 * 1024,
+                    group_used_megabytes=96.0,
+                    group_member_pids=[4242, 5000],
                 ),
             ),
             patch.object(audio, "ffmpeg_supports_rubberband", return_value=True),
@@ -263,7 +267,10 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertIsNone(payload["runtime_error"])
         gpu = cast(dict[str, object], payload["gpu"])
         self.assertEqual(gpu["process_pid"], 4242)
+        self.assertEqual(gpu["process_group_id"], 77)
         self.assertEqual(gpu["process_vram_used_mb"], 64.0)
+        self.assertEqual(gpu["process_group_vram_used_mb"], 96.0)
+        self.assertEqual(gpu["process_group_member_pids"], [4242, 5000])
         self.assertEqual(gpu["source"], "nvml")
         queue = cast(dict[str, object], payload["queue"])
         worker_limit = cast(int, queue["worker_limit"])

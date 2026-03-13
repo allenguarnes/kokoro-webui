@@ -39,6 +39,10 @@ class AuthRequiredError extends Error {
   }
 }
 
+const HEALTH_POLL_INTERVAL_MS = 2000;
+let healthPollTimerId = null;
+let healthPollInFlight = false;
+
 function authHeaders() {
   if (!appState.apiKey) {
     return {};
@@ -57,6 +61,7 @@ function apiFetch(input, init = {}) {
 }
 
 function handleAuthFailure(message = "Authentication failed.") {
+  stopHealthPolling();
   appState.apiKey = null;
   setUiLocked(true);
   setAuthPanelState(true, message, true);
@@ -78,6 +83,7 @@ export async function initializeAccess() {
     setAuthPanelState(false);
     setUiLocked(false);
     await loadHealth();
+    startHealthPolling();
     return;
   }
 
@@ -100,6 +106,7 @@ export async function submitApiKey(apiKey) {
     setUiLocked(false);
     setAuthPanelState(false);
     setStatus("Authenticated. Ready for synthesis");
+    startHealthPolling();
     return true;
   } catch (error) {
     if (error instanceof AuthRequiredError) {
@@ -117,13 +124,50 @@ export async function submitApiKey(apiKey) {
 }
 
 export function clearApiKey() {
+  stopHealthPolling();
   appState.apiKey = null;
   setUiLocked(true);
   setAuthPanelState(true, "Enter the configured API key to use this server.");
   setStatus("API key cleared.");
 }
 
-export async function loadHealth() {
+async function pollHealth() {
+  if (healthPollInFlight) {
+    return;
+  }
+  if (appState.authRequired && !appState.apiKey) {
+    return;
+  }
+  healthPollInFlight = true;
+  try {
+    await loadHealth({ quiet: true });
+  } catch (error) {
+    if (error instanceof AuthRequiredError) {
+      handleAuthFailure("Authentication failed.");
+    }
+  } finally {
+    healthPollInFlight = false;
+  }
+}
+
+function startHealthPolling() {
+  stopHealthPolling();
+  healthPollTimerId = window.setInterval(() => {
+    void pollHealth();
+  }, HEALTH_POLL_INTERVAL_MS);
+}
+
+function stopHealthPolling() {
+  if (healthPollTimerId === null) {
+    return;
+  }
+  window.clearInterval(healthPollTimerId);
+  healthPollTimerId = null;
+  healthPollInFlight = false;
+}
+
+export async function loadHealth(options = {}) {
+  const quiet = options.quiet === true;
   const [healthResponse, capabilitiesResponse] = await Promise.all([
     apiFetch("/api/health"),
     apiFetch("/api/capabilities"),
@@ -197,10 +241,15 @@ export async function loadHealth() {
     const runtimeError =
       typeof health.runtime_error === "string" ? health.runtime_error : null;
     updateQueueMonitorLayout(activeProvider);
+    const processGroupVramMb = Number(health?.gpu?.process_group_vram_used_mb);
     const processVramMb = Number(health?.gpu?.process_vram_used_mb);
+    const displayedVramMb =
+      Number.isFinite(processGroupVramMb) && processGroupVramMb >= 0
+        ? processGroupVramMb
+        : processVramMb;
     gpuVram.textContent =
-      Number.isFinite(processVramMb) && processVramMb >= 0
-        ? `${processVramMb.toFixed(processVramMb >= 1024 ? 0 : 1)} MB`
+      Number.isFinite(displayedVramMb) && displayedVramMb >= 0
+        ? `${displayedVramMb.toFixed(displayedVramMb >= 1024 ? 0 : 1)} MiB`
         : "--";
     if (health.ok) {
       setSystemStatus(
@@ -211,11 +260,13 @@ export async function loadHealth() {
         providerError,
         runtimeError,
       );
-      if (providerFallback && activeProvider) {
+      if (!quiet && providerFallback && activeProvider) {
         setStatus("Ready for synthesis with CPU fallback.", true);
         return;
       }
-      setStatus("Ready for synthesis");
+      if (!quiet) {
+        setStatus("Ready for synthesis");
+      }
       return;
     }
 
@@ -227,11 +278,13 @@ export async function loadHealth() {
       providerError,
       runtimeError,
     );
-    if (runtimeError) {
+    if (runtimeError && !quiet) {
       setStatus(`Runtime unavailable: ${runtimeError}`, true);
       return;
     }
-    setStatus(`Missing runtime files: ${health.missing.join(", ")}`, true);
+    if (!quiet) {
+      setStatus(`Missing runtime files: ${health.missing.join(", ")}`, true);
+    }
   } catch (error) {
     if (error instanceof AuthRequiredError) {
       throw error;
@@ -239,7 +292,9 @@ export async function loadHealth() {
     updateQueueMonitorLayout(null);
     gpuVram.textContent = "--";
     setSystemStatus(false, false);
-    setStatus("Unable to reach the backend.", true);
+    if (!quiet) {
+      setStatus("Unable to reach the backend.", true);
+    }
   }
 }
 
