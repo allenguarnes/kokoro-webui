@@ -29,6 +29,7 @@ import app.config as config
 import app.runtime as runtime
 from app.runtime import GpuProcessUsage, RuntimeStatus
 from app.schemas import RenderedChunk, SynthesisRequest
+from app.status_stream import create_status_stream_hub, iter_status_events
 
 
 def make_rendered_chunk(payload: SynthesisRequest, text: str) -> RenderedChunk:
@@ -402,6 +403,45 @@ class ApiIntegrationTests(unittest.TestCase):
         payload = cast(dict[str, object], response.json())
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["runtime_error"], "Failed to allocate CUDA memory.")
+
+    def test_status_stream_hub_emits_snapshot_events(self) -> None:
+        async def run_test() -> dict[str, str]:
+            hub = create_status_stream_hub()
+            await hub.publish_snapshot({"ok": True, "queue": {"active_jobs": 0}})
+
+            async def disconnected() -> bool:
+                return False
+
+            stream = iter_status_events(hub, disconnected=disconnected)
+            try:
+                return await anext(stream)
+            finally:
+                await stream.aclose()
+
+        event = asyncio.run(run_test())
+
+        self.assertEqual(event["event"], "health_snapshot")
+        payload = cast(dict[str, object], json.loads(event["data"]))
+        self.assertTrue(cast(bool, payload["ok"]))
+
+    def test_health_stream_requires_auth_when_enabled(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+        ):
+            test_app = api.create_app()
+
+            async def run_test() -> httpx.Response:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    return await client.get("/api/health/stream")
+
+            response = asyncio.run(run_test())
+
+        self.assertEqual(response.status_code, 401)
 
     def test_queue_overload_returns_503(self) -> None:
         request_payload = {

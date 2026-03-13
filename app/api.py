@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from sse_starlette import EventSourceResponse
 
 from app import audio, config, openai_compat, runtime
 from app.scheduler import (
@@ -25,6 +26,7 @@ from app.scheduler import (
     SynthesisScheduler,
     build_scheduler_policy,
 )
+from app.status_stream import create_status_stream_hub, iter_status_events
 from app.schemas import (
     ChunkedSynthesisRequest,
     ChunkMetadataRequest,
@@ -90,6 +92,56 @@ def create_app() -> FastAPI:
         else 0.0
     )
     last_synthesis_activity_at = time.monotonic()
+    status_stream_hub = create_status_stream_hub()
+    status_stream_poll_interval_sec = 2.0
+
+    def build_health_payload() -> dict[str, object]:
+        missing: list[str] = []
+        if not runtime.kokoro_runtime_available():
+            missing.append("kokoro-onnx")
+        if not config.MODEL_PATH.exists():
+            missing.append(str(config.MODEL_PATH.name))
+        if not config.VOICES_PATH.exists():
+            missing.append(str(config.VOICES_PATH.name))
+
+        runtime_status = runtime.get_runtime_status(initialize=False)
+        active_provider = (
+            runtime_status.active_providers[0]
+            if runtime_status.active_providers
+            else None
+        )
+        gpu_usage = runtime.get_current_process_gpu_usage(
+            active_provider=active_provider
+        )
+        return {
+            "ok": not missing and runtime_status.runtime_error is None,
+            "missing": missing,
+            "active_provider": active_provider,
+            "active_providers": runtime_status.active_providers,
+            "provider_fallback": runtime_status.provider_fallback,
+            "provider_error": runtime_status.provider_error,
+            "runtime_error": runtime_status.runtime_error,
+            "gpu": {
+                "process_pid": gpu_usage.pid,
+                "process_group_id": gpu_usage.process_group_id,
+                "available": gpu_usage.available,
+                "process_vram_used_bytes": gpu_usage.used_bytes,
+                "process_vram_used_mb": gpu_usage.used_megabytes,
+                "process_group_vram_used_bytes": gpu_usage.group_used_bytes,
+                "process_group_vram_used_mb": gpu_usage.group_used_megabytes,
+                "process_group_member_pids": gpu_usage.group_member_pids,
+                "source": gpu_usage.source,
+                "error": gpu_usage.error,
+            },
+            "runtime_activity": runtime_activity_payload(),
+            "queue": queue_payload(),
+        }
+
+    async def status_stream_publish_loop(stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            if status_stream_hub.subscriber_count() > 0:
+                await status_stream_hub.publish_snapshot(build_health_payload())
+            await status_stream_hub.wait_for_refresh(status_stream_poll_interval_sec)
 
     async def maybe_unload_runtime_for_idle() -> None:
         nonlocal last_synthesis_activity_at
@@ -105,6 +157,7 @@ def create_app() -> FastAPI:
             return
         runtime.clear_runtime_caches()
         last_synthesis_activity_at = time.monotonic()
+        status_stream_hub.request_refresh()
 
     async def runtime_idle_maintenance_loop(stop_event: asyncio.Event) -> None:
         if runtime_idle_unload_seconds <= 0:
@@ -123,6 +176,8 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         idle_stop_event = asyncio.Event()
         idle_task: asyncio.Task[None] | None = None
+        status_stop_event = asyncio.Event()
+        status_task = asyncio.create_task(status_stream_publish_loop(status_stop_event))
         if runtime_idle_unload_seconds > 0:
             idle_task = asyncio.create_task(
                 runtime_idle_maintenance_loop(idle_stop_event)
@@ -131,8 +186,11 @@ def create_app() -> FastAPI:
             yield
         finally:
             idle_stop_event.set()
+            status_stop_event.set()
+            status_stream_hub.request_refresh()
             if idle_task is not None:
                 await idle_task
+            await status_task
             synthesis_scheduler.shutdown()
 
     app = FastAPI(title="Kokoro WebUI", lifespan=lifespan)
@@ -474,6 +532,7 @@ def create_app() -> FastAPI:
             return await synthesis_scheduler.run_interactive(function, *args, **kwargs)
         finally:
             last_synthesis_activity_at = time.monotonic()
+            status_stream_hub.request_refresh()
 
     async def run_stream_synthesis_task(
         function: Callable[P, T],
@@ -485,6 +544,7 @@ def create_app() -> FastAPI:
             return await synthesis_scheduler.run_stream(function, *args, **kwargs)
         finally:
             last_synthesis_activity_at = time.monotonic()
+            status_stream_hub.request_refresh()
 
     async def synthesize_chunk_async(
         payload: SynthesisRequest, text: str
@@ -545,50 +605,23 @@ def create_app() -> FastAPI:
     @app.get("/api/health")
     async def health(request: Request) -> JSONResponse:
         ensure_http_auth(request)
-        missing: list[str] = []
-        if not runtime.kokoro_runtime_available():
-            missing.append("kokoro-onnx")
-        if not config.MODEL_PATH.exists():
-            missing.append(str(config.MODEL_PATH.name))
-        if not config.VOICES_PATH.exists():
-            missing.append(str(config.VOICES_PATH.name))
+        return JSONResponse(build_health_payload())
 
-        runtime_status = runtime.get_runtime_status(initialize=False)
-        active_provider = (
-            runtime_status.active_providers[0]
-            if runtime_status.active_providers
-            else None
-        )
-        gpu_usage = runtime.get_current_process_gpu_usage(
-            active_provider=active_provider
-        )
-
-        return JSONResponse(
-            {
-                "ok": not missing and runtime_status.runtime_error is None,
-                "missing": missing,
-                "active_provider": runtime_status.active_providers[0]
-                if runtime_status.active_providers
-                else None,
-                "active_providers": runtime_status.active_providers,
-                "provider_fallback": runtime_status.provider_fallback,
-                "provider_error": runtime_status.provider_error,
-                "runtime_error": runtime_status.runtime_error,
-                "gpu": {
-                    "process_pid": gpu_usage.pid,
-                    "process_group_id": gpu_usage.process_group_id,
-                    "available": gpu_usage.available,
-                    "process_vram_used_bytes": gpu_usage.used_bytes,
-                    "process_vram_used_mb": gpu_usage.used_megabytes,
-                    "process_group_vram_used_bytes": gpu_usage.group_used_bytes,
-                    "process_group_vram_used_mb": gpu_usage.group_used_megabytes,
-                    "process_group_member_pids": gpu_usage.group_member_pids,
-                    "source": gpu_usage.source,
-                    "error": gpu_usage.error,
-                },
-                "runtime_activity": runtime_activity_payload(),
-                "queue": queue_payload(),
-            }
+    @app.get("/api/health/stream")
+    async def health_stream(request: Request) -> EventSourceResponse:
+        ensure_http_auth(request)
+        await status_stream_hub.publish_snapshot(build_health_payload())
+        return EventSourceResponse(
+            iter_status_events(
+                status_stream_hub,
+                disconnected=request.is_disconnected,
+            ),
+            ping=15,
+            send_timeout=30,
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     @app.get("/api/capabilities")

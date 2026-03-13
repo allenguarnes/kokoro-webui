@@ -10,6 +10,7 @@ Kokoro WebUI includes:
 - Native synthesis endpoints (`/api/*`)
 - OpenAI-compatible speech endpoints (`/v1/*`)
 - Streaming over NDJSON and WebSocket
+- Live status updates over Server-Sent Events (`/api/health/stream`)
 - Optional backend pitch shifting
 - Automatic CPU fallback when GPU runtime is unavailable or incompatible
 
@@ -17,6 +18,7 @@ Kokoro WebUI includes:
 
 - Python 3.12 / 3.13
 - FastAPI + Uvicorn
+- `sse-starlette`
 - `kokoro-onnx`
 - NumPy + SoundFile
 - Static HTML/CSS/JS frontend
@@ -36,6 +38,12 @@ Request flow:
 2. Backend validates payload and synthesizes PCM via Kokoro.
 3. Optional post-processing is applied (`pitch`, `opus`).
 4. Audio is returned directly or streamed chunk-by-chunk.
+
+Status flow:
+1. UI bootstraps with `/api/public-config`, `/api/health`, and `/api/capabilities`.
+2. UI opens `/api/health/stream` for live runtime and queue updates.
+3. A single in-process publisher computes status snapshots and fans them out to SSE subscribers.
+4. Browser tabs can share one live status connection locally through `BroadcastChannel`.
 
 `pcm` is the closest thing to a native output path here: raw 16-bit PCM generated directly from synthesized samples with no container encoding. `wav` stays close to native, but adds a WAV container/header. `opus` is produced as a backend post-processing step through `ffmpeg`, similar to pitch shifting, so it adds extra work beyond base Kokoro synthesis.
 
@@ -143,6 +151,9 @@ Optional, depending on features:
   - Optional NVIDIA-only metrics path used to report `kokoro-webui` process VRAM
   - Included with `uv sync --extra gpu`
   - Without it, synthesis still works and GPU memory metrics are simply unavailable
+- `sse-starlette`
+  - Required for `/api/health/stream`
+  - Without it, the live status path is unavailable
 - `uvicorn[standard]` (`uvloop`, `httptools`, and related runtime helpers)
   - Recommended on Linux for lower-overhead request/event-loop handling
   - Without it, the app still works with the pure-Python/cross-platform stack
@@ -228,6 +239,17 @@ The app auto-loads `.env` (if present).
 | `KOKORO_VOICES_PATH` | `models/voices-v1.0.bin` | Override voices path |
 
 On Linux, `uv sync --extra server` installs `uvicorn[standard]`, which gives Uvicorn access to `uvloop` and `httptools` automatically. The app remains cross-platform because those packages are optional rather than required.
+
+### Live Status Streaming
+
+The built-in UI no longer relies on steady `/api/health` polling while a tab is open.
+
+- `GET /api/health` remains the bootstrap and fallback snapshot endpoint
+- `GET /api/health/stream` is the steady-state live status feed for the browser UI
+- the current implementation is intentionally single-node: one in-process publisher computes snapshots and fans them out to connected SSE clients
+- browser tabs on the same machine can share one live status connection with `BroadcastChannel`, which reduces duplicate local connections
+
+This keeps the local-tool path lightweight while preserving a clean seam for future multi-node fan-out through a shared broadcaster backend.
 
 Example `.env`:
 

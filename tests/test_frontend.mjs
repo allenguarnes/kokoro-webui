@@ -410,10 +410,12 @@ function installGlobals(document, fetchImpl, options = {}) {
     window: globalThis.window,
     fetch: globalThis.fetch,
     WebSocket: globalThis.WebSocket,
+    BroadcastChannel: globalThis.BroadcastChannel,
     URL: globalThis.URL,
     Headers: globalThis.Headers,
     Response: globalThis.Response,
   };
+  const windowListeners = new Map();
   globalThis.document = document;
   globalThis.Element = FakeElement;
   globalThis.Event = class Event {
@@ -437,9 +439,22 @@ function installGlobals(document, fetchImpl, options = {}) {
         return null;
       },
       setItem() {},
+      removeItem() {},
     },
     matchMedia() {
       return { matches: false };
+    },
+    addEventListener(type, listener) {
+      const listeners = windowListeners.get(type) ?? [];
+      listeners.push(listener);
+      windowListeners.set(type, listeners);
+    },
+    removeEventListener(type, listener) {
+      const listeners = windowListeners.get(type) ?? [];
+      windowListeners.set(
+        type,
+        listeners.filter((candidate) => candidate !== listener),
+      );
     },
     location: {
       protocol: "http:",
@@ -449,6 +464,7 @@ function installGlobals(document, fetchImpl, options = {}) {
 
   globalThis.fetch = fetchImpl;
   globalThis.WebSocket = options.WebSocket ?? class UnsupportedWebSocket {};
+  globalThis.BroadcastChannel = options.BroadcastChannel;
   globalThis.Headers = FakeHeaders;
   globalThis.Response = FakeResponse;
   globalThis.URL = {
@@ -617,15 +633,17 @@ test("synthesize relocks the UI after NDJSON auth failure", async (t) => {
 
   await apiClient.synthesize({ preventDefault() {} });
 
-  assert.deepEqual(fetchCalls, [
+  assert.deepEqual(fetchCalls.slice(0, 3), [
     "/api/public-config",
     "/api/health",
     "/api/capabilities",
-    "/api/speak-stream",
   ]);
+  assert.equal(fetchCalls.at(-1), "/api/speak-stream");
   assert.equal(document.getElementById("submitButton").disabled, true);
   assert.equal(document.getElementById("authPanel").hidden, false);
   assert.equal(document.getElementById("authMessage").textContent, "Authentication failed.");
+  apiClient.clearApiKey();
+  await new Promise((resolve) => setTimeout(resolve, 0));
 });
 
 test("synthesize relocks the UI after WebSocket token auth throttling", async (t) => {
@@ -696,16 +714,18 @@ test("synthesize relocks the UI after WebSocket token auth throttling", async (t
 
   await apiClient.synthesize({ preventDefault() {} });
 
-  assert.deepEqual(fetchCalls, [
+  assert.deepEqual(fetchCalls.slice(0, 3), [
     "/api/public-config",
     "/api/health",
     "/api/capabilities",
-    "/api/ws-token",
   ]);
+  assert.equal(fetchCalls.at(-1), "/api/ws-token");
   assert.equal(document.getElementById("submitButton").disabled, true);
   assert.equal(document.getElementById("authPanel").hidden, false);
   assert.equal(
     document.getElementById("statusText").textContent,
     "Too many authentication failures. Try again later.",
   );
+  apiClient.clearApiKey();
+  await new Promise((resolve) => setTimeout(resolve, 0));
 });

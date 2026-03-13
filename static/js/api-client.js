@@ -56,28 +56,81 @@ function isAuthError(error) {
   );
 }
 
-const HEALTH_POLL_INTERVAL_MS = 4000;
-const HIDDEN_HEALTH_POLL_INTERVAL_MS = 20000;
-const HEALTH_POLL_MAX_INTERVAL_MS = 60000;
+const STATUS_STREAM_RECONNECT_BASE_MS = 1000;
+const STATUS_STREAM_RECONNECT_MAX_MS = 30000;
+const STATUS_LEADER_LEASE_MS = 5000;
+const STATUS_LEADER_HEARTBEAT_MS = 2000;
+const STATUS_LEADER_TAKEOVER_DELAY_MS = STATUS_LEADER_LEASE_MS + 500;
 const HEALTH_REQUEST_TIMEOUT_MS = 8000;
-let healthPollTimerId = null;
-let healthPollInFlight = false;
-let healthPollFailureCount = 0;
-let healthPollAbortController = null;
-let healthPollCycle = 0;
 
-function getHealthPollIntervalMs() {
-  const baseInterval = document.hidden
-    ? HIDDEN_HEALTH_POLL_INTERVAL_MS
-    : HEALTH_POLL_INTERVAL_MS;
-  const backoffFactor = 2 ** Math.min(healthPollFailureCount, 4);
-  const backoffInterval = Math.min(
-    baseInterval * backoffFactor,
-    HEALTH_POLL_MAX_INTERVAL_MS,
+function supportsBroadcastChannel() {
+  return typeof BroadcastChannel === "function";
+}
+
+function getStatusLeaderLeaseKey(scopeId) {
+  return `kokoro-status-leader:${scopeId}`;
+}
+
+function readStatusLeaderLease(scopeId) {
+  const raw = window.localStorage.getItem(getStatusLeaderLeaseKey(scopeId));
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (
+      typeof parsed?.tabId !== "string" ||
+      !Number.isFinite(parsed?.expiresAt)
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeStatusLeaderLease(scopeId, tabId, expiresAt) {
+  window.localStorage.setItem(
+    getStatusLeaderLeaseKey(scopeId),
+    JSON.stringify({ tabId, expiresAt }),
   );
-  const jitterWindow = Math.max(250, Math.round(backoffInterval * 0.1));
-  const jitterOffset = Math.round(Math.random() * jitterWindow);
-  return backoffInterval + jitterOffset;
+}
+
+function clearStatusLeaderLease(scopeId) {
+  if (!scopeId) {
+    return;
+  }
+  const lease = readStatusLeaderLease(scopeId);
+  if (lease?.tabId !== appState.tabId) {
+    return;
+  }
+  window.localStorage.removeItem(getStatusLeaderLeaseKey(scopeId));
+}
+
+async function hashStatusScope(value) {
+  if (globalThis.crypto?.subtle) {
+    const bytes = new TextEncoder().encode(value);
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(digest), (byte) =>
+      byte.toString(16).padStart(2, "0"),
+    ).join("");
+  }
+  let hash = 5381;
+  for (const char of value) {
+    hash = (hash * 33) ^ char.charCodeAt(0);
+  }
+  return Math.abs(hash >>> 0).toString(16);
+}
+
+async function getStatusScopeId() {
+  if (!appState.authRequired) {
+    return "public";
+  }
+  if (!appState.apiKey) {
+    return null;
+  }
+  return `auth-${await hashStatusScope(appState.apiKey)}`;
 }
 
 function authHeaders() {
@@ -150,7 +203,7 @@ function sanitizeOperationalMessage(error, fallback) {
 
 function handleAuthFailure(message = "Authentication failed.") {
   appState.apiKey = null;
-  stopHealthPolling();
+  stopHealthMonitoring();
   resetPlaybackState();
   appState.lastExportRequest = null;
   setUiLocked(true);
@@ -206,7 +259,7 @@ export async function initializeAccess() {
     setAuthPanelState(false);
     setUiLocked(false);
     await loadHealth();
-    startHealthPolling();
+    void startHealthMonitoring();
     return;
   }
 
@@ -229,7 +282,7 @@ export async function submitApiKey(apiKey) {
     setUiLocked(false);
     setAuthPanelState(false);
     setStatus("Authenticated. Ready for synthesis");
-    startHealthPolling();
+    void startHealthMonitoring();
     return true;
   } catch (error) {
     if (isAuthError(error)) {
@@ -253,7 +306,7 @@ export async function submitApiKey(apiKey) {
 
 export function clearApiKey() {
   appState.apiKey = null;
-  stopHealthPolling();
+  stopHealthMonitoring();
   resetPlaybackState();
   appState.lastExportRequest = null;
   setUiLocked(true);
@@ -264,81 +317,316 @@ export function clearApiKey() {
   }
 }
 
-async function pollHealth() {
-  if (healthPollInFlight) {
+function clearStatusStreamReconnect() {
+  if (appState.statusStreamReconnectTimerId === null) {
     return;
   }
-  if (appState.authRequired && !appState.apiKey) {
+  window.clearTimeout(appState.statusStreamReconnectTimerId);
+  appState.statusStreamReconnectTimerId = null;
+}
+
+function clearStatusLeaderHeartbeat() {
+  if (appState.statusLeaderHeartbeatTimerId === null) {
     return;
   }
-  const pollCycle = ++healthPollCycle;
-  healthPollInFlight = true;
-  const abortController = new AbortController();
-  healthPollAbortController = abortController;
-  try {
-    await loadHealth({
-      quiet: true,
-      includeCapabilities: false,
-      signal: abortController.signal,
-      timeoutMs: HEALTH_REQUEST_TIMEOUT_MS,
+  window.clearInterval(appState.statusLeaderHeartbeatTimerId);
+  appState.statusLeaderHeartbeatTimerId = null;
+}
+
+function clearStatusLeaderCheck() {
+  if (appState.statusLeaderCheckTimerId === null) {
+    return;
+  }
+  window.clearTimeout(appState.statusLeaderCheckTimerId);
+  appState.statusLeaderCheckTimerId = null;
+}
+
+function closeStatusBroadcastChannel() {
+  if (!appState.statusBroadcastChannel) {
+    appState.statusStreamScopeId = null;
+    return;
+  }
+  appState.statusBroadcastChannel.close();
+  appState.statusBroadcastChannel = null;
+  appState.statusLeaderTabId = null;
+  appState.statusIsLeader = false;
+  appState.statusStreamScopeId = null;
+}
+
+function postStatusChannelMessage(message) {
+  appState.statusBroadcastChannel?.postMessage({
+    ...message,
+    tabId: appState.tabId,
+    scopeId: appState.statusStreamScopeId,
+    sentAt: Date.now(),
+  });
+}
+
+function scheduleLeaderTakeoverCheck() {
+  clearStatusLeaderCheck();
+  if (!appState.statusBroadcastChannel || document.hidden) {
+    return;
+  }
+  appState.statusLeaderCheckTimerId = window.setTimeout(() => {
+    appState.statusLeaderCheckTimerId = null;
+    void startHealthMonitoring();
+  }, STATUS_LEADER_TAKEOVER_DELAY_MS);
+}
+
+function renewStatusLeadership() {
+  if (!appState.statusIsLeader || !appState.statusStreamScopeId) {
+    return;
+  }
+  writeStatusLeaderLease(
+    appState.statusStreamScopeId,
+    appState.tabId,
+    Date.now() + STATUS_LEADER_LEASE_MS,
+  );
+  postStatusChannelMessage({ type: "leader-heartbeat" });
+}
+
+function releaseStatusLeadership() {
+  clearStatusLeaderHeartbeat();
+  if (appState.statusIsLeader) {
+    clearStatusLeaderLease(appState.statusStreamScopeId);
+    postStatusChannelMessage({ type: "leader-release" });
+  }
+  appState.statusIsLeader = false;
+  appState.statusLeaderTabId = null;
+}
+
+function tryAcquireStatusLeadership() {
+  if (!appState.statusBroadcastChannel || !appState.statusStreamScopeId || document.hidden) {
+    return false;
+  }
+  const lease = readStatusLeaderLease(appState.statusStreamScopeId);
+  const now = Date.now();
+  if (lease && lease.expiresAt > now && lease.tabId !== appState.tabId) {
+    appState.statusLeaderTabId = lease.tabId;
+    scheduleLeaderTakeoverCheck();
+    return false;
+  }
+  writeStatusLeaderLease(
+    appState.statusStreamScopeId,
+    appState.tabId,
+    now + STATUS_LEADER_LEASE_MS,
+  );
+  const confirmedLease = readStatusLeaderLease(appState.statusStreamScopeId);
+  if (confirmedLease?.tabId !== appState.tabId) {
+    scheduleLeaderTakeoverCheck();
+    return false;
+  }
+  clearStatusLeaderCheck();
+  appState.statusIsLeader = true;
+  appState.statusLeaderTabId = appState.tabId;
+  clearStatusLeaderHeartbeat();
+  appState.statusLeaderHeartbeatTimerId = window.setInterval(
+    renewStatusLeadership,
+    STATUS_LEADER_HEARTBEAT_MS,
+  );
+  renewStatusLeadership();
+  postStatusChannelMessage({ type: "leader-announce" });
+  if (appState.lastStatusSnapshot) {
+    postStatusChannelMessage({
+      type: "health-update",
+      payload: appState.lastStatusSnapshot,
     });
-    if (pollCycle === healthPollCycle) {
-      healthPollFailureCount = 0;
+  }
+  return true;
+}
+
+function handleStatusChannelMessage(event) {
+  const message = event.data;
+  if (
+    !message ||
+    message.scopeId !== appState.statusStreamScopeId ||
+    message.tabId === appState.tabId
+  ) {
+    return;
+  }
+  if (message.type === "leader-announce" || message.type === "leader-heartbeat") {
+    appState.statusLeaderTabId = message.tabId;
+    appState.statusIsLeader = false;
+    scheduleLeaderTakeoverCheck();
+    return;
+  }
+  if (message.type === "leader-release") {
+    if (appState.statusLeaderTabId === message.tabId) {
+      appState.statusLeaderTabId = null;
+      scheduleLeaderTakeoverCheck();
     }
+    return;
+  }
+  if (message.type === "health-update") {
+    appState.statusLeaderTabId = message.tabId;
+    appState.statusIsLeader = false;
+    appState.lastStatusSnapshot = message.payload;
+    applyHealthState(message.payload, { quiet: true });
+    scheduleLeaderTakeoverCheck();
+    return;
+  }
+  if (message.type === "request-state" && appState.statusIsLeader && appState.lastStatusSnapshot) {
+    postStatusChannelMessage({
+      type: "health-update",
+      payload: appState.lastStatusSnapshot,
+    });
+  }
+}
+
+async function ensureStatusBroadcastChannel() {
+  const scopeId = await getStatusScopeId();
+  if (!scopeId || !supportsBroadcastChannel()) {
+    closeStatusBroadcastChannel();
+    appState.statusStreamScopeId = scopeId;
+    return false;
+  }
+  if (
+    appState.statusBroadcastChannel &&
+    appState.statusStreamScopeId === scopeId
+  ) {
+    return true;
+  }
+  releaseStatusLeadership();
+  closeStatusBroadcastChannel();
+  appState.statusStreamScopeId = scopeId;
+  appState.statusBroadcastChannel = new BroadcastChannel(`kokoro-status:${scopeId}`);
+  appState.statusBroadcastChannel.onmessage = handleStatusChannelMessage;
+  postStatusChannelMessage({ type: "request-state" });
+  scheduleLeaderTakeoverCheck();
+  return true;
+}
+
+function stopHealthMonitoring() {
+  clearStatusStreamReconnect();
+  clearStatusLeaderCheck();
+  releaseStatusLeadership();
+  appState.statusStreamReconnectAttempts = 0;
+  appState.statusStreamAbortController?.abort();
+  appState.statusStreamAbortController = null;
+  closeStatusBroadcastChannel();
+}
+
+function scheduleStatusStreamReconnect() {
+  if (
+    document.hidden ||
+    appState.statusStreamReconnectTimerId !== null ||
+    (appState.authRequired && !appState.apiKey)
+  ) {
+    return;
+  }
+  const delayMs = Math.min(
+    STATUS_STREAM_RECONNECT_BASE_MS * 2 ** appState.statusStreamReconnectAttempts,
+    STATUS_STREAM_RECONNECT_MAX_MS,
+  );
+  appState.statusStreamReconnectTimerId = window.setTimeout(() => {
+    appState.statusStreamReconnectTimerId = null;
+    void startHealthMonitoring();
+  }, delayMs);
+}
+
+function parseSseEvent(rawEvent) {
+  const lines = rawEvent.split(/\r?\n/);
+  let event = "message";
+  const data = [];
+  for (const line of lines) {
+    if (!line || line.startsWith(":")) {
+      continue;
+    }
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim() || "message";
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      data.push(line.slice(5).trimStart());
+    }
+  }
+  return {
+    event,
+    data: data.join("\n"),
+  };
+}
+
+async function consumeStatusStream(stream, signal) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split(/\r?\n\r?\n/);
+      buffer = events.pop() || "";
+      for (const rawEvent of events) {
+        const parsedEvent = parseSseEvent(rawEvent);
+        if (parsedEvent.event === "health_snapshot" && parsedEvent.data) {
+          applyHealthState(JSON.parse(parsedEvent.data), { quiet: true });
+        }
+      }
+      if (signal.aborted) {
+        return;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function connectStatusStream(abortController) {
+  const response = await apiFetch("/api/health/stream", {
+    headers: {
+      Accept: "text/event-stream",
+    },
+    signal: abortController.signal,
+    timeoutMs: HEALTH_REQUEST_TIMEOUT_MS,
+  });
+  if (response.status === 401 || response.status === 429) {
+    throw await buildAuthError(response);
+  }
+  if (!response.ok || !response.body) {
+    throw new Error("Status stream unavailable.");
+  }
+  await consumeStatusStream(response.body, abortController.signal);
+  if (!abortController.signal.aborted) {
+    throw new Error("Status stream disconnected.");
+  }
+}
+
+async function startHealthMonitoring() {
+  if (document.hidden || (appState.authRequired && !appState.apiKey)) {
+    return;
+  }
+  const useSharedChannel = await ensureStatusBroadcastChannel();
+  if (useSharedChannel && !tryAcquireStatusLeadership()) {
+    appState.statusStreamReconnectAttempts = 0;
+    appState.statusStreamAbortController?.abort();
+    appState.statusStreamAbortController = null;
+    return;
+  }
+  if (appState.statusStreamAbortController) {
+    return;
+  }
+  clearStatusStreamReconnect();
+  const abortController = new AbortController();
+  appState.statusStreamAbortController = abortController;
+  try {
+    await connectStatusStream(abortController);
+    appState.statusStreamReconnectAttempts = 0;
   } catch (error) {
+    if (appState.statusStreamAbortController !== abortController) {
+      return;
+    }
+    appState.statusStreamAbortController = null;
     if (isAuthError(error)) {
       handleAuthFailure(error.message || "Authentication failed.");
       return;
     }
-    if (pollCycle === healthPollCycle) {
-      healthPollFailureCount += 1;
-    }
-  } finally {
-    if (healthPollAbortController === abortController) {
-      healthPollAbortController = null;
-    }
-    if (pollCycle !== healthPollCycle) {
-      return;
-    }
-    healthPollInFlight = false;
-    if ((!appState.authRequired || appState.apiKey) && healthPollTimerId === null) {
-      scheduleHealthPoll();
-    }
+    releaseStatusLeadership();
+    appState.statusStreamReconnectAttempts += 1;
+    scheduleStatusStreamReconnect();
   }
-}
-
-function startHealthPolling() {
-  stopHealthPolling();
-  healthPollCycle += 1;
-  scheduleHealthPoll();
-}
-
-function scheduleHealthPoll(delayMs = getHealthPollIntervalMs()) {
-  if (healthPollTimerId !== null) {
-    window.clearTimeout(healthPollTimerId);
-  }
-  healthPollTimerId = window.setTimeout(() => {
-    healthPollTimerId = null;
-    void pollHealth();
-  }, delayMs);
-}
-
-function stopHealthPolling() {
-  if (healthPollTimerId === null) {
-    healthPollCycle += 1;
-    healthPollInFlight = false;
-    healthPollFailureCount = 0;
-    healthPollAbortController?.abort();
-    healthPollAbortController = null;
-    return;
-  }
-  window.clearTimeout(healthPollTimerId);
-  healthPollTimerId = null;
-  healthPollCycle += 1;
-  healthPollInFlight = false;
-  healthPollFailureCount = 0;
-  healthPollAbortController?.abort();
-  healthPollAbortController = null;
 }
 
 export async function loadHealth(options = {}) {
@@ -362,135 +650,7 @@ export async function loadHealth(options = {}) {
       }
       capabilities = await capabilitiesResponse.json();
     }
-    if (capabilities) {
-      populateVoices(capabilities.voices || []);
-      if (
-        Array.isArray(capabilities.formats) &&
-        capabilities.formats.length > 0
-      ) {
-        appState.availableFormats = capabilities.formats;
-        if (!appState.availableFormats.includes(appState.selectedFormat)) {
-          appState.selectedFormat = appState.availableFormats[0];
-        }
-      }
-      if (
-        Array.isArray(capabilities.opus_bitrates) &&
-        capabilities.opus_bitrates.length > 0
-      ) {
-        appState.availableOpusBitrates = capabilities.opus_bitrates;
-        if (
-          !appState.availableOpusBitrates.includes(appState.selectedOpusBitrate)
-        ) {
-          appState.selectedOpusBitrate = appState.availableOpusBitrates[0];
-        }
-      }
-      if (
-        Array.isArray(capabilities.wav_sample_rates) &&
-        capabilities.wav_sample_rates.length > 0
-      ) {
-        appState.availableWavSampleRates = capabilities.wav_sample_rates;
-        if (
-          !appState.availableWavSampleRates.includes(
-            appState.selectedWavSampleRate,
-          )
-        ) {
-          appState.selectedWavSampleRate = appState.availableWavSampleRates[0];
-        }
-      }
-    }
-    const websocketEnabled = capabilities
-      ? Boolean(capabilities.websocket_streaming)
-      : transportInput.querySelector('option[value="ws"]')?.disabled !== true;
-    const wsOption = transportInput.querySelector('option[value="ws"]');
-    if (wsOption && capabilities) {
-      wsOption.disabled = !websocketEnabled;
-    }
-    if (transportInput.value === "ws" && !websocketEnabled) {
-      transportInput.value = "ndjson";
-    }
-    if (capabilities) {
-      appState.pitchShiftingAvailable = capabilities.pitch_shifting !== false;
-      if (
-        Number.isFinite(capabilities.max_pitch_semitones) &&
-        capabilities.max_pitch_semitones > 0
-      ) {
-        appState.maxPitchSemitones = capabilities.max_pitch_semitones;
-      }
-    }
-    updatePitchControlAvailability();
-    refreshCustomSelect(transportInput);
-    syncTransportModeText();
-    updateFormatControlState();
-    const activeProvider =
-      typeof health.active_provider === "string"
-        ? health.active_provider
-        : null;
-    const providerFallback = health.provider_fallback === true;
-    const providerError = summarizeDiagnostic(
-      health.provider_error,
-      "Provider reported a startup issue. Check server logs.",
-    );
-    const runtimeError = summarizeDiagnostic(
-      health.runtime_error,
-      "Runtime unavailable. Check server logs.",
-    );
-    const runtimeActivityState =
-      typeof health?.runtime_activity?.state === "string"
-        ? health.runtime_activity.state
-        : null;
-    updateQueueMonitorLayout(activeProvider);
-    const processGroupVramMb = Number(health?.gpu?.process_group_vram_used_mb);
-    const processVramMb = Number(health?.gpu?.process_vram_used_mb);
-    const displayedVramMb =
-      Number.isFinite(processGroupVramMb) && processGroupVramMb >= 0
-        ? processGroupVramMb
-        : processVramMb;
-    gpuVram.textContent =
-      Number.isFinite(displayedVramMb) && displayedVramMb >= 0
-        ? `${displayedVramMb.toFixed(displayedVramMb >= 1024 ? 0 : 1)} MiB`
-        : "--";
-    if (health.ok) {
-      setSystemStatus(
-        true,
-        websocketEnabled,
-        activeProvider,
-        providerFallback,
-        providerError,
-        runtimeError,
-        runtimeActivityState,
-      );
-      if (!quiet && providerFallback && activeProvider) {
-        setStatus("Ready for synthesis with CPU fallback.", true);
-        return;
-      }
-      if (!quiet) {
-        setStatus("Ready for synthesis");
-      }
-      return;
-    }
-
-    setSystemStatus(
-      false,
-      websocketEnabled,
-      activeProvider,
-      providerFallback,
-      providerError,
-      runtimeError,
-      runtimeActivityState,
-    );
-    if (runtimeError && !quiet) {
-      setStatus(runtimeError, true);
-      return;
-    }
-    if (!quiet) {
-      const missingFiles = Array.isArray(health.missing) ? health.missing : [];
-      setStatus(
-        missingFiles.length
-          ? "Runtime files are missing. Check server setup."
-          : "Runtime unavailable. Check server setup.",
-        true,
-      );
-    }
+    applyHealthState(health, { quiet, capabilities });
   } catch (error) {
     if (isAuthError(error)) {
       throw error;
@@ -507,20 +667,151 @@ export async function loadHealth(options = {}) {
   }
 }
 
-function handleVisibilityChange() {
-  if (appState.authRequired && !appState.apiKey) {
-    stopHealthPolling();
+function applyHealthState(health, options = {}) {
+  const quiet = options.quiet === true;
+  const capabilities = options.capabilities ?? null;
+  appState.lastStatusSnapshot = health;
+  if (appState.statusIsLeader && appState.statusBroadcastChannel) {
+    postStatusChannelMessage({
+      type: "health-update",
+      payload: health,
+    });
+  }
+  if (capabilities) {
+    populateVoices(capabilities.voices || []);
+    if (Array.isArray(capabilities.formats) && capabilities.formats.length > 0) {
+      appState.availableFormats = capabilities.formats;
+      if (!appState.availableFormats.includes(appState.selectedFormat)) {
+        appState.selectedFormat = appState.availableFormats[0];
+      }
+    }
+    if (
+      Array.isArray(capabilities.opus_bitrates) &&
+      capabilities.opus_bitrates.length > 0
+    ) {
+      appState.availableOpusBitrates = capabilities.opus_bitrates;
+      if (!appState.availableOpusBitrates.includes(appState.selectedOpusBitrate)) {
+        appState.selectedOpusBitrate = appState.availableOpusBitrates[0];
+      }
+    }
+    if (
+      Array.isArray(capabilities.wav_sample_rates) &&
+      capabilities.wav_sample_rates.length > 0
+    ) {
+      appState.availableWavSampleRates = capabilities.wav_sample_rates;
+      if (!appState.availableWavSampleRates.includes(appState.selectedWavSampleRate)) {
+        appState.selectedWavSampleRate = appState.availableWavSampleRates[0];
+      }
+    }
+  }
+  const websocketEnabled = capabilities
+    ? Boolean(capabilities.websocket_streaming)
+    : transportInput.querySelector('option[value="ws"]')?.disabled !== true;
+    const wsOption = transportInput.querySelector('option[value="ws"]');
+  if (wsOption && capabilities) {
+    wsOption.disabled = !websocketEnabled;
+  }
+  if (transportInput.value === "ws" && !websocketEnabled) {
+    transportInput.value = "ndjson";
+  }
+  if (capabilities) {
+    appState.pitchShiftingAvailable = capabilities.pitch_shifting !== false;
+    if (
+      Number.isFinite(capabilities.max_pitch_semitones) &&
+      capabilities.max_pitch_semitones > 0
+    ) {
+      appState.maxPitchSemitones = capabilities.max_pitch_semitones;
+    }
+  }
+  updatePitchControlAvailability();
+  refreshCustomSelect(transportInput);
+  syncTransportModeText();
+  updateFormatControlState();
+  const activeProvider =
+    typeof health.active_provider === "string" ? health.active_provider : null;
+  const providerFallback = health.provider_fallback === true;
+  const providerError = summarizeDiagnostic(
+    health.provider_error,
+    "Provider reported a startup issue. Check server logs.",
+  );
+  const runtimeError = summarizeDiagnostic(
+    health.runtime_error,
+    "Runtime unavailable. Check server logs.",
+  );
+  const runtimeActivityState =
+    typeof health?.runtime_activity?.state === "string"
+      ? health.runtime_activity.state
+      : null;
+  updateQueueMonitorLayout(activeProvider);
+  const processGroupVramMb = Number(health?.gpu?.process_group_vram_used_mb);
+  const processVramMb = Number(health?.gpu?.process_vram_used_mb);
+  const displayedVramMb =
+    Number.isFinite(processGroupVramMb) && processGroupVramMb >= 0
+      ? processGroupVramMb
+      : processVramMb;
+  gpuVram.textContent =
+    Number.isFinite(displayedVramMb) && displayedVramMb >= 0
+      ? `${displayedVramMb.toFixed(displayedVramMb >= 1024 ? 0 : 1)} MiB`
+      : "--";
+  if (health.ok) {
+    setSystemStatus(
+      true,
+      websocketEnabled,
+      activeProvider,
+      providerFallback,
+      providerError,
+      runtimeError,
+      runtimeActivityState,
+    );
+    if (!quiet && providerFallback && activeProvider) {
+      setStatus("Ready for synthesis with CPU fallback.", true);
+      return;
+    }
+    if (!quiet) {
+      setStatus("Ready for synthesis");
+    }
     return;
   }
-  healthPollFailureCount = 0;
-  startHealthPolling();
-  if (!document.hidden) {
-    stopHealthPolling();
-    void pollHealth();
+
+  setSystemStatus(
+    false,
+    websocketEnabled,
+    activeProvider,
+    providerFallback,
+    providerError,
+    runtimeError,
+    runtimeActivityState,
+  );
+  if (runtimeError && !quiet) {
+    setStatus(runtimeError, true);
+    return;
+  }
+  if (!quiet) {
+    const missingFiles = Array.isArray(health.missing) ? health.missing : [];
+    setStatus(
+      missingFiles.length
+        ? "Runtime files are missing. Check server setup."
+        : "Runtime unavailable. Check server setup.",
+      true,
+    );
   }
 }
 
+function handleVisibilityChange() {
+  if (appState.authRequired && !appState.apiKey) {
+    stopHealthMonitoring();
+    return;
+  }
+  if (!document.hidden) {
+    void startHealthMonitoring();
+    return;
+  }
+  stopHealthMonitoring();
+}
+
 document.addEventListener("visibilitychange", handleVisibilityChange);
+window.addEventListener("pagehide", stopHealthMonitoring);
+window.addEventListener("beforeunload", stopHealthMonitoring);
 
 export async function synthesize(event) {
   event.preventDefault();
