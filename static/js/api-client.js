@@ -1,4 +1,5 @@
 import {
+  authApiKeyInput,
   audioDuration,
   chunkBar,
   chunkProgress,
@@ -63,6 +64,7 @@ let healthPollTimerId = null;
 let healthPollInFlight = false;
 let healthPollFailureCount = 0;
 let healthPollAbortController = null;
+let healthPollCycle = 0;
 
 function getHealthPollIntervalMs() {
   const baseInterval = document.hidden
@@ -154,6 +156,9 @@ function handleAuthFailure(message = "Authentication failed.") {
   setUiLocked(true);
   setAuthPanelState(true, message, true);
   setStatus(message, true);
+  if (authApiKeyInput) {
+    authApiKeyInput.value = "";
+  }
 }
 
 function summarizeDiagnostic(detail, fallback) {
@@ -254,6 +259,9 @@ export function clearApiKey() {
   setUiLocked(true);
   setAuthPanelState(true, "Enter the configured API key to use this server.");
   setStatus("API key cleared.");
+  if (authApiKeyInput) {
+    authApiKeyInput.value = "";
+  }
 }
 
 async function pollHealth() {
@@ -263,24 +271,35 @@ async function pollHealth() {
   if (appState.authRequired && !appState.apiKey) {
     return;
   }
+  const pollCycle = ++healthPollCycle;
   healthPollInFlight = true;
-  healthPollAbortController = new AbortController();
+  const abortController = new AbortController();
+  healthPollAbortController = abortController;
   try {
     await loadHealth({
       quiet: true,
       includeCapabilities: false,
-      signal: healthPollAbortController.signal,
+      signal: abortController.signal,
       timeoutMs: HEALTH_REQUEST_TIMEOUT_MS,
     });
-    healthPollFailureCount = 0;
+    if (pollCycle === healthPollCycle) {
+      healthPollFailureCount = 0;
+    }
   } catch (error) {
     if (isAuthError(error)) {
       handleAuthFailure(error.message || "Authentication failed.");
       return;
     }
-    healthPollFailureCount += 1;
+    if (pollCycle === healthPollCycle) {
+      healthPollFailureCount += 1;
+    }
   } finally {
-    healthPollAbortController = null;
+    if (healthPollAbortController === abortController) {
+      healthPollAbortController = null;
+    }
+    if (pollCycle !== healthPollCycle) {
+      return;
+    }
     healthPollInFlight = false;
     if ((!appState.authRequired || appState.apiKey) && healthPollTimerId === null) {
       scheduleHealthPoll();
@@ -290,6 +309,7 @@ async function pollHealth() {
 
 function startHealthPolling() {
   stopHealthPolling();
+  healthPollCycle += 1;
   scheduleHealthPoll();
 }
 
@@ -305,6 +325,7 @@ function scheduleHealthPoll(delayMs = getHealthPollIntervalMs()) {
 
 function stopHealthPolling() {
   if (healthPollTimerId === null) {
+    healthPollCycle += 1;
     healthPollInFlight = false;
     healthPollFailureCount = 0;
     healthPollAbortController?.abort();
@@ -313,6 +334,7 @@ function stopHealthPolling() {
   }
   window.clearTimeout(healthPollTimerId);
   healthPollTimerId = null;
+  healthPollCycle += 1;
   healthPollInFlight = false;
   healthPollFailureCount = 0;
   healthPollAbortController?.abort();
@@ -464,7 +486,7 @@ export async function loadHealth(options = {}) {
       const missingFiles = Array.isArray(health.missing) ? health.missing : [];
       setStatus(
         missingFiles.length
-          ? `Missing runtime files: ${missingFiles.join(", ")}`
+          ? "Runtime files are missing. Check server setup."
           : "Runtime unavailable. Check server setup.",
         true,
       );

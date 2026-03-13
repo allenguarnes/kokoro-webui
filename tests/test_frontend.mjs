@@ -40,6 +40,59 @@ class FakeClassList {
   }
 }
 
+class FakeHeaders {
+  constructor(init = {}) {
+    this._values = new Map();
+    if (init instanceof FakeHeaders) {
+      init.forEach((value, key) => this.set(key, value));
+      return;
+    }
+    Object.entries(init).forEach(([key, value]) => this.set(key, value));
+  }
+
+  set(name, value) {
+    this._values.set(String(name).toLowerCase(), String(value));
+  }
+
+  get(name) {
+    return this._values.get(String(name).toLowerCase()) ?? null;
+  }
+
+  forEach(callback) {
+    this._values.forEach((value, key) => callback(value, key, this));
+  }
+}
+
+class FakeResponse {
+  constructor(body, init = {}) {
+    this._body = body;
+    this.status = init.status ?? 200;
+    this.headers = new FakeHeaders(init.headers || {});
+    this.ok = this.status >= 200 && this.status < 300;
+  }
+
+  async json() {
+    if (typeof this._body === "string") {
+      return JSON.parse(this._body);
+    }
+    return this._body;
+  }
+
+  async blob() {
+    return this._body;
+  }
+}
+
+function createJsonResponse(payload, init = {}) {
+  return new FakeResponse(payload, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init.headers || {}),
+    },
+  });
+}
+
 class FakeElement {
   constructor(tagName, ownerDocument) {
     this.tagName = tagName.toUpperCase();
@@ -358,6 +411,8 @@ function installGlobals(document, fetchImpl, options = {}) {
     fetch: globalThis.fetch,
     WebSocket: globalThis.WebSocket,
     URL: globalThis.URL,
+    Headers: globalThis.Headers,
+    Response: globalThis.Response,
   };
   globalThis.document = document;
   globalThis.Element = FakeElement;
@@ -394,6 +449,8 @@ function installGlobals(document, fetchImpl, options = {}) {
 
   globalThis.fetch = fetchImpl;
   globalThis.WebSocket = options.WebSocket ?? class UnsupportedWebSocket {};
+  globalThis.Headers = FakeHeaders;
+  globalThis.Response = FakeResponse;
   globalThis.URL = {
     createObjectURL() {
       return "blob:fake";
@@ -478,12 +535,9 @@ test("loadHealth surfaces 429 detail and avoids capabilities fetch on auth failu
   t.after(() => sandbox.cleanup());
   const restoreGlobals = installGlobals(document, async (input) => {
     fetchCalls.push(String(input));
-    return new Response(
-      JSON.stringify({ detail: "Too many authentication failures. Try again later." }),
-      {
-        status: 429,
-        headers: { "Content-Type": "application/json" },
-      },
+    return createJsonResponse(
+      { detail: "Too many authentication failures. Try again later." },
+      { status: 429 },
     );
   });
   t.after(restoreGlobals);
@@ -505,10 +559,7 @@ test("submitApiKey keeps the UI locked when backend validation fails", async (t)
   const restoreGlobals = installGlobals(document, async (input) => {
     requestCount += 1;
     if (String(input) === "/api/public-config") {
-      return new Response(JSON.stringify({ auth_required: true }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
+      return createJsonResponse({ auth_required: true });
     }
     throw new TypeError("Network down");
   });
@@ -539,20 +590,13 @@ test("synthesize relocks the UI after NDJSON auth failure", async (t) => {
     const target = String(input);
     fetchCalls.push(target);
     if (target === "/api/public-config") {
-      return new Response(JSON.stringify({ auth_required: true }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
+      return createJsonResponse({ auth_required: true });
     }
     if (target === "/api/health") {
-      return new Response(JSON.stringify({ ok: true, gpu: {}, runtime_activity: {} }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
+      return createJsonResponse({ ok: true, gpu: {}, runtime_activity: {} });
     }
     if (target === "/api/capabilities") {
-      return new Response(
-        JSON.stringify({
+      return createJsonResponse({
           voices: ["af_heart"],
           formats: ["wav"],
           opus_bitrates: ["32k"],
@@ -560,17 +604,9 @@ test("synthesize relocks the UI after NDJSON auth failure", async (t) => {
           websocket_streaming: true,
           pitch_shifting: true,
           max_pitch_semitones: 6,
-        }),
-        {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        },
-      );
+        });
     }
-    return new Response(JSON.stringify({ detail: "Authentication failed." }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
+    return createJsonResponse({ detail: "Authentication failed." }, { status: 401 });
   });
   t.after(restoreGlobals);
 
@@ -614,12 +650,9 @@ test("synthesize relocks the UI after WebSocket token auth throttling", async (t
   const restoreGlobals = installGlobals(
     document,
     async () => {
-      return new Response(
-        JSON.stringify({ detail: "Too many authentication failures. Try again later." }),
-        {
-          status: 429,
-          headers: { "Content-Type": "application/json" },
-        },
+      return createJsonResponse(
+        { detail: "Too many authentication failures. Try again later." },
+        { status: 429 },
       );
     },
     { WebSocket: FakeWebSocket },
@@ -633,20 +666,13 @@ test("synthesize relocks the UI after WebSocket token auth throttling", async (t
     const target = String(input);
     fetchCalls.push(target);
     if (target === "/api/public-config") {
-      return new Response(JSON.stringify({ auth_required: true }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
+      return createJsonResponse({ auth_required: true });
     }
     if (target === "/api/health") {
-      return new Response(JSON.stringify({ ok: true, gpu: {}, runtime_activity: {} }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
+      return createJsonResponse({ ok: true, gpu: {}, runtime_activity: {} });
     }
     if (target === "/api/capabilities") {
-      return new Response(
-        JSON.stringify({
+      return createJsonResponse({
           voices: ["af_heart"],
           formats: ["wav"],
           opus_bitrates: ["32k"],
@@ -654,12 +680,7 @@ test("synthesize relocks the UI after WebSocket token auth throttling", async (t
           websocket_streaming: true,
           pitch_shifting: true,
           max_pitch_semitones: 6,
-        }),
-        {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        },
-      );
+        });
     }
     return originalFetch(input);
   };
