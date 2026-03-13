@@ -55,13 +55,27 @@ function isAuthError(error) {
   );
 }
 
-const HEALTH_POLL_INTERVAL_MS = 2000;
-const HIDDEN_HEALTH_POLL_INTERVAL_MS = 15000;
+const HEALTH_POLL_INTERVAL_MS = 4000;
+const HIDDEN_HEALTH_POLL_INTERVAL_MS = 20000;
+const HEALTH_POLL_MAX_INTERVAL_MS = 60000;
+const HEALTH_REQUEST_TIMEOUT_MS = 8000;
 let healthPollTimerId = null;
 let healthPollInFlight = false;
+let healthPollFailureCount = 0;
+let healthPollAbortController = null;
 
 function getHealthPollIntervalMs() {
-  return document.hidden ? HIDDEN_HEALTH_POLL_INTERVAL_MS : HEALTH_POLL_INTERVAL_MS;
+  const baseInterval = document.hidden
+    ? HIDDEN_HEALTH_POLL_INTERVAL_MS
+    : HEALTH_POLL_INTERVAL_MS;
+  const backoffFactor = 2 ** Math.min(healthPollFailureCount, 4);
+  const backoffInterval = Math.min(
+    baseInterval * backoffFactor,
+    HEALTH_POLL_MAX_INTERVAL_MS,
+  );
+  const jitterWindow = Math.max(250, Math.round(backoffInterval * 0.1));
+  const jitterOffset = Math.round(Math.random() * jitterWindow);
+  return backoffInterval + jitterOffset;
 }
 
 function authHeaders() {
@@ -74,18 +88,69 @@ function authHeaders() {
 }
 
 function apiFetch(input, init = {}) {
+  const { timeoutMs = 0, signal, ...restInit } = init;
   const headers = new Headers(init.headers || {});
   Object.entries(authHeaders()).forEach(([key, value]) => {
     headers.set(key, value);
   });
-  return fetch(input, { ...init, headers });
+
+  if (!timeoutMs) {
+    return fetch(input, { ...restInit, signal, headers });
+  }
+
+  const controller = new AbortController();
+  let timeoutId = null;
+  const onAbort = () => {
+    controller.abort(signal?.reason);
+  };
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
+  timeoutId = window.setTimeout(() => {
+    controller.abort(new Error("Health request timed out."));
+  }, timeoutMs);
+
+  return fetch(input, { ...restInit, signal: controller.signal, headers }).finally(() => {
+    window.clearTimeout(timeoutId);
+    signal?.removeEventListener?.("abort", onAbort);
+  });
+}
+
+function sanitizeAuthMessage(message) {
+  if (typeof message !== "string") {
+    return "Authentication failed.";
+  }
+  const normalized = message.trim().toLowerCase();
+  if (normalized.includes("too many authentication failures")) {
+    return "Too many authentication failures. Try again later.";
+  }
+  return "Authentication failed.";
+}
+
+function sanitizeOperationalMessage(error, fallback) {
+  const message = typeof error?.message === "string" ? error.message.trim() : "";
+  if (!message) {
+    return fallback;
+  }
+  if (
+    /network|fetch|timeout|timed out|load failed|backend|connection|abort/i.test(
+      message,
+    )
+  ) {
+    return "Unable to reach the backend.";
+  }
+  return fallback;
 }
 
 function handleAuthFailure(message = "Authentication failed.") {
+  appState.apiKey = null;
   stopHealthPolling();
   resetPlaybackState();
   appState.lastExportRequest = null;
-  appState.apiKey = null;
   setUiLocked(true);
   setAuthPanelState(true, message, true);
   setStatus(message, true);
@@ -100,12 +165,13 @@ function summarizeDiagnostic(detail, fallback) {
 
 async function buildAuthError(response) {
   const payload = await response.json().catch(() => ({}));
-  const message =
+  const message = sanitizeAuthMessage(
     payload.detail ||
-    payload?.error?.message ||
-    (response.status === 429
-      ? "Too many authentication failures. Try again later."
-      : "Authentication failed.");
+      payload?.error?.message ||
+      (response.status === 429
+        ? "Too many authentication failures. Try again later."
+        : "Authentication failed."),
+  );
   if (response.status === 429) {
     return new AuthRateLimitError(message);
   }
@@ -166,10 +232,14 @@ export async function submitApiKey(apiKey) {
       return false;
     }
     appState.apiKey = null;
-    setStatus("Unable to reach the backend.", true);
+    const userMessage = sanitizeOperationalMessage(
+      error,
+      "Unable to reach the backend.",
+    );
+    setStatus(userMessage, true);
     setAuthPanelState(
       true,
-      error.message || "Unable to reach the backend.",
+      userMessage,
       true,
     );
     return false;
@@ -177,10 +247,10 @@ export async function submitApiKey(apiKey) {
 }
 
 export function clearApiKey() {
+  appState.apiKey = null;
   stopHealthPolling();
   resetPlaybackState();
   appState.lastExportRequest = null;
-  appState.apiKey = null;
   setUiLocked(true);
   setAuthPanelState(true, "Enter the configured API key to use this server.");
   setStatus("API key cleared.");
@@ -194,39 +264,69 @@ async function pollHealth() {
     return;
   }
   healthPollInFlight = true;
+  healthPollAbortController = new AbortController();
   try {
-    await loadHealth({ quiet: true, includeCapabilities: false });
+    await loadHealth({
+      quiet: true,
+      includeCapabilities: false,
+      signal: healthPollAbortController.signal,
+      timeoutMs: HEALTH_REQUEST_TIMEOUT_MS,
+    });
+    healthPollFailureCount = 0;
   } catch (error) {
     if (isAuthError(error)) {
       handleAuthFailure(error.message || "Authentication failed.");
+      return;
     }
+    healthPollFailureCount += 1;
   } finally {
+    healthPollAbortController = null;
     healthPollInFlight = false;
+    if ((!appState.authRequired || appState.apiKey) && healthPollTimerId === null) {
+      scheduleHealthPoll();
+    }
   }
 }
 
 function startHealthPolling() {
   stopHealthPolling();
-  const intervalMs = getHealthPollIntervalMs();
-  healthPollTimerId = window.setInterval(() => {
+  scheduleHealthPoll();
+}
+
+function scheduleHealthPoll(delayMs = getHealthPollIntervalMs()) {
+  if (healthPollTimerId !== null) {
+    window.clearTimeout(healthPollTimerId);
+  }
+  healthPollTimerId = window.setTimeout(() => {
+    healthPollTimerId = null;
     void pollHealth();
-  }, intervalMs);
+  }, delayMs);
 }
 
 function stopHealthPolling() {
   if (healthPollTimerId === null) {
+    healthPollInFlight = false;
+    healthPollFailureCount = 0;
+    healthPollAbortController?.abort();
+    healthPollAbortController = null;
     return;
   }
-  window.clearInterval(healthPollTimerId);
+  window.clearTimeout(healthPollTimerId);
   healthPollTimerId = null;
   healthPollInFlight = false;
+  healthPollFailureCount = 0;
+  healthPollAbortController?.abort();
+  healthPollAbortController = null;
 }
 
 export async function loadHealth(options = {}) {
   const quiet = options.quiet === true;
   const includeCapabilities = options.includeCapabilities !== false;
   const strictErrors = options.strictErrors === true;
-  const healthResponse = await apiFetch("/api/health");
+  const healthResponse = await apiFetch("/api/health", {
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+  });
   if (healthResponse.status === 401 || healthResponse.status === 429) {
     throw await buildAuthError(healthResponse);
   }
@@ -390,8 +490,10 @@ function handleVisibilityChange() {
     stopHealthPolling();
     return;
   }
+  healthPollFailureCount = 0;
   startHealthPolling();
   if (!document.hidden) {
+    stopHealthPolling();
     void pollHealth();
   }
 }
@@ -449,7 +551,7 @@ export async function synthesize(event) {
     if (isAuthError(error)) {
       handleAuthFailure(error.message || "Authentication failed.");
     } else if (error.name !== "AbortError") {
-      setStatus(error.message || "Synthesis failed.", true);
+      setStatus(sanitizeOperationalMessage(error, "Synthesis failed."), true);
     }
     genTime.textContent = "--";
     fileSize.textContent = "--";
@@ -500,7 +602,7 @@ export async function exportAudio() {
     if (isAuthError(error)) {
       handleAuthFailure(error.message || "Authentication failed.");
     } else {
-      setStatus(error.message || "Export failed.", true);
+      setStatus(sanitizeOperationalMessage(error, "Export failed."), true);
     }
   } finally {
     exportButtonLabel.textContent = "Export Audio";

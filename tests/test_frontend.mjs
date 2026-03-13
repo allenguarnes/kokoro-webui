@@ -350,6 +350,15 @@ function installDom() {
 }
 
 function installGlobals(document, fetchImpl, options = {}) {
+  const originals = {
+    document: globalThis.document,
+    Element: globalThis.Element,
+    Event: globalThis.Event,
+    window: globalThis.window,
+    fetch: globalThis.fetch,
+    WebSocket: globalThis.WebSocket,
+    URL: globalThis.URL,
+  };
   globalThis.document = document;
   globalThis.Element = FakeElement;
   globalThis.Event = class Event {
@@ -391,6 +400,16 @@ function installGlobals(document, fetchImpl, options = {}) {
     },
     revokeObjectURL() {},
   };
+
+  return () => {
+    Object.entries(originals).forEach(([key, value]) => {
+      if (value === undefined) {
+        delete globalThis[key];
+        return;
+      }
+      globalThis[key] = value;
+    });
+  };
 }
 
 async function createFrontendSandbox() {
@@ -423,10 +442,11 @@ test("synthesize resets busy state when stream startup fails", async (t) => {
   const fetchCalls = [];
   const sandbox = await createFrontendSandbox();
   t.after(() => sandbox.cleanup());
-  installGlobals(document, async (input) => {
+  const restoreGlobals = installGlobals(document, async (input) => {
     fetchCalls.push(String(input));
     throw new TypeError("Failed to fetch");
   });
+  t.after(restoreGlobals);
 
   const apiClient = await sandbox.importModule("./static/js/api-client.js");
 
@@ -440,7 +460,10 @@ test("synthesize resets busy state when stream startup fails", async (t) => {
   );
 
   assert.deepEqual(fetchCalls, ["/api/speak-stream"]);
-  assert.equal(document.getElementById("statusText").textContent, "Failed to fetch");
+  assert.equal(
+    document.getElementById("statusText").textContent,
+    "Unable to reach the backend.",
+  );
   assert.equal(document.getElementById("submitButton").disabled, false);
   assert.equal(
     document.getElementById("submitButton").querySelector(".button-label").textContent,
@@ -453,7 +476,7 @@ test("loadHealth surfaces 429 detail and avoids capabilities fetch on auth failu
   const fetchCalls = [];
   const sandbox = await createFrontendSandbox();
   t.after(() => sandbox.cleanup());
-  installGlobals(document, async (input) => {
+  const restoreGlobals = installGlobals(document, async (input) => {
     fetchCalls.push(String(input));
     return new Response(
       JSON.stringify({ detail: "Too many authentication failures. Try again later." }),
@@ -463,6 +486,7 @@ test("loadHealth surfaces 429 detail and avoids capabilities fetch on auth failu
       },
     );
   });
+  t.after(restoreGlobals);
 
   const apiClient = await sandbox.importModule("./static/js/api-client.js");
 
@@ -478,7 +502,7 @@ test("submitApiKey keeps the UI locked when backend validation fails", async (t)
   let requestCount = 0;
   const sandbox = await createFrontendSandbox();
   t.after(() => sandbox.cleanup());
-  installGlobals(document, async (input) => {
+  const restoreGlobals = installGlobals(document, async (input) => {
     requestCount += 1;
     if (String(input) === "/api/public-config") {
       return new Response(JSON.stringify({ auth_required: true }), {
@@ -488,6 +512,7 @@ test("submitApiKey keeps the UI locked when backend validation fails", async (t)
     }
     throw new TypeError("Network down");
   });
+  t.after(restoreGlobals);
 
   const apiClient = await sandbox.importModule("./static/js/api-client.js");
 
@@ -499,7 +524,10 @@ test("submitApiKey keeps the UI locked when backend validation fails", async (t)
   assert.equal(requestCount, 2);
   assert.equal(document.getElementById("submitButton").disabled, true);
   assert.equal(document.getElementById("statusText").textContent, "Unable to reach the backend.");
-  assert.equal(document.getElementById("authMessage").textContent, "Network down");
+  assert.equal(
+    document.getElementById("authMessage").textContent,
+    "Unable to reach the backend.",
+  );
 });
 
 test("synthesize relocks the UI after NDJSON auth failure", async (t) => {
@@ -507,7 +535,7 @@ test("synthesize relocks the UI after NDJSON auth failure", async (t) => {
   const fetchCalls = [];
   const sandbox = await createFrontendSandbox();
   t.after(() => sandbox.cleanup());
-  installGlobals(document, async (input) => {
+  const restoreGlobals = installGlobals(document, async (input) => {
     const target = String(input);
     fetchCalls.push(target);
     if (target === "/api/public-config") {
@@ -544,6 +572,7 @@ test("synthesize relocks the UI after NDJSON auth failure", async (t) => {
       headers: { "Content-Type": "application/json" },
     });
   });
+  t.after(restoreGlobals);
 
   const apiClient = await sandbox.importModule("./static/js/api-client.js");
 
@@ -582,7 +611,7 @@ test("synthesize relocks the UI after WebSocket token auth throttling", async (t
     }
   }
 
-  installGlobals(
+  const restoreGlobals = installGlobals(
     document,
     async () => {
       return new Response(
@@ -595,6 +624,7 @@ test("synthesize relocks the UI after WebSocket token auth throttling", async (t
     },
     { WebSocket: FakeWebSocket },
   );
+  t.after(restoreGlobals);
 
   const apiClient = await sandbox.importModule("./static/js/api-client.js");
 
@@ -633,6 +663,9 @@ test("synthesize relocks the UI after WebSocket token auth throttling", async (t
     }
     return originalFetch(input);
   };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
 
   await apiClient.initializeAccess();
   await apiClient.submitApiKey("bad-key");
