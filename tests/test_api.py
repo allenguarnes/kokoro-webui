@@ -9,7 +9,7 @@ import threading
 import time
 import unittest
 import warnings
-from collections.abc import Iterator
+from collections.abc import AsyncGenerator, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import cast, override
@@ -27,6 +27,7 @@ import app.api as api
 import app.audio as audio
 import app.config as config
 import app.runtime as runtime
+import app.status_stream as status_stream
 from app.runtime import GpuProcessUsage, RuntimeStatus
 from app.schemas import RenderedChunk, SynthesisRequest
 from app.status_stream import create_status_stream_hub, iter_status_events
@@ -412,17 +413,50 @@ class ApiIntegrationTests(unittest.TestCase):
             async def disconnected() -> bool:
                 return False
 
-            stream = iter_status_events(hub, disconnected=disconnected)
+            stream = cast(
+                AsyncGenerator[dict[str, str], None],
+                iter_status_events(hub, disconnected=disconnected),
+            )
             try:
                 return await anext(stream)
             finally:
-                await stream.aclose()
+                await cast(AsyncGenerator[dict[str, str], None], stream).aclose()
 
         event = asyncio.run(run_test())
 
         self.assertEqual(event["event"], "health_snapshot")
         payload = cast(dict[str, object], json.loads(event["data"]))
         self.assertTrue(cast(bool, payload["ok"]))
+
+    def test_status_stream_hub_cleans_up_disconnected_subscribers(self) -> None:
+        async def run_test() -> None:
+            hub = create_status_stream_hub()
+            disconnected = False
+
+            async def is_disconnected() -> bool:
+                return disconnected
+
+            stream = cast(
+                AsyncGenerator[dict[str, str], None],
+                iter_status_events(hub, disconnected=is_disconnected),
+            )
+            task = asyncio.ensure_future(stream.__anext__())
+            await asyncio.sleep(0)
+            self.assertEqual(hub.subscriber_count(), 1)
+            with patch.object(
+                status_stream,
+                "_SUBSCRIBER_DISCONNECT_CHECK_SECONDS",
+                0.01,
+            ):
+                disconnected = True
+                await asyncio.sleep(0.02)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await cast(AsyncGenerator[dict[str, str], None], stream).aclose()
+            self.assertEqual(hub.subscriber_count(), 0)
+
+        asyncio.run(run_test())
 
     def test_health_stream_requires_auth_when_enabled(self) -> None:
         with (

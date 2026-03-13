@@ -61,7 +61,16 @@ const STATUS_STREAM_RECONNECT_MAX_MS = 30000;
 const STATUS_LEADER_LEASE_MS = 5000;
 const STATUS_LEADER_HEARTBEAT_MS = 2000;
 const STATUS_LEADER_TAKEOVER_DELAY_MS = STATUS_LEADER_LEASE_MS + 500;
+const STATUS_MESSAGE_MAX_AGE_MS = STATUS_LEADER_LEASE_MS + 1000;
 const HEALTH_REQUEST_TIMEOUT_MS = 8000;
+
+function getSafeLocalStorage() {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
 
 function supportsBroadcastChannel() {
   return typeof BroadcastChannel === "function";
@@ -72,7 +81,11 @@ function getStatusLeaderLeaseKey(scopeId) {
 }
 
 function readStatusLeaderLease(scopeId) {
-  const raw = window.localStorage.getItem(getStatusLeaderLeaseKey(scopeId));
+  const localStorage = getSafeLocalStorage();
+  if (!localStorage) {
+    return null;
+  }
+  const raw = localStorage.getItem(getStatusLeaderLeaseKey(scopeId));
   if (!raw) {
     return null;
   }
@@ -91,21 +104,38 @@ function readStatusLeaderLease(scopeId) {
 }
 
 function writeStatusLeaderLease(scopeId, tabId, expiresAt) {
-  window.localStorage.setItem(
-    getStatusLeaderLeaseKey(scopeId),
-    JSON.stringify({ tabId, expiresAt }),
-  );
+  const localStorage = getSafeLocalStorage();
+  if (!localStorage) {
+    return false;
+  }
+  try {
+    localStorage.setItem(
+      getStatusLeaderLeaseKey(scopeId),
+      JSON.stringify({ tabId, expiresAt }),
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function clearStatusLeaderLease(scopeId) {
   if (!scopeId) {
     return;
   }
+  const localStorage = getSafeLocalStorage();
+  if (!localStorage) {
+    return;
+  }
   const lease = readStatusLeaderLease(scopeId);
   if (lease?.tabId !== appState.tabId) {
     return;
   }
-  window.localStorage.removeItem(getStatusLeaderLeaseKey(scopeId));
+  try {
+    localStorage.removeItem(getStatusLeaderLeaseKey(scopeId));
+  } catch {
+    // Ignore storage cleanup failures and fall back to lease expiry.
+  }
 }
 
 async function hashStatusScope(value) {
@@ -377,11 +407,18 @@ function renewStatusLeadership() {
   if (!appState.statusIsLeader || !appState.statusStreamScopeId) {
     return;
   }
-  writeStatusLeaderLease(
+  const wroteLease = writeStatusLeaderLease(
     appState.statusStreamScopeId,
     appState.tabId,
     Date.now() + STATUS_LEADER_LEASE_MS,
   );
+  if (!wroteLease) {
+    releaseStatusLeadership();
+    appState.statusStreamAbortController?.abort();
+    appState.statusStreamAbortController = null;
+    scheduleStatusStreamReconnect();
+    return;
+  }
   postStatusChannelMessage({ type: "leader-heartbeat" });
 }
 
@@ -395,6 +432,14 @@ function releaseStatusLeadership() {
   appState.statusLeaderTabId = null;
 }
 
+function demoteStatusLeader(remoteTabId = null) {
+  appState.statusIsLeader = false;
+  appState.statusLeaderTabId = remoteTabId;
+  clearStatusLeaderHeartbeat();
+  appState.statusStreamAbortController?.abort();
+  appState.statusStreamAbortController = null;
+}
+
 function tryAcquireStatusLeadership() {
   if (!appState.statusBroadcastChannel || !appState.statusStreamScopeId || document.hidden) {
     return false;
@@ -406,11 +451,14 @@ function tryAcquireStatusLeadership() {
     scheduleLeaderTakeoverCheck();
     return false;
   }
-  writeStatusLeaderLease(
+  const wroteLease = writeStatusLeaderLease(
     appState.statusStreamScopeId,
     appState.tabId,
     now + STATUS_LEADER_LEASE_MS,
   );
+  if (!wroteLease) {
+    return false;
+  }
   const confirmedLease = readStatusLeaderLease(appState.statusStreamScopeId);
   if (confirmedLease?.tabId !== appState.tabId) {
     scheduleLeaderTakeoverCheck();
@@ -444,9 +492,19 @@ function handleStatusChannelMessage(event) {
   ) {
     return;
   }
+  if (
+    !Number.isFinite(message.sentAt) ||
+    Math.abs(Date.now() - message.sentAt) > STATUS_MESSAGE_MAX_AGE_MS
+  ) {
+    return;
+  }
+  const currentLease = readStatusLeaderLease(appState.statusStreamScopeId);
+  const isLeaseOwner = currentLease?.tabId === message.tabId;
   if (message.type === "leader-announce" || message.type === "leader-heartbeat") {
-    appState.statusLeaderTabId = message.tabId;
-    appState.statusIsLeader = false;
+    if (!isLeaseOwner) {
+      return;
+    }
+    demoteStatusLeader(message.tabId);
     scheduleLeaderTakeoverCheck();
     return;
   }
@@ -458,8 +516,10 @@ function handleStatusChannelMessage(event) {
     return;
   }
   if (message.type === "health-update") {
-    appState.statusLeaderTabId = message.tabId;
-    appState.statusIsLeader = false;
+    if (!isLeaseOwner) {
+      return;
+    }
+    demoteStatusLeader(message.tabId);
     appState.lastStatusSnapshot = message.payload;
     applyHealthState(message.payload, { quiet: true });
     scheduleLeaderTakeoverCheck();
@@ -475,7 +535,7 @@ function handleStatusChannelMessage(event) {
 
 async function ensureStatusBroadcastChannel() {
   const scopeId = await getStatusScopeId();
-  if (!scopeId || !supportsBroadcastChannel()) {
+  if (!scopeId || !supportsBroadcastChannel() || !getSafeLocalStorage()) {
     closeStatusBroadcastChannel();
     appState.statusStreamScopeId = scopeId;
     return false;

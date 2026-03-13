@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Protocol
+
+_SUBSCRIBER_DISCONNECT_CHECK_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -99,13 +101,19 @@ async def iter_status_events(
     hub: StatusStreamHub,
     *,
     disconnected: Callable[[], Awaitable[bool]],
-) -> AsyncIterator[dict[str, str]]:
+) -> AsyncGenerator[dict[str, str], None]:
     queue = hub.subscribe()
     try:
         while True:
             if await disconnected():
                 return
-            event = await queue.get()
+            try:
+                event = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=_SUBSCRIBER_DISCONNECT_CHECK_SECONDS,
+                )
+            except TimeoutError:
+                continue
             yield {
                 "event": event.event,
                 "data": event.data,
