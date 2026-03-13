@@ -46,9 +46,23 @@ class AuthRateLimitError extends Error {
   }
 }
 
+function isAuthError(error) {
+  return (
+    error instanceof AuthRequiredError ||
+    error instanceof AuthRateLimitError ||
+    error?.name === "AuthRequiredError" ||
+    error?.name === "AuthRateLimitError"
+  );
+}
+
 const HEALTH_POLL_INTERVAL_MS = 2000;
+const HIDDEN_HEALTH_POLL_INTERVAL_MS = 15000;
 let healthPollTimerId = null;
 let healthPollInFlight = false;
+
+function getHealthPollIntervalMs() {
+  return document.hidden ? HIDDEN_HEALTH_POLL_INTERVAL_MS : HEALTH_POLL_INTERVAL_MS;
+}
 
 function authHeaders() {
   if (!appState.apiKey) {
@@ -69,10 +83,19 @@ function apiFetch(input, init = {}) {
 
 function handleAuthFailure(message = "Authentication failed.") {
   stopHealthPolling();
+  resetPlaybackState();
+  appState.lastExportRequest = null;
   appState.apiKey = null;
   setUiLocked(true);
   setAuthPanelState(true, message, true);
   setStatus(message, true);
+}
+
+function summarizeDiagnostic(detail, fallback) {
+  if (typeof detail !== "string" || !detail.trim()) {
+    return null;
+  }
+  return fallback;
 }
 
 async function buildAuthError(response) {
@@ -131,18 +154,19 @@ export async function submitApiKey(apiKey) {
   appState.apiKey = trimmedKey;
   setAuthPanelState(true, "Validating API key...", false, false);
   try {
-    await loadHealth();
+    await loadHealth({ strictErrors: true });
     setUiLocked(false);
     setAuthPanelState(false);
     setStatus("Authenticated. Ready for synthesis");
     startHealthPolling();
     return true;
   } catch (error) {
-    if (error instanceof AuthRequiredError || error instanceof AuthRateLimitError) {
+    if (isAuthError(error)) {
       handleAuthFailure(error.message || "Authentication failed.");
       return false;
     }
     appState.apiKey = null;
+    setStatus("Unable to reach the backend.", true);
     setAuthPanelState(
       true,
       error.message || "Unable to reach the backend.",
@@ -154,6 +178,8 @@ export async function submitApiKey(apiKey) {
 
 export function clearApiKey() {
   stopHealthPolling();
+  resetPlaybackState();
+  appState.lastExportRequest = null;
   appState.apiKey = null;
   setUiLocked(true);
   setAuthPanelState(true, "Enter the configured API key to use this server.");
@@ -171,7 +197,7 @@ async function pollHealth() {
   try {
     await loadHealth({ quiet: true, includeCapabilities: false });
   } catch (error) {
-    if (error instanceof AuthRequiredError || error instanceof AuthRateLimitError) {
+    if (isAuthError(error)) {
       handleAuthFailure(error.message || "Authentication failed.");
     }
   } finally {
@@ -181,9 +207,10 @@ async function pollHealth() {
 
 function startHealthPolling() {
   stopHealthPolling();
+  const intervalMs = getHealthPollIntervalMs();
   healthPollTimerId = window.setInterval(() => {
     void pollHealth();
-  }, HEALTH_POLL_INTERVAL_MS);
+  }, intervalMs);
 }
 
 function stopHealthPolling() {
@@ -198,6 +225,7 @@ function stopHealthPolling() {
 export async function loadHealth(options = {}) {
   const quiet = options.quiet === true;
   const includeCapabilities = options.includeCapabilities !== false;
+  const strictErrors = options.strictErrors === true;
   const healthResponse = await apiFetch("/api/health");
   if (healthResponse.status === 401 || healthResponse.status === 429) {
     throw await buildAuthError(healthResponse);
@@ -276,10 +304,14 @@ export async function loadHealth(options = {}) {
         ? health.active_provider
         : null;
     const providerFallback = health.provider_fallback === true;
-    const providerError =
-      typeof health.provider_error === "string" ? health.provider_error : null;
-    const runtimeError =
-      typeof health.runtime_error === "string" ? health.runtime_error : null;
+    const providerError = summarizeDiagnostic(
+      health.provider_error,
+      "Provider reported a startup issue. Check server logs.",
+    );
+    const runtimeError = summarizeDiagnostic(
+      health.runtime_error,
+      "Runtime unavailable. Check server logs.",
+    );
     const runtimeActivityState =
       typeof health?.runtime_activity?.state === "string"
         ? health.runtime_activity.state
@@ -325,14 +357,20 @@ export async function loadHealth(options = {}) {
       runtimeActivityState,
     );
     if (runtimeError && !quiet) {
-      setStatus(`Runtime unavailable: ${runtimeError}`, true);
+      setStatus(runtimeError, true);
       return;
     }
     if (!quiet) {
-      setStatus(`Missing runtime files: ${health.missing.join(", ")}`, true);
+      const missingFiles = Array.isArray(health.missing) ? health.missing : [];
+      setStatus(
+        missingFiles.length
+          ? `Missing runtime files: ${missingFiles.join(", ")}`
+          : "Runtime unavailable. Check server setup.",
+        true,
+      );
     }
   } catch (error) {
-    if (error instanceof AuthRequiredError || error instanceof AuthRateLimitError) {
+    if (isAuthError(error)) {
       throw error;
     }
     updateQueueMonitorLayout(null);
@@ -341,8 +379,24 @@ export async function loadHealth(options = {}) {
     if (!quiet) {
       setStatus("Unable to reach the backend.", true);
     }
+    if (strictErrors) {
+      throw error;
+    }
   }
 }
+
+function handleVisibilityChange() {
+  if (appState.authRequired && !appState.apiKey) {
+    stopHealthPolling();
+    return;
+  }
+  startHealthPolling();
+  if (!document.hidden) {
+    void pollHealth();
+  }
+}
+
+document.addEventListener("visibilitychange", handleVisibilityChange);
 
 export async function synthesize(event) {
   event.preventDefault();
@@ -392,10 +446,7 @@ export async function synthesize(event) {
     }
   } catch (error) {
     appState.lastExportRequest = null;
-    if (
-      error instanceof AuthRequiredError ||
-      error instanceof AuthRateLimitError
-    ) {
+    if (isAuthError(error)) {
       handleAuthFailure(error.message || "Authentication failed.");
     } else if (error.name !== "AbortError") {
       setStatus(error.message || "Synthesis failed.", true);
@@ -446,7 +497,7 @@ export async function exportAudio() {
       `Exported ${appState.lastExportRequest.format.toUpperCase()} download.`,
     );
   } catch (error) {
-    if (error instanceof AuthRequiredError || error instanceof AuthRateLimitError) {
+    if (isAuthError(error)) {
       handleAuthFailure(error.message || "Authentication failed.");
     } else {
       setStatus(error.message || "Export failed.", true);

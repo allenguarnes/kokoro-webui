@@ -400,8 +400,9 @@ export function setUiLocked(locked) {
 }
 
 export function setBusy(isBusy) {
-  submitButton.disabled = isBusy;
-  exportButton.disabled = isBusy || !appState.lastExportRequest;
+  const uiLocked = textInput?.disabled === true;
+  submitButton.disabled = isBusy || uiLocked;
+  exportButton.disabled = isBusy || uiLocked || !appState.lastExportRequest;
   if (submitButtonLabel) {
     submitButtonLabel.textContent = isBusy ? "Generating..." : "Play";
   }

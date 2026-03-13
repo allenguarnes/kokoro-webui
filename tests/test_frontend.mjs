@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import os from "node:os";
 import path from "node:path";
+import { cp, mkdtemp, rm } from "node:fs/promises";
 import { URL as NodeURL, pathToFileURL } from "node:url";
 
 class FakeClassList {
@@ -180,8 +182,10 @@ class FakeDocument {
   constructor() {
     this._elementsById = new Map();
     this._queryResults = new Map();
+    this._listeners = new Map();
     this.body = new FakeElement("body", this);
     this.documentElement = new FakeElement("html", this);
+    this.hidden = false;
   }
 
   createElement(tagName) {
@@ -201,7 +205,17 @@ class FakeDocument {
     return this._queryResults.get(selector) ?? [];
   }
 
-  addEventListener() {}
+  addEventListener(type, listener) {
+    const listeners = this._listeners.get(type) ?? [];
+    listeners.push(listener);
+    this._listeners.set(type, listeners);
+  }
+
+  dispatchEvent(event) {
+    const listeners = this._listeners.get(event.type) ?? [];
+    listeners.forEach((listener) => listener.call(this, event));
+    return true;
+  }
 
   registerElement(id, element) {
     element.id = id;
@@ -335,7 +349,7 @@ function installDom() {
   return document;
 }
 
-function installGlobals(document, fetchImpl) {
+function installGlobals(document, fetchImpl, options = {}) {
   globalThis.document = document;
   globalThis.Element = FakeElement;
   globalThis.Event = class Event {
@@ -370,6 +384,7 @@ function installGlobals(document, fetchImpl) {
   };
 
   globalThis.fetch = fetchImpl;
+  globalThis.WebSocket = options.WebSocket ?? class UnsupportedWebSocket {};
   globalThis.URL = {
     createObjectURL() {
       return "blob:fake";
@@ -378,23 +393,42 @@ function installGlobals(document, fetchImpl) {
   };
 }
 
-async function importFrontendModule(relativePath) {
-  const absolutePath = path.resolve(relativePath);
+async function createFrontendSandbox() {
+  const sandboxRoot = await mkdtemp(path.join(os.tmpdir(), "kokoro-frontend-"));
+  const sourceRoot = path.resolve("static/js");
+  const targetRoot = path.join(sandboxRoot, "static", "js");
+  await cp(sourceRoot, targetRoot, { recursive: true });
+  return {
+    importModule(relativePath) {
+      return importFrontendModule(relativePath, sandboxRoot);
+    },
+    cleanup() {
+      return rm(sandboxRoot, { recursive: true, force: true });
+    },
+  };
+}
+
+async function importFrontendModule(relativePath, sandboxRoot) {
+  const absolutePath = sandboxRoot
+    ? path.join(sandboxRoot, relativePath.replace(/^\.\//, ""))
+    : path.resolve(relativePath);
   const url = new NodeURL(
     `${pathToFileURL(absolutePath).href}?t=${Date.now()}-${Math.random()}`,
   );
   return import(url.href);
 }
 
-test("synthesize resets busy state when stream startup fails", async () => {
+test("synthesize resets busy state when stream startup fails", async (t) => {
   const document = installDom();
   const fetchCalls = [];
+  const sandbox = await createFrontendSandbox();
+  t.after(() => sandbox.cleanup());
   installGlobals(document, async (input) => {
     fetchCalls.push(String(input));
     throw new TypeError("Failed to fetch");
   });
 
-  const apiClient = await importFrontendModule("./static/js/api-client.js");
+  const apiClient = await sandbox.importModule("./static/js/api-client.js");
 
   await assert.doesNotReject(
     Promise.race([
@@ -414,9 +448,11 @@ test("synthesize resets busy state when stream startup fails", async () => {
   );
 });
 
-test("loadHealth surfaces 429 detail and avoids capabilities fetch on auth failure", async () => {
+test("loadHealth surfaces 429 detail and avoids capabilities fetch on auth failure", async (t) => {
   const document = installDom();
   const fetchCalls = [];
+  const sandbox = await createFrontendSandbox();
+  t.after(() => sandbox.cleanup());
   installGlobals(document, async (input) => {
     fetchCalls.push(String(input));
     return new Response(
@@ -428,11 +464,194 @@ test("loadHealth surfaces 429 detail and avoids capabilities fetch on auth failu
     );
   });
 
-  const apiClient = await importFrontendModule("./static/js/api-client.js");
+  const apiClient = await sandbox.importModule("./static/js/api-client.js");
 
   await assert.rejects(
     apiClient.loadHealth(),
     /Too many authentication failures\. Try again later\./,
   );
   assert.deepEqual(fetchCalls, ["/api/health"]);
+});
+
+test("submitApiKey keeps the UI locked when backend validation fails", async (t) => {
+  const document = installDom();
+  let requestCount = 0;
+  const sandbox = await createFrontendSandbox();
+  t.after(() => sandbox.cleanup());
+  installGlobals(document, async (input) => {
+    requestCount += 1;
+    if (String(input) === "/api/public-config") {
+      return new Response(JSON.stringify({ auth_required: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    throw new TypeError("Network down");
+  });
+
+  const apiClient = await sandbox.importModule("./static/js/api-client.js");
+
+  await apiClient.initializeAccess();
+
+  const unlocked = await apiClient.submitApiKey("wrong-key");
+
+  assert.equal(unlocked, false);
+  assert.equal(requestCount, 2);
+  assert.equal(document.getElementById("submitButton").disabled, true);
+  assert.equal(document.getElementById("statusText").textContent, "Unable to reach the backend.");
+  assert.equal(document.getElementById("authMessage").textContent, "Network down");
+});
+
+test("synthesize relocks the UI after NDJSON auth failure", async (t) => {
+  const document = installDom();
+  const fetchCalls = [];
+  const sandbox = await createFrontendSandbox();
+  t.after(() => sandbox.cleanup());
+  installGlobals(document, async (input) => {
+    const target = String(input);
+    fetchCalls.push(target);
+    if (target === "/api/public-config") {
+      return new Response(JSON.stringify({ auth_required: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (target === "/api/health") {
+      return new Response(JSON.stringify({ ok: true, gpu: {}, runtime_activity: {} }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (target === "/api/capabilities") {
+      return new Response(
+        JSON.stringify({
+          voices: ["af_heart"],
+          formats: ["wav"],
+          opus_bitrates: ["32k"],
+          wav_sample_rates: ["native"],
+          websocket_streaming: true,
+          pitch_shifting: true,
+          max_pitch_semitones: 6,
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    }
+    return new Response(JSON.stringify({ detail: "Authentication failed." }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+
+  const apiClient = await sandbox.importModule("./static/js/api-client.js");
+
+  await apiClient.initializeAccess();
+  await apiClient.submitApiKey("bad-key");
+
+  await apiClient.synthesize({ preventDefault() {} });
+
+  assert.deepEqual(fetchCalls, [
+    "/api/public-config",
+    "/api/health",
+    "/api/capabilities",
+    "/api/speak-stream",
+  ]);
+  assert.equal(document.getElementById("submitButton").disabled, true);
+  assert.equal(document.getElementById("authPanel").hidden, false);
+  assert.equal(document.getElementById("authMessage").textContent, "Authentication failed.");
+});
+
+test("synthesize relocks the UI after WebSocket token auth throttling", async (t) => {
+  const document = installDom();
+  const fetchCalls = [];
+  const sandbox = await createFrontendSandbox();
+  t.after(() => sandbox.cleanup());
+  class FakeWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.binaryType = "arraybuffer";
+      setTimeout(() => this.onopen?.(), 0);
+    }
+
+    send() {}
+
+    close(code = 1000, reason = "") {
+      setTimeout(() => this.onclose?.({ code, reason }), 0);
+    }
+  }
+
+  installGlobals(
+    document,
+    async () => {
+      return new Response(
+        JSON.stringify({ detail: "Too many authentication failures. Try again later." }),
+        {
+          status: 429,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    },
+    { WebSocket: FakeWebSocket },
+  );
+
+  const apiClient = await sandbox.importModule("./static/js/api-client.js");
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const target = String(input);
+    fetchCalls.push(target);
+    if (target === "/api/public-config") {
+      return new Response(JSON.stringify({ auth_required: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (target === "/api/health") {
+      return new Response(JSON.stringify({ ok: true, gpu: {}, runtime_activity: {} }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (target === "/api/capabilities") {
+      return new Response(
+        JSON.stringify({
+          voices: ["af_heart"],
+          formats: ["wav"],
+          opus_bitrates: ["32k"],
+          wav_sample_rates: ["native"],
+          websocket_streaming: true,
+          pitch_shifting: true,
+          max_pitch_semitones: 6,
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    }
+    return originalFetch(input);
+  };
+
+  await apiClient.initializeAccess();
+  await apiClient.submitApiKey("bad-key");
+  document.getElementById("transport").options[0].selected = false;
+  document.getElementById("transport").options[1].selected = true;
+  document.getElementById("transport").value = "ws";
+
+  await apiClient.synthesize({ preventDefault() {} });
+
+  assert.deepEqual(fetchCalls, [
+    "/api/public-config",
+    "/api/health",
+    "/api/capabilities",
+    "/api/ws-token",
+  ]);
+  assert.equal(document.getElementById("submitButton").disabled, true);
+  assert.equal(document.getElementById("authPanel").hidden, false);
+  assert.equal(
+    document.getElementById("statusText").textContent,
+    "Too many authentication failures. Try again later.",
+  );
 });
