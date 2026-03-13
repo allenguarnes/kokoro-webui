@@ -162,15 +162,27 @@ function buildAuthHeaders() {
   };
 }
 
+async function throwAuthError(response) {
+  const payload = await response.json().catch(() => ({}));
+  const message =
+    payload.detail ||
+    payload?.error?.message ||
+    (response.status === 429
+      ? "Too many authentication failures. Try again later."
+      : "Authentication failed.");
+  const error = new Error(message);
+  error.name =
+    response.status === 429 ? "AuthRateLimitError" : "AuthRequiredError";
+  throw error;
+}
+
 async function issueWebSocketToken() {
   const response = await fetch("/api/ws-token", {
     method: "POST",
     headers: buildAuthHeaders(),
   });
-  if (response.status === 401) {
-    const error = new Error("Authentication failed.");
-    error.name = "AuthRequiredError";
-    throw error;
+  if (response.status === 401 || response.status === 429) {
+    await throwAuthError(response);
   }
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
@@ -206,10 +218,8 @@ export async function readStreamIntoQueue(state, token) {
     signal: appState.streamAbortController.signal,
   });
 
-  if (response.status === 401) {
-    const error = new Error("Authentication failed.");
-    error.name = "AuthRequiredError";
-    throw error;
+  if (response.status === 401 || response.status === 429) {
+    await throwAuthError(response);
   }
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));

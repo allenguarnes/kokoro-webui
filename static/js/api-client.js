@@ -39,6 +39,13 @@ class AuthRequiredError extends Error {
   }
 }
 
+class AuthRateLimitError extends Error {
+  constructor(message = "Too many authentication failures. Try again later.") {
+    super(message);
+    this.name = "AuthRateLimitError";
+  }
+}
+
 const HEALTH_POLL_INTERVAL_MS = 2000;
 let healthPollTimerId = null;
 let healthPollInFlight = false;
@@ -66,6 +73,28 @@ function handleAuthFailure(message = "Authentication failed.") {
   setUiLocked(true);
   setAuthPanelState(true, message, true);
   setStatus(message, true);
+}
+
+async function buildAuthError(response) {
+  const payload = await response.json().catch(() => ({}));
+  const message =
+    payload.detail ||
+    payload?.error?.message ||
+    (response.status === 429
+      ? "Too many authentication failures. Try again later."
+      : "Authentication failed.");
+  if (response.status === 429) {
+    return new AuthRateLimitError(message);
+  }
+  return new AuthRequiredError(message);
+}
+
+function failQueuedPlayback(state, message) {
+  state.streamError = message;
+  if (state.queueWaiter) {
+    state.queueWaiter();
+    state.queueWaiter = null;
+  }
 }
 
 async function loadPublicConfig() {
@@ -109,8 +138,8 @@ export async function submitApiKey(apiKey) {
     startHealthPolling();
     return true;
   } catch (error) {
-    if (error instanceof AuthRequiredError) {
-      handleAuthFailure("Authentication failed.");
+    if (error instanceof AuthRequiredError || error instanceof AuthRateLimitError) {
+      handleAuthFailure(error.message || "Authentication failed.");
       return false;
     }
     appState.apiKey = null;
@@ -142,8 +171,8 @@ async function pollHealth() {
   try {
     await loadHealth({ quiet: true, includeCapabilities: false });
   } catch (error) {
-    if (error instanceof AuthRequiredError) {
-      handleAuthFailure("Authentication failed.");
+    if (error instanceof AuthRequiredError || error instanceof AuthRateLimitError) {
+      handleAuthFailure(error.message || "Authentication failed.");
     }
   } finally {
     healthPollInFlight = false;
@@ -169,18 +198,20 @@ function stopHealthPolling() {
 export async function loadHealth(options = {}) {
   const quiet = options.quiet === true;
   const includeCapabilities = options.includeCapabilities !== false;
-  const [healthResponse, capabilitiesResponse] = await Promise.all([
-    apiFetch("/api/health"),
-    includeCapabilities ? apiFetch("/api/capabilities") : Promise.resolve(null),
-  ]);
-  if (healthResponse.status === 401 || capabilitiesResponse?.status === 401) {
-    throw new AuthRequiredError();
+  const healthResponse = await apiFetch("/api/health");
+  if (healthResponse.status === 401 || healthResponse.status === 429) {
+    throw await buildAuthError(healthResponse);
   }
   try {
     const health = await healthResponse.json();
-    const capabilities = capabilitiesResponse
-      ? await capabilitiesResponse.json()
-      : null;
+    let capabilities = null;
+    if (includeCapabilities) {
+      const capabilitiesResponse = await apiFetch("/api/capabilities");
+      if (capabilitiesResponse.status === 401 || capabilitiesResponse.status === 429) {
+        throw await buildAuthError(capabilitiesResponse);
+      }
+      capabilities = await capabilitiesResponse.json();
+    }
     if (capabilities) {
       populateVoices(capabilities.voices || []);
       if (
@@ -301,7 +332,7 @@ export async function loadHealth(options = {}) {
       setStatus(`Missing runtime files: ${health.missing.join(", ")}`, true);
     }
   } catch (error) {
-    if (error instanceof AuthRequiredError) {
+    if (error instanceof AuthRequiredError || error instanceof AuthRateLimitError) {
       throw error;
     }
     updateQueueMonitorLayout(null);
@@ -347,8 +378,11 @@ export async function synthesize(event) {
       transportInput.value === "ws"
         ? readWebSocketIntoQueue(state, token)
         : readStreamIntoQueue(state, token);
-    await playQueueFromStream(state, token);
-    await readPromise;
+    const guardedReadPromise = readPromise.catch((error) => {
+      failQueuedPlayback(state, error.message || "Synthesis failed.");
+      throw error;
+    });
+    await Promise.all([playQueueFromStream(state, token), guardedReadPromise]);
 
     if (state.streamError) {
       throw new Error(state.streamError);
@@ -358,7 +392,10 @@ export async function synthesize(event) {
     }
   } catch (error) {
     appState.lastExportRequest = null;
-    if (error.name === "AuthRequiredError") {
+    if (
+      error instanceof AuthRequiredError ||
+      error instanceof AuthRateLimitError
+    ) {
       handleAuthFailure(error.message || "Authentication failed.");
     } else if (error.name !== "AbortError") {
       setStatus(error.message || "Synthesis failed.", true);
@@ -388,8 +425,8 @@ export async function exportAudio() {
       body: JSON.stringify(appState.lastExportRequest),
     });
 
-    if (response.status === 401) {
-      throw new AuthRequiredError();
+    if (response.status === 401 || response.status === 429) {
+      throw await buildAuthError(response);
     }
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
@@ -409,7 +446,7 @@ export async function exportAudio() {
       `Exported ${appState.lastExportRequest.format.toUpperCase()} download.`,
     );
   } catch (error) {
-    if (error instanceof AuthRequiredError) {
+    if (error instanceof AuthRequiredError || error instanceof AuthRateLimitError) {
       handleAuthFailure(error.message || "Authentication failed.");
     } else {
       setStatus(error.message || "Export failed.", true);
