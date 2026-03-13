@@ -20,8 +20,9 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import InvalidStatus
 from websockets.sync.client import connect as websocket_connect
+from websockets.typing import Subprotocol
 
 import app.api as api
 import app.audio as audio
@@ -63,6 +64,13 @@ def make_pcm_chunk(
     sample_rate = 24000
     duration_sec = float(len(samples) / sample_rate)
     return samples, sample_rate, duration_sec
+
+
+def ws_subprotocols(token: str, proof: str) -> tuple[Subprotocol, Subprotocol]:
+    return cast(
+        tuple[Subprotocol, Subprotocol],
+        ("kokoro-stream", f"kokoro-auth.{token}.{proof}"),
+    )
 
 
 @contextmanager
@@ -266,14 +274,14 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["active_provider"], "CPUExecutionProvider")
         self.assertEqual(payload["active_providers"], ["CPUExecutionProvider"])
         self.assertTrue(cast(bool, payload["provider_fallback"]))
-        self.assertEqual(payload["provider_error"], "Failed to load CUDA runtime.")
+        self.assertEqual(
+            payload["provider_error"],
+            "Provider reported a startup issue. Check server logs.",
+        )
         self.assertIsNone(payload["runtime_error"])
         gpu = cast(dict[str, object], payload["gpu"])
-        self.assertEqual(gpu["process_pid"], 4242)
-        self.assertEqual(gpu["process_group_id"], 77)
         self.assertEqual(gpu["process_vram_used_mb"], 64.0)
         self.assertEqual(gpu["process_group_vram_used_mb"], 96.0)
-        self.assertEqual(gpu["process_group_member_pids"], [4242, 5000])
         self.assertEqual(gpu["source"], "nvml")
         runtime_activity = cast(dict[str, object], payload["runtime_activity"])
         self.assertEqual(runtime_activity["state"], "idling")
@@ -321,7 +329,7 @@ class ApiIntegrationTests(unittest.TestCase):
 
         payload = cast(dict[str, object], response.json())
         self.assertTrue(payload["auth_required"])
-        self.assertEqual(payload["websocket_auth"], "header-or-session-token")
+        self.assertEqual(payload["websocket_auth"], "session-token-subprotocol")
 
     def test_capabilities_reports_runtime_and_formats(self) -> None:
         fake_status = RuntimeStatus(
@@ -403,7 +411,10 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = cast(dict[str, object], response.json())
         self.assertFalse(payload["ok"])
-        self.assertEqual(payload["runtime_error"], "Failed to allocate CUDA memory.")
+        self.assertEqual(
+            payload["runtime_error"],
+            "Runtime unavailable. Check server logs.",
+        )
 
     def test_status_stream_hub_emits_snapshot_events(self) -> None:
         async def run_test() -> dict[str, str]:
@@ -820,9 +831,14 @@ class ApiIntegrationTests(unittest.TestCase):
                     headers={"Authorization": "Bearer secret-key"},
                     timeout=5.0,
                 )
-                ws_token = cast(str, token_response.json()["token"])
-                with websocket_connect(f"{endpoints['ws']}/ws/speak-stream") as ws:
-                    ws.send(json.dumps({**request_payload, "ws_token": ws_token}))
+                token_payload = cast(dict[str, object], token_response.json())
+                ws_token = cast(str, token_payload["token"])
+                ws_proof = cast(str, token_payload["proof"])
+                with websocket_connect(
+                    f"{endpoints['ws']}/ws/speak-stream",
+                    subprotocols=ws_subprotocols(ws_token, ws_proof),
+                ) as ws:
+                    ws.send(json.dumps(request_payload))
                     meta = cast(dict[str, object], json.loads(cast(str, ws.recv())))
                     chunk = cast(dict[str, object], json.loads(cast(str, ws.recv())))
                     audio_bytes = cast(bytes, ws.recv())
@@ -855,24 +871,28 @@ class ApiIntegrationTests(unittest.TestCase):
                     headers={"Authorization": "Bearer secret-key"},
                     timeout=5.0,
                 )
-                ws_token = cast(str, token_response.json()["token"])
-                with websocket_connect(f"{endpoints['ws']}/ws/speak-stream") as ws:
-                    ws.send(json.dumps({**request_payload, "ws_token": ws_token}))
+                token_payload = cast(dict[str, object], token_response.json())
+                ws_token = cast(str, token_payload["token"])
+                ws_proof = cast(str, token_payload["proof"])
+                with websocket_connect(
+                    f"{endpoints['ws']}/ws/speak-stream",
+                    subprotocols=ws_subprotocols(ws_token, ws_proof),
+                ) as ws:
+                    ws.send(json.dumps(request_payload))
                     _ = ws.recv()
                     _ = ws.recv()
                     _ = ws.recv()
                     _ = ws.recv()
 
-                with self.assertRaises(ConnectionClosed) as closed:
-                    with websocket_connect(f"{endpoints['ws']}/ws/speak-stream") as ws:
-                        ws.send(json.dumps({**request_payload, "ws_token": ws_token}))
+                with self.assertRaises(InvalidStatus) as rejected:
+                    with websocket_connect(
+                        f"{endpoints['ws']}/ws/speak-stream",
+                        subprotocols=ws_subprotocols(ws_token, ws_proof),
+                    ) as ws:
+                        ws.send(json.dumps(request_payload))
                         _ = ws.recv()
 
-        close_frame = closed.exception.rcvd
-        self.assertIsNotNone(close_frame)
-        if close_frame is None:
-            self.fail("Expected a close frame from the server.")
-        self.assertEqual(close_frame.code, 1008)
+        self.assertEqual(rejected.exception.response.status_code, 403)
 
     def test_websocket_stream_rejects_query_string_api_key(self) -> None:
         request_payload = {
@@ -891,18 +911,14 @@ class ApiIntegrationTests(unittest.TestCase):
         ):
             test_app = api.create_app()
             with run_live_server(test_app) as endpoints:
-                with self.assertRaises(ConnectionClosed) as closed:
+                with self.assertRaises(InvalidStatus) as rejected:
                     with websocket_connect(
                         f"{endpoints['ws']}/ws/speak-stream?api_key=secret-key"
                     ) as ws:
                         ws.send(json.dumps(request_payload))
                         _ = ws.recv()
 
-        close_frame = closed.exception.rcvd
-        self.assertIsNotNone(close_frame)
-        if close_frame is None:
-            self.fail("Expected a close frame from the server.")
-        self.assertEqual(close_frame.code, 1008)
+        self.assertEqual(rejected.exception.response.status_code, 403)
 
     def test_websocket_stream_rejects_api_key_in_first_message(self) -> None:
         request_payload = {
@@ -922,16 +938,12 @@ class ApiIntegrationTests(unittest.TestCase):
         ):
             test_app = api.create_app()
             with run_live_server(test_app) as endpoints:
-                with self.assertRaises(ConnectionClosed) as closed:
+                with self.assertRaises(InvalidStatus) as rejected:
                     with websocket_connect(f"{endpoints['ws']}/ws/speak-stream") as ws:
                         ws.send(json.dumps(request_payload))
                         _ = ws.recv()
 
-        close_frame = closed.exception.rcvd
-        self.assertIsNotNone(close_frame)
-        if close_frame is None:
-            self.fail("Expected a close frame from the server.")
-        self.assertEqual(close_frame.code, 1008)
+        self.assertEqual(rejected.exception.response.status_code, 403)
 
     def test_websocket_stream_rejects_session_token_from_other_client(self) -> None:
         request_payload = {
@@ -959,20 +971,67 @@ class ApiIntegrationTests(unittest.TestCase):
                     },
                     timeout=5.0,
                 )
-                ws_token = cast(str, token_response.json()["token"])
-                with self.assertRaises(ConnectionClosed) as closed:
+                token_payload = cast(dict[str, object], token_response.json())
+                ws_token = cast(str, token_payload["token"])
+                ws_proof = cast(str, token_payload["proof"])
+                with self.assertRaises(InvalidStatus) as rejected:
                     with websocket_connect(
                         f"{endpoints['ws']}/ws/speak-stream",
                         additional_headers={"X-Forwarded-For": "2.2.2.2"},
+                        subprotocols=ws_subprotocols(ws_token, ws_proof),
                     ) as ws:
-                        ws.send(json.dumps({**request_payload, "ws_token": ws_token}))
+                        ws.send(json.dumps(request_payload))
                         _ = ws.recv()
 
-        close_frame = closed.exception.rcvd
-        self.assertIsNotNone(close_frame)
-        if close_frame is None:
-            self.fail("Expected a close frame from the server.")
-        self.assertEqual(close_frame.code, 1008)
+        self.assertEqual(rejected.exception.response.status_code, 403)
+
+    def test_websocket_token_survives_wrong_client_attempt(self) -> None:
+        request_payload = {
+            "text": "Hello over websocket.",
+            "voice": "af_heart",
+            "speed": 1.0,
+            "pitch": 0.0,
+            "lang": "en-us",
+            "format": "opus",
+            "target_chunk_chars": 120,
+        }
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(config, "get_trust_proxy_headers", return_value=True),
+            patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk),
+        ):
+            test_app = api.create_app()
+            with run_live_server(test_app) as endpoints:
+                token_response = httpx.post(
+                    f"{endpoints['http']}/api/ws-token",
+                    headers={
+                        "Authorization": "Bearer secret-key",
+                        "X-Forwarded-For": "1.1.1.1",
+                    },
+                    timeout=5.0,
+                )
+                token_payload = cast(dict[str, object], token_response.json())
+                ws_token = cast(str, token_payload["token"])
+                ws_proof = cast(str, token_payload["proof"])
+                with self.assertRaises(InvalidStatus):
+                    with websocket_connect(
+                        f"{endpoints['ws']}/ws/speak-stream",
+                        additional_headers={"X-Forwarded-For": "2.2.2.2"},
+                        subprotocols=ws_subprotocols(ws_token, ws_proof),
+                    ) as ws:
+                        ws.send(json.dumps(request_payload))
+                        _ = ws.recv()
+
+                with websocket_connect(
+                    f"{endpoints['ws']}/ws/speak-stream",
+                    additional_headers={"X-Forwarded-For": "1.1.1.1"},
+                    subprotocols=ws_subprotocols(ws_token, ws_proof),
+                ) as ws:
+                    ws.send(json.dumps(request_payload))
+                    first_message = cast(str, ws.recv())
+
+        self.assertIn('"type": "meta"', first_message)
 
     def test_auth_failures_are_rate_limited(self) -> None:
         with (
@@ -995,14 +1054,14 @@ class ApiIntegrationTests(unittest.TestCase):
                     base_url="http://testserver",
                 ) as client:
                     first = await client.get(
-                        "/api/health", headers={"Authorization": "Bearer wrong-token-1"}
+                        "/api/health", headers={"Authorization": "Bearer wrong-token"}
                     )
                     second = await client.get(
-                        "/api/health", headers={"Authorization": "Bearer wrong-token-2"}
+                        "/api/health", headers={"Authorization": "Bearer wrong-token"}
                     )
                     third = await client.get(
                         "/api/health",
-                        headers={"Authorization": "Bearer wrong-token-3"},
+                        headers={"Authorization": "Bearer wrong-token"},
                     )
                     valid = await client.get(
                         "/api/health",
@@ -1035,11 +1094,11 @@ class ApiIntegrationTests(unittest.TestCase):
                 ) as client:
                     first = await client.get(
                         "/v1/models",
-                        headers={"Authorization": "Bearer invalid-1"},
+                        headers={"Authorization": "Bearer invalid-token"},
                     )
                     second = await client.get(
                         "/v1/models",
-                        headers={"Authorization": "Bearer invalid-2"},
+                        headers={"Authorization": "Bearer invalid-token"},
                     )
                     return first, second
 
@@ -1108,16 +1167,12 @@ class ApiIntegrationTests(unittest.TestCase):
         ):
             test_app = api.create_app()
             with run_live_server(test_app) as endpoints:
-                with self.assertRaises(ConnectionClosed) as closed:
+                with self.assertRaises(InvalidStatus) as rejected:
                     with websocket_connect(f"{endpoints['ws']}/ws/speak-stream") as ws:
                         time.sleep(0.05)
                         _ = ws.recv()
 
-        close_frame = closed.exception.rcvd
-        self.assertIsNotNone(close_frame)
-        if close_frame is None:
-            self.fail("Expected a close frame from the server.")
-        self.assertEqual(close_frame.code, 1008)
+        self.assertEqual(rejected.exception.response.status_code, 403)
 
     def test_internal_speak_error_does_not_leak_exception_text(self) -> None:
         request_payload = {

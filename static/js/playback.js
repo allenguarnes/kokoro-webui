@@ -19,6 +19,8 @@ import {
   setStatus,
 } from "./ui.js";
 
+const WS_TOKEN_REQUEST_TIMEOUT_MS = 8000;
+
 function decodeBase64ToBytes(base64Text) {
   const binary = atob(base64Text);
   const bytes = new Uint8Array(binary.length);
@@ -95,6 +97,10 @@ export function resetPlaybackState() {
   if (appState.streamAbortController) {
     appState.streamAbortController.abort();
     appState.streamAbortController = null;
+  }
+  if (appState.wsTokenAbortController) {
+    appState.wsTokenAbortController.abort();
+    appState.wsTokenAbortController = null;
   }
   if (appState.activeSocket) {
     appState.activeSocket.close(1000, "reset");
@@ -177,9 +183,21 @@ async function throwAuthError(response) {
 }
 
 async function issueWebSocketToken() {
+  appState.wsTokenAbortController?.abort();
+  const abortController = new AbortController();
+  appState.wsTokenAbortController = abortController;
+  const timeoutId = window.setTimeout(() => {
+    abortController.abort(new Error("WebSocket token request timed out."));
+  }, WS_TOKEN_REQUEST_TIMEOUT_MS);
   const response = await fetch("/api/ws-token", {
     method: "POST",
     headers: buildAuthHeaders(),
+    signal: abortController.signal,
+  }).finally(() => {
+    window.clearTimeout(timeoutId);
+    if (appState.wsTokenAbortController === abortController) {
+      appState.wsTokenAbortController = null;
+    }
   });
   if (response.status === 401 || response.status === 429) {
     await throwAuthError(response);
@@ -189,7 +207,10 @@ async function issueWebSocketToken() {
     throw new Error(payload.detail || "Unable to issue WebSocket token.");
   }
   const payload = await response.json();
-  return payload.token;
+  return {
+    token: payload.token,
+    proof: payload.proof,
+  };
 }
 
 async function waitForQueue(state, token) {
@@ -288,100 +309,114 @@ export async function readStreamIntoQueue(state, token) {
 
 export function readWebSocketIntoQueue(state, token) {
   return new Promise((resolve, reject) => {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/ws/speak-stream`;
-    const socket = new WebSocket(wsUrl);
-    socket.binaryType = "arraybuffer";
-    appState.activeSocket = socket;
-
-    socket.onopen = async () => {
+    void (async () => {
       try {
         const payload = buildSynthesisPayload();
+        let wsAuth = null;
         if (appState.authRequired) {
-          payload.ws_token = await issueWebSocketToken();
+          wsAuth = await issueWebSocketToken();
         }
-        socket.send(JSON.stringify(payload));
+        if (token !== appState.playbackToken) {
+          resolve();
+          return;
+        }
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const wsUrl = `${protocol}//${window.location.host}/ws/speak-stream`;
+        const subprotocols = appState.authRequired
+          ? ["kokoro-stream", `kokoro-auth.${wsAuth.token}.${wsAuth.proof}`]
+          : ["kokoro-stream"];
+        const socket = new WebSocket(wsUrl, subprotocols);
+        socket.binaryType = "arraybuffer";
+        appState.activeSocket = socket;
+
+        socket.onopen = () => {
+          try {
+            socket.send(JSON.stringify(payload));
+          } catch (error) {
+            socket.close(1000, "ws-send-failed");
+            reject(error);
+          }
+        };
+
+        socket.onmessage = (event) => {
+          if (token !== appState.playbackToken || !appState.chunkState) {
+            return;
+          }
+          if (typeof event.data === "string") {
+            const message = JSON.parse(event.data);
+            if (message.type === "meta") {
+              state.totalChunks = message.total_chunks;
+              chunkProgress.textContent = `0 / ${state.totalChunks}`;
+              setStatus(
+                `Chunk plan ready with ${state.totalChunks} sentence-safe chunks${
+                  message.pitch !== 0
+                    ? ` at ${formatSignedSemitones(Number(message.pitch))}`
+                    : ""
+                }.`,
+              );
+            } else if (message.type === "chunk") {
+              state.pendingChunkMeta = message;
+            } else if (message.type === "error") {
+              state.streamError = message.detail || "WebSocket streaming failed.";
+              notifyQueue(state);
+            } else if (message.type === "done") {
+              state.streamDone = true;
+              notifyQueue(state);
+            }
+            return;
+          }
+
+          if (!(event.data instanceof ArrayBuffer) || !state.pendingChunkMeta) {
+            state.streamError =
+              "WebSocket stream lost chunk metadata before audio bytes arrived.";
+            notifyQueue(state);
+            return;
+          }
+
+          const chunkMeta = state.pendingChunkMeta;
+          state.pendingChunkMeta = null;
+          state.queue.push(
+            createQueueEntry(chunkMeta, createPlaybackBlob(chunkMeta, event.data)),
+          );
+          notifyQueue(state);
+        };
+
+        socket.onerror = () => {
+          reject(new Error("WebSocket transport failed."));
+        };
+
+        socket.onclose = (event) => {
+          if (
+            token === appState.playbackToken &&
+            appState.chunkState &&
+            !state.streamDone &&
+            !state.streamError &&
+            event.code !== 1000
+          ) {
+            state.streamError =
+              event.reason ||
+              (event.code === 1008
+                ? "Authentication failed."
+                : "WebSocket streaming failed.");
+            notifyQueue(state);
+          }
+          if (
+            token === appState.playbackToken &&
+            appState.chunkState &&
+            !state.streamDone
+          ) {
+            state.streamDone = true;
+            notifyQueue(state);
+          }
+          if (appState.activeSocket === socket) {
+            appState.activeSocket = null;
+          }
+          resolve();
+        };
       } catch (error) {
-        socket.close(1000, "ws-token-failed");
         reject(error);
       }
-    };
-
-    socket.onmessage = (event) => {
-      if (token !== appState.playbackToken || !appState.chunkState) {
-        return;
-      }
-      if (typeof event.data === "string") {
-        const message = JSON.parse(event.data);
-        if (message.type === "meta") {
-          state.totalChunks = message.total_chunks;
-          chunkProgress.textContent = `0 / ${state.totalChunks}`;
-          setStatus(
-            `Chunk plan ready with ${state.totalChunks} sentence-safe chunks${
-              message.pitch !== 0
-                ? ` at ${formatSignedSemitones(Number(message.pitch))}`
-                : ""
-            }.`,
-          );
-        } else if (message.type === "chunk") {
-          state.pendingChunkMeta = message;
-        } else if (message.type === "error") {
-          state.streamError = message.detail || "WebSocket streaming failed.";
-          notifyQueue(state);
-        } else if (message.type === "done") {
-          state.streamDone = true;
-          notifyQueue(state);
-        }
-        return;
-      }
-
-      if (!(event.data instanceof ArrayBuffer) || !state.pendingChunkMeta) {
-        state.streamError =
-          "WebSocket stream lost chunk metadata before audio bytes arrived.";
-        notifyQueue(state);
-        return;
-      }
-
-      const chunkMeta = state.pendingChunkMeta;
-      state.pendingChunkMeta = null;
-      state.queue.push(
-        createQueueEntry(chunkMeta, createPlaybackBlob(chunkMeta, event.data)),
-      );
-      notifyQueue(state);
-    };
-
-    socket.onerror = () => {
-      reject(new Error("WebSocket transport failed."));
-    };
-
-    socket.onclose = (event) => {
-      if (
-        token === appState.playbackToken &&
-        appState.chunkState &&
-        !state.streamDone &&
-        !state.streamError &&
-        event.code !== 1000
-      ) {
-        state.streamError =
-          event.reason ||
-          (event.code === 1008
-            ? "Authentication failed."
-            : "WebSocket streaming failed.");
-        notifyQueue(state);
-      }
-      if (
-        token === appState.playbackToken &&
-        appState.chunkState &&
-        !state.streamDone
-      ) {
-        state.streamDone = true;
-        notifyQueue(state);
-      }
-      if (appState.activeSocket === socket) {
-        appState.activeSocket = null;
-      }
-      resolve();
-    };
+    })();
   });
 }
 

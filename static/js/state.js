@@ -4,13 +4,17 @@ export const appState = {
   tabId:
     globalThis.crypto?.randomUUID?.() ||
     `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+  statusMonitoringPromise: null,
+  statusMonitoringRestartRequested: false,
   statusStreamAbortController: null,
+  wsTokenAbortController: null,
   statusStreamReconnectTimerId: null,
   statusStreamReconnectAttempts: 0,
   statusStreamScopeId: null,
   statusBroadcastChannel: null,
   statusLeaderHeartbeatTimerId: null,
   statusLeaderCheckTimerId: null,
+  statusLeaderLockRelease: null,
   statusLeaderTabId: null,
   statusIsLeader: false,
   lastStatusSnapshot: null,

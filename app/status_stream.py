@@ -27,9 +27,11 @@ class StatusStreamHub(Protocol):
 
     def request_refresh(self) -> None: ...
 
-    async def wait_for_refresh(self, timeout_seconds: float) -> None: ...
+    async def wait_for_refresh(self, timeout_seconds: float) -> bool: ...
 
     async def publish_snapshot(self, snapshot: dict[str, object]) -> bool: ...
+
+    def prime_snapshot(self, snapshot: dict[str, object]) -> bool: ...
 
     def subscribe(self) -> asyncio.Queue[StatusStreamEvent]: ...
 
@@ -49,13 +51,14 @@ class InMemoryStatusStreamHub:
     def request_refresh(self) -> None:
         self._refresh_event.set()
 
-    async def wait_for_refresh(self, timeout_seconds: float) -> None:
+    async def wait_for_refresh(self, timeout_seconds: float) -> bool:
         try:
             await asyncio.wait_for(self._refresh_event.wait(), timeout=timeout_seconds)
         except TimeoutError:
-            return
+            return False
         finally:
             self._refresh_event.clear()
+        return True
 
     async def publish_snapshot(self, snapshot: dict[str, object]) -> bool:
         serialized = json.dumps(snapshot, separators=(",", ":"), sort_keys=True)
@@ -78,6 +81,14 @@ class InMemoryStatusStreamHub:
                 stale_queues.append(queue)
         for queue in stale_queues:
             self._subscribers.discard(queue)
+        return True
+
+    def prime_snapshot(self, snapshot: dict[str, object]) -> bool:
+        serialized = json.dumps(snapshot, separators=(",", ":"), sort_keys=True)
+        if serialized == self._last_serialized_snapshot:
+            return False
+        self._last_serialized_snapshot = serialized
+        self._next_event_id += 1
         return True
 
     def subscribe(self) -> asyncio.Queue[StatusStreamEvent]:

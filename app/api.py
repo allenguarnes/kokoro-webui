@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import hmac
 import io
 import json
@@ -93,9 +94,32 @@ def create_app() -> FastAPI:
     )
     last_synthesis_activity_at = time.monotonic()
     status_stream_hub = create_status_stream_hub()
-    status_stream_poll_interval_sec = 2.0
+    status_stream_poll_interval_sec = 15.0
+    status_request_cache_seconds = 1.0
+    public_status_scope_id = f"public-{secrets.token_urlsafe(12)}"
+    auth_status_scope_id = f"auth-{secrets.token_urlsafe(12)}"
+    status_snapshot_state: dict[str, object] = {
+        "payload": None,
+        "built_at": 0.0,
+        "dirty": True,
+    }
 
-    def build_health_payload() -> dict[str, object]:
+    def build_health_payload(
+        *, force: bool = False, max_age_seconds: float | None = None
+    ) -> dict[str, object]:
+        cached_health_payload = cast(
+            dict[str, object] | None, status_snapshot_state["payload"]
+        )
+        cache_age_seconds = time.monotonic() - cast(
+            float, status_snapshot_state["built_at"]
+        )
+        if (
+            not force
+            and cached_health_payload is not None
+            and status_snapshot_state["dirty"] is False
+            and (max_age_seconds is None or cache_age_seconds <= max_age_seconds)
+        ):
+            return cached_health_payload
         missing: list[str] = []
         if not runtime.kokoro_runtime_available():
             missing.append("kokoro-onnx")
@@ -113,35 +137,75 @@ def create_app() -> FastAPI:
         gpu_usage = runtime.get_current_process_gpu_usage(
             active_provider=active_provider
         )
-        return {
+        cached_health_payload = {
             "ok": not missing and runtime_status.runtime_error is None,
             "missing": missing,
             "active_provider": active_provider,
             "active_providers": runtime_status.active_providers,
             "provider_fallback": runtime_status.provider_fallback,
-            "provider_error": runtime_status.provider_error,
-            "runtime_error": runtime_status.runtime_error,
+            "provider_error": summarize_runtime_diagnostic(
+                runtime_status.provider_error,
+                "Provider reported a startup issue. Check server logs.",
+            ),
+            "runtime_error": summarize_runtime_diagnostic(
+                runtime_status.runtime_error,
+                "Runtime unavailable. Check server logs.",
+            ),
+            "status_stream_scope": auth_status_scope_id
+            if config.get_require_auth()
+            else public_status_scope_id,
             "gpu": {
-                "process_pid": gpu_usage.pid,
-                "process_group_id": gpu_usage.process_group_id,
                 "available": gpu_usage.available,
                 "process_vram_used_bytes": gpu_usage.used_bytes,
                 "process_vram_used_mb": gpu_usage.used_megabytes,
                 "process_group_vram_used_bytes": gpu_usage.group_used_bytes,
                 "process_group_vram_used_mb": gpu_usage.group_used_megabytes,
-                "process_group_member_pids": gpu_usage.group_member_pids,
                 "source": gpu_usage.source,
-                "error": gpu_usage.error,
+                "error": summarize_runtime_diagnostic(
+                    gpu_usage.error,
+                    "GPU metrics unavailable. Check server logs.",
+                ),
             },
             "runtime_activity": runtime_activity_payload(),
             "queue": queue_payload(),
         }
+        status_snapshot_state["payload"] = cached_health_payload
+        status_snapshot_state["built_at"] = time.monotonic()
+        status_snapshot_state["dirty"] = False
+        return cached_health_payload
+
+    def request_status_refresh() -> None:
+        status_snapshot_state["dirty"] = True
+        status_stream_hub.request_refresh()
+
+    def summarize_runtime_diagnostic(
+        detail: str | None, fallback: str | None
+    ) -> str | None:
+        if not detail:
+            return None
+        return fallback
 
     async def status_stream_publish_loop(stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
-            if status_stream_hub.subscriber_count() > 0:
-                await status_stream_hub.publish_snapshot(build_health_payload())
-            await status_stream_hub.wait_for_refresh(status_stream_poll_interval_sec)
+            cached_health_payload = cast(
+                dict[str, object] | None, status_snapshot_state["payload"]
+            )
+            if status_stream_hub.subscriber_count() > 0 and (
+                status_snapshot_state["dirty"] is True
+                or cached_health_payload is None
+                or time.monotonic() - cast(float, status_snapshot_state["built_at"])
+                >= status_stream_poll_interval_sec
+            ):
+                await status_stream_hub.publish_snapshot(
+                    build_health_payload(
+                        max_age_seconds=status_stream_poll_interval_sec
+                    )
+                )
+            refresh_requested = await status_stream_hub.wait_for_refresh(
+                status_stream_poll_interval_sec
+            )
+            if refresh_requested:
+                status_snapshot_state["dirty"] = True
 
     async def maybe_unload_runtime_for_idle() -> None:
         nonlocal last_synthesis_activity_at
@@ -157,7 +221,7 @@ def create_app() -> FastAPI:
             return
         runtime.clear_runtime_caches()
         last_synthesis_activity_at = time.monotonic()
-        status_stream_hub.request_refresh()
+        request_status_refresh()
 
     async def runtime_idle_maintenance_loop(stop_event: asyncio.Event) -> None:
         if runtime_idle_unload_seconds <= 0:
@@ -187,7 +251,7 @@ def create_app() -> FastAPI:
         finally:
             idle_stop_event.set()
             status_stop_event.set()
-            status_stream_hub.request_refresh()
+            request_status_refresh()
             if idle_task is not None:
                 await idle_task
             await status_task
@@ -206,13 +270,14 @@ def create_app() -> FastAPI:
     auth_failures: dict[str, list[float]] = {}
     auth_failures_lock = threading.Lock()
     auth_failures_tick = 0
-    ws_session_tokens: dict[str, tuple[float, str]] = {}
+    auth_failure_source_limit = max(auth_failure_limit + 1, 2)
+    ws_session_tokens: dict[str, tuple[float, str, str]] = {}
     ws_session_tokens_lock = threading.Lock()
 
     def prune_ws_session_tokens(now: float) -> None:
         if not ws_session_tokens:
             return
-        for token, (expires_at, _) in list(ws_session_tokens.items()):
+        for token, (expires_at, _, _) in list(ws_session_tokens.items()):
             if expires_at <= now:
                 ws_session_tokens.pop(token, None)
 
@@ -228,26 +293,41 @@ def create_app() -> FastAPI:
         for token, _ in oldest:
             ws_session_tokens.pop(token, None)
 
-    def issue_ws_session_token(client_id: str) -> tuple[str, int]:
+    def issue_ws_session_token(client_id: str) -> tuple[str, str, int]:
         now = time.monotonic()
         token = secrets.token_urlsafe(24)
+        proof = secrets.token_urlsafe(16)
         expires_in = max(1, int(ws_session_token_ttl_sec))
         with ws_session_tokens_lock:
-            ws_session_tokens[token] = (now + ws_session_token_ttl_sec, client_id)
+            ws_session_tokens[token] = (
+                now + ws_session_token_ttl_sec,
+                client_id,
+                proof,
+            )
             compact_ws_session_tokens(now)
-        return token, expires_in
+        return token, proof, expires_in
 
-    def consume_ws_session_token(candidate: str | None, client_id: str) -> bool:
+    def consume_ws_session_token(
+        candidate: str | None, client_id: str, proof: str | None
+    ) -> bool:
         if not candidate:
             return False
         now = time.monotonic()
         with ws_session_tokens_lock:
             compact_ws_session_tokens(now)
-            token_entry = ws_session_tokens.pop(candidate, None)
-        if token_entry is None:
-            return False
-        expires_at, bound_client_id = token_entry
-        return expires_at > now and hmac.compare_digest(bound_client_id, client_id)
+            token_entry = ws_session_tokens.get(candidate)
+            if token_entry is None:
+                return False
+            expires_at, bound_client_id, bound_proof = token_entry
+            if expires_at <= now:
+                ws_session_tokens.pop(candidate, None)
+                return False
+            if not hmac.compare_digest(bound_client_id, client_id):
+                return False
+            if not proof or not hmac.compare_digest(bound_proof, proof):
+                return False
+            ws_session_tokens.pop(candidate, None)
+            return True
 
     def is_valid_api_key(candidate: str | None) -> bool:
         if not require_auth:
@@ -283,8 +363,15 @@ def create_app() -> FastAPI:
             return real_ip
         return None
 
-    def auth_bucket_id(source_id: str) -> str:
-        return source_id
+    def auth_bucket_id(source_id: str, credential_hint: str | None = None) -> str:
+        cleaned_hint = (credential_hint or "").strip()
+        if not cleaned_hint:
+            return f"{source_id}:source"
+        digest = hashlib.sha256(cleaned_hint.encode("utf-8")).hexdigest()[:16]
+        return f"{source_id}:{digest}"
+
+    def auth_source_bucket_id(source_id: str) -> str:
+        return f"{source_id}:source"
 
     def compact_auth_failures(now: float) -> None:
         if not auth_failures:
@@ -362,12 +449,21 @@ def create_app() -> FastAPI:
     def ensure_http_auth(request: Request) -> None:
         candidate = extract_http_api_key(request)
         client_id = extract_http_client_id(request)
-        bucket_id = auth_bucket_id(client_id)
+        bucket_id = auth_bucket_id(client_id, candidate)
+        source_bucket_id = auth_source_bucket_id(client_id)
         if is_valid_api_key(candidate):
             clear_auth_failures(bucket_id)
+            clear_auth_failures(source_bucket_id)
             return
-        failure_count = record_auth_failure(bucket_id)
-        if auth_failure_throttled(failure_count):
+        credential_failure_count = record_auth_failure(bucket_id)
+        source_failure_count = (
+            credential_failure_count
+            if bucket_id == source_bucket_id
+            else record_auth_failure(source_bucket_id)
+        )
+        if auth_failure_throttled(credential_failure_count) or (
+            auth_failure_limit > 0 and source_failure_count > auth_failure_source_limit
+        ):
             raise http_rate_limit_exception()
         raise http_auth_exception()
 
@@ -393,12 +489,21 @@ def create_app() -> FastAPI:
     def openai_auth_error_for_request(request: Request) -> JSONResponse | None:
         candidate = extract_http_api_key(request)
         client_id = extract_http_client_id(request)
-        bucket_id = auth_bucket_id(client_id)
+        bucket_id = auth_bucket_id(client_id, candidate)
+        source_bucket_id = auth_source_bucket_id(client_id)
         if is_valid_api_key(candidate):
             clear_auth_failures(bucket_id)
+            clear_auth_failures(source_bucket_id)
             return None
-        failure_count = record_auth_failure(bucket_id)
-        if auth_failure_throttled(failure_count):
+        credential_failure_count = record_auth_failure(bucket_id)
+        source_failure_count = (
+            credential_failure_count
+            if bucket_id == source_bucket_id
+            else record_auth_failure(source_bucket_id)
+        )
+        if auth_failure_throttled(credential_failure_count) or (
+            auth_failure_limit > 0 and source_failure_count > auth_failure_source_limit
+        ):
             return openai_auth_error_response(429)
         return openai_auth_error_response(401)
 
@@ -420,6 +525,30 @@ def create_app() -> FastAPI:
         cleaned = message_token.strip()
         return cleaned or None
 
+    def extract_websocket_session_proof(message_payload: object) -> str | None:
+        if not isinstance(message_payload, dict):
+            return None
+        message_map = cast(dict[str, object], message_payload)
+        message_proof = message_map.get("ws_proof")
+        if not isinstance(message_proof, str):
+            return None
+        cleaned = message_proof.strip()
+        return cleaned or None
+
+    def extract_websocket_offered_session_auth(
+        websocket: WebSocket,
+    ) -> tuple[str | None, str | None]:
+        offered_protocols = websocket.headers.get("sec-websocket-protocol", "")
+        for raw_protocol in offered_protocols.split(","):
+            protocol = raw_protocol.strip()
+            if not protocol.startswith("kokoro-auth."):
+                continue
+            _, token, proof = (protocol.split(".", 2) + [None, None])[:3]
+            cleaned_token = token.strip() if isinstance(token, str) else ""
+            cleaned_proof = proof.strip() if isinstance(proof, str) else ""
+            return cleaned_token or None, cleaned_proof or None
+        return None, None
+
     def extract_websocket_client_id(websocket: WebSocket) -> str:
         forwarded_host = get_forwarded_host(websocket.headers)
         return auth_identifier_from_host(
@@ -431,17 +560,29 @@ def create_app() -> FastAPI:
         websocket: WebSocket, message_payload: object
     ) -> str | None:
         client_id = extract_websocket_client_id(websocket)
+        ws_token: str | None = None
+        ws_proof: str | None = None
         if require_auth:
             ws_token = extract_websocket_session_token(message_payload)
-            if consume_ws_session_token(ws_token, client_id):
+            ws_proof = extract_websocket_session_proof(message_payload)
+            if consume_ws_session_token(ws_token, client_id, ws_proof):
                 return None
         candidate = extract_websocket_api_key(websocket)
-        bucket_id = auth_bucket_id(client_id)
+        bucket_id = auth_bucket_id(client_id, ws_token or candidate)
+        source_bucket_id = auth_source_bucket_id(client_id)
         if is_valid_api_key(candidate):
             clear_auth_failures(bucket_id)
+            clear_auth_failures(source_bucket_id)
             return None
-        failure_count = record_auth_failure(bucket_id)
-        if auth_failure_throttled(failure_count):
+        credential_failure_count = record_auth_failure(bucket_id)
+        source_failure_count = (
+            credential_failure_count
+            if bucket_id == source_bucket_id
+            else record_auth_failure(source_bucket_id)
+        )
+        if auth_failure_throttled(credential_failure_count) or (
+            auth_failure_limit > 0 and source_failure_count > auth_failure_source_limit
+        ):
             return "Too many authentication failures. Try again later."
         return "Authentication failed."
 
@@ -532,7 +673,7 @@ def create_app() -> FastAPI:
             return await synthesis_scheduler.run_interactive(function, *args, **kwargs)
         finally:
             last_synthesis_activity_at = time.monotonic()
-            status_stream_hub.request_refresh()
+            request_status_refresh()
 
     async def run_stream_synthesis_task(
         function: Callable[P, T],
@@ -544,7 +685,7 @@ def create_app() -> FastAPI:
             return await synthesis_scheduler.run_stream(function, *args, **kwargs)
         finally:
             last_synthesis_activity_at = time.monotonic()
-            status_stream_hub.request_refresh()
+            request_status_refresh()
 
     async def synthesize_chunk_async(
         payload: SynthesisRequest, text: str
@@ -585,7 +726,7 @@ def create_app() -> FastAPI:
                 "auth_required": require_auth,
                 "auth_scheme": "bearer" if require_auth else "none",
                 "websocket_auth": (
-                    "header-or-session-token" if require_auth else "none"
+                    "session-token-subprotocol" if require_auth else "none"
                 ),
             }
         )
@@ -593,10 +734,13 @@ def create_app() -> FastAPI:
     @app.post("/api/ws-token")
     async def issue_websocket_token(request: Request) -> JSONResponse:
         ensure_http_auth(request)
-        token, expires_in = issue_ws_session_token(extract_http_client_id(request))
+        token, proof, expires_in = issue_ws_session_token(
+            extract_http_client_id(request)
+        )
         return JSONResponse(
             {
                 "token": token,
+                "proof": proof,
                 "token_type": "ws",
                 "expires_in": expires_in,
             }
@@ -605,12 +749,16 @@ def create_app() -> FastAPI:
     @app.get("/api/health")
     async def health(request: Request) -> JSONResponse:
         ensure_http_auth(request)
-        return JSONResponse(build_health_payload())
+        return JSONResponse(
+            build_health_payload(max_age_seconds=status_request_cache_seconds)
+        )
 
     @app.get("/api/health/stream")
     async def health_stream(request: Request) -> EventSourceResponse:
         ensure_http_auth(request)
-        await status_stream_hub.publish_snapshot(build_health_payload())
+        _ = status_stream_hub.prime_snapshot(
+            build_health_payload(max_age_seconds=status_request_cache_seconds)
+        )
         return EventSourceResponse(
             iter_status_events(
                 status_stream_hub,
@@ -631,8 +779,6 @@ def create_app() -> FastAPI:
         available_formats = config.get_available_formats()
         return JSONResponse(
             {
-                "model_path": str(config.MODEL_PATH),
-                "voices_path": str(config.VOICES_PATH),
                 "voices": runtime.load_voice_names(),
                 "formats": available_formats,
                 "opus_bitrates": config.OPUS_BITRATES,
@@ -645,8 +791,14 @@ def create_app() -> FastAPI:
                 else None,
                 "active_providers": runtime_status.active_providers,
                 "provider_fallback": runtime_status.provider_fallback,
-                "provider_error": runtime_status.provider_error,
-                "runtime_error": runtime_status.runtime_error,
+                "provider_error": summarize_runtime_diagnostic(
+                    runtime_status.provider_error,
+                    "Provider reported a startup issue. Check server logs.",
+                ),
+                "runtime_error": summarize_runtime_diagnostic(
+                    runtime_status.runtime_error,
+                    "Runtime unavailable. Check server logs.",
+                ),
                 "pitch_shifting": audio.ffmpeg_supports_rubberband(),
                 "synthesis_workers": synthesis_workers,
                 "synthesis_queue_limit": synthesis_queue_limit,
@@ -964,21 +1116,53 @@ def create_app() -> FastAPI:
 
     @app.websocket("/ws/speak-stream")
     async def ws_speak_stream(websocket: WebSocket) -> None:
-        await websocket.accept()
+        selected_subprotocol = None
+        offered_protocols = websocket.headers.get("sec-websocket-protocol", "")
+        if any(
+            protocol.strip() == "kokoro-stream"
+            for protocol in offered_protocols.split(",")
+        ):
+            selected_subprotocol = "kokoro-stream"
+        if require_auth:
+            client_id = extract_websocket_client_id(websocket)
+            ws_token, ws_proof = extract_websocket_offered_session_auth(websocket)
+            if not consume_ws_session_token(ws_token, client_id, ws_proof):
+                credential_bucket_id = auth_bucket_id(client_id, ws_token)
+                source_bucket_id = auth_source_bucket_id(client_id)
+                credential_failure_count = record_auth_failure(credential_bucket_id)
+                source_failure_count = (
+                    credential_failure_count
+                    if credential_bucket_id == source_bucket_id
+                    else record_auth_failure(source_bucket_id)
+                )
+                reason = (
+                    "Too many authentication failures. Try again later."
+                    if auth_failure_throttled(credential_failure_count)
+                    or (
+                        auth_failure_limit > 0
+                        and source_failure_count > auth_failure_source_limit
+                    )
+                    else "Authentication failed."
+                )
+                await websocket.close(code=1008, reason=reason)
+                return
+        await websocket.accept(subprotocol=selected_subprotocol)
         try:
             raw_payload = await asyncio.wait_for(
                 websocket.receive_text(),
                 timeout=ws_auth_handshake_timeout_sec,
             )
             payload_data = cast(object, json.loads(raw_payload))
-            auth_error_detail = websocket_auth_error_detail(websocket, payload_data)
-            if auth_error_detail is not None:
-                await websocket.close(code=1008, reason=auth_error_detail)
-                return
+            if not require_auth:
+                auth_error_detail = websocket_auth_error_detail(websocket, payload_data)
+                if auth_error_detail is not None:
+                    await websocket.close(code=1008, reason=auth_error_detail)
+                    return
             if isinstance(payload_data, dict):
                 payload_map = cast(dict[str, object], payload_data)
                 payload_map.pop("api_key", None)
                 payload_map.pop("ws_token", None)
+                payload_map.pop("ws_proof", None)
             payload = ChunkedSynthesisRequest.model_validate(payload_data)
             chunks = runtime.split_text_into_chunks(
                 payload.text, payload.target_chunk_chars

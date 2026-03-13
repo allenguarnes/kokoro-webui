@@ -72,6 +72,10 @@ function getSafeLocalStorage() {
   }
 }
 
+function getNavigatorLocks() {
+  return globalThis.navigator?.locks ?? null;
+}
+
 function supportsBroadcastChannel() {
   return typeof BroadcastChannel === "function";
 }
@@ -80,7 +84,14 @@ function getStatusLeaderLeaseKey(scopeId) {
   return `kokoro-status-leader:${scopeId}`;
 }
 
+function isAuthStatusScope(scopeId) {
+  return typeof scopeId === "string" && scopeId.startsWith("auth-");
+}
+
 function readStatusLeaderLease(scopeId) {
+  if (isAuthStatusScope(scopeId)) {
+    return null;
+  }
   const localStorage = getSafeLocalStorage();
   if (!localStorage) {
     return null;
@@ -104,6 +115,9 @@ function readStatusLeaderLease(scopeId) {
 }
 
 function writeStatusLeaderLease(scopeId, tabId, expiresAt) {
+  if (isAuthStatusScope(scopeId)) {
+    return true;
+  }
   const localStorage = getSafeLocalStorage();
   if (!localStorage) {
     return false;
@@ -123,6 +137,9 @@ function clearStatusLeaderLease(scopeId) {
   if (!scopeId) {
     return;
   }
+  if (isAuthStatusScope(scopeId)) {
+    return;
+  }
   const localStorage = getSafeLocalStorage();
   if (!localStorage) {
     return;
@@ -138,29 +155,14 @@ function clearStatusLeaderLease(scopeId) {
   }
 }
 
-async function hashStatusScope(value) {
-  if (globalThis.crypto?.subtle) {
-    const bytes = new TextEncoder().encode(value);
-    const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
-    return Array.from(new Uint8Array(digest), (byte) =>
-      byte.toString(16).padStart(2, "0"),
-    ).join("");
+function getStatusScopeId() {
+  if (typeof appState.statusStreamScopeId === "string" && appState.statusStreamScopeId) {
+    return appState.statusStreamScopeId;
   }
-  let hash = 5381;
-  for (const char of value) {
-    hash = (hash * 33) ^ char.charCodeAt(0);
-  }
-  return Math.abs(hash >>> 0).toString(16);
-}
-
-async function getStatusScopeId() {
-  if (!appState.authRequired) {
-    return "public";
-  }
-  if (!appState.apiKey) {
+  if (appState.authRequired) {
     return null;
   }
-  return `auth-${await hashStatusScope(appState.apiKey)}`;
+  return "public";
 }
 
 function authHeaders() {
@@ -363,6 +365,11 @@ function clearStatusLeaderHeartbeat() {
   appState.statusLeaderHeartbeatTimerId = null;
 }
 
+function releaseStatusLeaderLock() {
+  appState.statusLeaderLockRelease?.();
+  appState.statusLeaderLockRelease = null;
+}
+
 function clearStatusLeaderCheck() {
   if (appState.statusLeaderCheckTimerId === null) {
     return;
@@ -424,6 +431,7 @@ function renewStatusLeadership() {
 
 function releaseStatusLeadership() {
   clearStatusLeaderHeartbeat();
+  releaseStatusLeaderLock();
   if (appState.statusIsLeader) {
     clearStatusLeaderLease(appState.statusStreamScopeId);
     postStatusChannelMessage({ type: "leader-release" });
@@ -436,31 +444,69 @@ function demoteStatusLeader(remoteTabId = null) {
   appState.statusIsLeader = false;
   appState.statusLeaderTabId = remoteTabId;
   clearStatusLeaderHeartbeat();
+  releaseStatusLeaderLock();
   appState.statusStreamAbortController?.abort();
   appState.statusStreamAbortController = null;
 }
 
-function tryAcquireStatusLeadership() {
+async function tryAcquireStatusLeadership() {
   if (!appState.statusBroadcastChannel || !appState.statusStreamScopeId || document.hidden) {
     return false;
   }
-  const lease = readStatusLeaderLease(appState.statusStreamScopeId);
+  const scopeId = appState.statusStreamScopeId;
+  if (appState.statusIsLeader && appState.statusLeaderTabId === appState.tabId) {
+    return true;
+  }
+  const lease = readStatusLeaderLease(scopeId);
   const now = Date.now();
   if (lease && lease.expiresAt > now && lease.tabId !== appState.tabId) {
     appState.statusLeaderTabId = lease.tabId;
     scheduleLeaderTakeoverCheck();
     return false;
   }
+  if (!(await tryAcquireStatusLeaderLock(scopeId))) {
+    scheduleLeaderTakeoverCheck();
+    return false;
+  }
+  if (
+    !appState.statusBroadcastChannel ||
+    appState.statusStreamScopeId !== scopeId ||
+    document.hidden
+  ) {
+    releaseStatusLeaderLock();
+    return false;
+  }
   const wroteLease = writeStatusLeaderLease(
-    appState.statusStreamScopeId,
+    scopeId,
     appState.tabId,
     now + STATUS_LEADER_LEASE_MS,
   );
   if (!wroteLease) {
+    releaseStatusLeaderLock();
     return false;
   }
-  const confirmedLease = readStatusLeaderLease(appState.statusStreamScopeId);
+  if (isAuthStatusScope(scopeId)) {
+    clearStatusLeaderCheck();
+    appState.statusIsLeader = true;
+    appState.statusLeaderTabId = appState.tabId;
+    clearStatusLeaderHeartbeat();
+    appState.statusLeaderHeartbeatTimerId = window.setInterval(
+      renewStatusLeadership,
+      STATUS_LEADER_HEARTBEAT_MS,
+    );
+    renewStatusLeadership();
+    postStatusChannelMessage({ type: "leader-announce" });
+    if (appState.lastStatusSnapshot) {
+      postStatusChannelMessage({
+        type: "health-update",
+        payload: appState.lastStatusSnapshot,
+      });
+    }
+    return true;
+  }
+  const confirmedLease = readStatusLeaderLease(scopeId);
   if (confirmedLease?.tabId !== appState.tabId) {
+    releaseStatusLeaderLock();
     scheduleLeaderTakeoverCheck();
     return false;
   }
@@ -499,7 +545,9 @@ function handleStatusChannelMessage(event) {
     return;
   }
   const currentLease = readStatusLeaderLease(appState.statusStreamScopeId);
-  const isLeaseOwner = currentLease?.tabId === message.tabId;
+  const isLeaseOwner = isAuthStatusScope(appState.statusStreamScopeId)
+    ? true
+    : currentLease?.tabId === message.tabId;
   if (message.type === "leader-announce" || message.type === "leader-heartbeat") {
     if (!isLeaseOwner) {
       return;
@@ -534,8 +582,15 @@ function handleStatusChannelMessage(event) {
 }
 
 async function ensureStatusBroadcastChannel() {
-  const scopeId = await getStatusScopeId();
-  if (!scopeId || !supportsBroadcastChannel() || !getSafeLocalStorage()) {
+  const scopeId = getStatusScopeId();
+  if (
+    !scopeId ||
+    isAuthStatusScope(scopeId) ||
+    !supportsBroadcastChannel() ||
+    (!isAuthStatusScope(scopeId) && !getSafeLocalStorage()) ||
+    (isAuthStatusScope(scopeId) && !getNavigatorLocks()?.request)
+  ) {
+    releaseStatusLeadership();
     closeStatusBroadcastChannel();
     appState.statusStreamScopeId = scopeId;
     return false;
@@ -556,6 +611,39 @@ async function ensureStatusBroadcastChannel() {
   return true;
 }
 
+async function tryAcquireStatusLeaderLock(scopeId) {
+  const locks = getNavigatorLocks();
+  if (!locks?.request) {
+    return true;
+  }
+  return new Promise((resolve) => {
+    let resolved = false;
+    void locks
+      .request(
+        `kokoro-status:${scopeId}`,
+        { ifAvailable: true, mode: "exclusive" },
+        async (lock) => {
+          if (!lock) {
+            resolved = true;
+            resolve(false);
+            return;
+          }
+          const keepAlive = new Promise((release) => {
+            appState.statusLeaderLockRelease = release;
+          });
+          resolved = true;
+          resolve(true);
+          await keepAlive;
+        },
+      )
+      .catch(() => {
+        if (!resolved) {
+          resolve(false);
+        }
+      });
+  });
+}
+
 function stopHealthMonitoring() {
   clearStatusStreamReconnect();
   clearStatusLeaderCheck();
@@ -564,6 +652,10 @@ function stopHealthMonitoring() {
   appState.statusStreamAbortController?.abort();
   appState.statusStreamAbortController = null;
   closeStatusBroadcastChannel();
+}
+
+function requestHealthMonitoringRestart() {
+  appState.statusMonitoringRestartRequested = true;
 }
 
 function scheduleStatusStreamReconnect() {
@@ -655,37 +747,58 @@ async function connectStatusStream(abortController) {
 }
 
 async function startHealthMonitoring() {
-  if (document.hidden || (appState.authRequired && !appState.apiKey)) {
-    return;
+  if (appState.statusMonitoringPromise) {
+    return appState.statusMonitoringPromise;
   }
-  const useSharedChannel = await ensureStatusBroadcastChannel();
-  if (useSharedChannel && !tryAcquireStatusLeadership()) {
-    appState.statusStreamReconnectAttempts = 0;
-    appState.statusStreamAbortController?.abort();
-    appState.statusStreamAbortController = null;
-    return;
-  }
-  if (appState.statusStreamAbortController) {
-    return;
-  }
-  clearStatusStreamReconnect();
-  const abortController = new AbortController();
-  appState.statusStreamAbortController = abortController;
+  const monitoringPromise = (async () => {
+    if (document.hidden || (appState.authRequired && !appState.apiKey)) {
+      return;
+    }
+    const useSharedChannel = await ensureStatusBroadcastChannel();
+    if (useSharedChannel && !(await tryAcquireStatusLeadership())) {
+      appState.statusStreamReconnectAttempts = 0;
+      appState.statusStreamAbortController?.abort();
+      appState.statusStreamAbortController = null;
+      return;
+    }
+    if (appState.statusStreamAbortController) {
+      return;
+    }
+    clearStatusStreamReconnect();
+    const abortController = new AbortController();
+    appState.statusStreamAbortController = abortController;
+    try {
+      await connectStatusStream(abortController);
+      appState.statusStreamReconnectAttempts = 0;
+    } catch (error) {
+      if (appState.statusStreamAbortController !== abortController) {
+        return;
+      }
+      appState.statusStreamAbortController = null;
+      if (isAuthError(error)) {
+        handleAuthFailure(error.message || "Authentication failed.");
+        return;
+      }
+      releaseStatusLeadership();
+      appState.statusStreamReconnectAttempts += 1;
+      scheduleStatusStreamReconnect();
+    }
+  })();
+  appState.statusMonitoringPromise = monitoringPromise;
   try {
-    await connectStatusStream(abortController);
-    appState.statusStreamReconnectAttempts = 0;
-  } catch (error) {
-    if (appState.statusStreamAbortController !== abortController) {
-      return;
+    await monitoringPromise;
+  } finally {
+    if (appState.statusMonitoringPromise === monitoringPromise) {
+      appState.statusMonitoringPromise = null;
     }
-    appState.statusStreamAbortController = null;
-    if (isAuthError(error)) {
-      handleAuthFailure(error.message || "Authentication failed.");
-      return;
+    if (appState.statusMonitoringRestartRequested) {
+      appState.statusMonitoringRestartRequested = false;
+      if (!document.hidden && (!appState.authRequired || appState.apiKey)) {
+        window.setTimeout(() => {
+          void startHealthMonitoring();
+        }, 0);
+      }
     }
-    releaseStatusLeadership();
-    appState.statusStreamReconnectAttempts += 1;
-    scheduleStatusStreamReconnect();
   }
 }
 
@@ -730,6 +843,32 @@ export async function loadHealth(options = {}) {
 function applyHealthState(health, options = {}) {
   const quiet = options.quiet === true;
   const capabilities = options.capabilities ?? null;
+  const nextStatusScopeId =
+    typeof health?.status_stream_scope === "string" && health.status_stream_scope
+      ? health.status_stream_scope
+      : null;
+  const statusScopeChanged =
+    Boolean(nextStatusScopeId) &&
+    appState.statusStreamScopeId !== null &&
+    appState.statusStreamScopeId !== nextStatusScopeId;
+  if (
+    statusScopeChanged &&
+    appState.statusBroadcastChannel &&
+    appState.statusStreamScopeId
+  ) {
+    stopHealthMonitoring();
+  }
+  if (typeof health?.status_stream_scope === "string" && health.status_stream_scope) {
+    appState.statusStreamScopeId = health.status_stream_scope;
+  }
+  if (
+    statusScopeChanged &&
+    !document.hidden &&
+    (!appState.authRequired || appState.apiKey)
+  ) {
+    requestHealthMonitoringRestart();
+    void startHealthMonitoring();
+  }
   appState.lastStatusSnapshot = health;
   if (appState.statusIsLeader && appState.statusBroadcastChannel) {
     postStatusChannelMessage({
