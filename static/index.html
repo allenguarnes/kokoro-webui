@@ -8,23 +8,14 @@
         <link rel="stylesheet" href="/static/styles.css" />
     </head>
     <body>
-        <div class="scene">
-            <div class="orb orb-a"></div>
-            <div class="orb orb-b"></div>
-            <div class="grid"></div>
-        </div>
-
         <main id="appShell" class="shell">
-            <section class="topbar panel">
+            <section class="topbar">
                 <div class="topbar-title">
-                    <p class="eyebrow">
-                        <span class="icon icon-heart" aria-hidden="true"></span>
-                        Kokoro WebUI
-                    </p>
+                    <h1 class="app-title">Kokoro WebUI</h1>
                 </div>
                 <div class="topbar-meta">
                     <label class="field field-topbar-transport">
-                        <span>Transport</span>
+                        <span>Transport mode</span>
                         <select id="transport" name="transport">
                             <option value="ndjson">NDJSON</option>
                             <option value="ws">WebSocket</option>
@@ -66,16 +57,16 @@
                 <div class="auth-copy">
                     <p class="auth-kicker">
                         <span class="icon icon-key" aria-hidden="true"></span>
-                        API Access
+                        API key required
                     </p>
-                    <h2 class="auth-title">Unlock Kokoro WebUI</h2>
+                    <h2 class="auth-title">Unlock access</h2>
                     <p class="auth-text">
                         This server is protected. Enter the configured API key
-                        to unlock synthesis, streaming, and export controls.
+                        to enable synthesis and streaming.
                     </p>
                     <p class="auth-note">
-                        The workspace stays visible behind this gate so you can
-                        confirm you are on the right server before unlocking it.
+                        The key stays in this browser session and is sent as a
+                        request header for API calls.
                     </p>
                 </div>
                 <form id="authForm" class="auth-form">
@@ -118,7 +109,7 @@
                                     class="icon icon-spark"
                                     aria-hidden="true"
                                 ></span>
-                                Sample Scripts
+                                Sample scripts
                             </p>
                             <div class="chips">
                                 <button
@@ -409,7 +400,7 @@ The future sounds calmer when it is rendered locally.</textarea
                                     class="icon icon-info"
                                     aria-hidden="true"
                                 ></span>
-                                API Documentation
+                                API documentation
                             </span>
                             <span class="mini"
                                 >Expand for native and OpenAI-compatible

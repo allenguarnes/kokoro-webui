@@ -4,11 +4,8 @@
     }
 
     .panel-auth {
-        width: min(34rem, calc(100% - 1.4rem));
-    }
-
-    .shell-auth-locked .workspace {
-        padding-top: calc(10.4rem * var(--space-multiplier));
+        width: min(38rem, calc(100% - 1rem));
+        top: calc(2.65rem * var(--space-multiplier));
     }
 
     .auth-form {
@@ -38,10 +35,34 @@
 }
 
 @media (max-width: 740px) {
+    .shell {
+        padding: 0.65rem;
+    }
+
     .topbar {
-        align-items: start;
+        align-items: stretch;
         flex-direction: column;
-        gap: 0.55rem;
+        gap: 0.7rem;
+        padding: 0.08rem 0;
+    }
+
+    .topbar-meta {
+        justify-content: start;
+        width: 100%;
+    }
+
+    .topbar-meta .field-topbar-transport {
+        grid-template-columns: 1fr;
+        width: 100%;
+    }
+
+    .topbar-meta .field-topbar-transport .custom-select,
+    .topbar-meta .field-topbar-transport .custom-select-trigger {
+        width: 100%;
+    }
+
+    .controls {
+        grid-template-columns: 1fr;
     }
 
     .panel-auth {
@@ -50,89 +71,22 @@
         left: auto;
         transform: none;
         width: 100%;
-        gap: calc(0.72rem * var(--space-multiplier));
-        margin-top: calc(0.2rem * var(--space-multiplier));
-        padding: calc(0.8rem * var(--space-multiplier))
-            calc(0.82rem * var(--space-multiplier))
-            calc(0.78rem * var(--space-multiplier));
-        border-radius: 20px;
+        margin-top: 0.24rem;
     }
 
     .shell-auth-locked .workspace {
         padding-top: 0;
     }
 
-    .auth-kicker {
-        font-size: 0.64rem;
-        letter-spacing: 0.12em;
-    }
-
-    .auth-title {
-        font-size: 1.42rem;
-        line-height: 1.06;
-    }
-
-    .auth-text {
-        font-size: 0.86rem;
-        line-height: 1.46;
-    }
-
-    .auth-note {
-        display: none;
-    }
-
-    .auth-form {
-        gap: calc(0.55rem * var(--space-multiplier));
-    }
-
-    .field-auth input {
-        min-height: 2.5rem;
-        padding: 0.5rem 0.68rem;
-        font-size: 0.88rem;
-    }
-
-    .auth-message {
-        min-height: 1.05rem;
-        font-size: 0.7rem;
-        line-height: 1.4;
-    }
-
-    .topbar-meta {
-        justify-content: start;
-        flex-wrap: wrap;
-    }
-
-    .runtime-badge {
-        order: 2;
-        margin-right: 0;
-    }
-
-    .topbar-meta .field-topbar-transport {
-        width: 100%;
-        margin-right: 0;
-    }
-
-    .topbar-meta .field-topbar-transport .custom-select {
-        min-width: 0;
-        flex: 1 1 11rem;
-    }
-
-    .controls {
-        grid-template-columns: 1fr;
-    }
-
-    .actions {
-        flex-direction: column;
-    }
-
+    .actions,
     .auth-actions {
         flex-direction: column;
         align-items: stretch;
-        gap: 0.45rem;
     }
 
     .button-auth-primary,
-    .auth-actions .button-ghost {
+    .auth-actions .button-ghost,
+    .actions button {
         width: 100%;
     }
 
