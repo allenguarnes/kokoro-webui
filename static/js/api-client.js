@@ -140,7 +140,7 @@ async function pollHealth() {
   }
   healthPollInFlight = true;
   try {
-    await loadHealth({ quiet: true });
+    await loadHealth({ quiet: true, includeCapabilities: false });
   } catch (error) {
     if (error instanceof AuthRequiredError) {
       handleAuthFailure("Authentication failed.");
@@ -168,64 +168,73 @@ function stopHealthPolling() {
 
 export async function loadHealth(options = {}) {
   const quiet = options.quiet === true;
+  const includeCapabilities = options.includeCapabilities !== false;
   const [healthResponse, capabilitiesResponse] = await Promise.all([
     apiFetch("/api/health"),
-    apiFetch("/api/capabilities"),
+    includeCapabilities ? apiFetch("/api/capabilities") : Promise.resolve(null),
   ]);
-  if (healthResponse.status === 401 || capabilitiesResponse.status === 401) {
+  if (healthResponse.status === 401 || capabilitiesResponse?.status === 401) {
     throw new AuthRequiredError();
   }
   try {
     const health = await healthResponse.json();
-    const capabilities = await capabilitiesResponse.json();
-    populateVoices(capabilities.voices || []);
-    if (
-      Array.isArray(capabilities.formats) &&
-      capabilities.formats.length > 0
-    ) {
-      appState.availableFormats = capabilities.formats;
-      if (!appState.availableFormats.includes(appState.selectedFormat)) {
-        appState.selectedFormat = appState.availableFormats[0];
-      }
-    }
-    if (
-      Array.isArray(capabilities.opus_bitrates) &&
-      capabilities.opus_bitrates.length > 0
-    ) {
-      appState.availableOpusBitrates = capabilities.opus_bitrates;
+    const capabilities = capabilitiesResponse
+      ? await capabilitiesResponse.json()
+      : null;
+    if (capabilities) {
+      populateVoices(capabilities.voices || []);
       if (
-        !appState.availableOpusBitrates.includes(appState.selectedOpusBitrate)
+        Array.isArray(capabilities.formats) &&
+        capabilities.formats.length > 0
       ) {
-        appState.selectedOpusBitrate = appState.availableOpusBitrates[0];
+        appState.availableFormats = capabilities.formats;
+        if (!appState.availableFormats.includes(appState.selectedFormat)) {
+          appState.selectedFormat = appState.availableFormats[0];
+        }
       }
-    }
-    if (
-      Array.isArray(capabilities.wav_sample_rates) &&
-      capabilities.wav_sample_rates.length > 0
-    ) {
-      appState.availableWavSampleRates = capabilities.wav_sample_rates;
       if (
-        !appState.availableWavSampleRates.includes(
-          appState.selectedWavSampleRate,
-        )
+        Array.isArray(capabilities.opus_bitrates) &&
+        capabilities.opus_bitrates.length > 0
       ) {
-        appState.selectedWavSampleRate = appState.availableWavSampleRates[0];
+        appState.availableOpusBitrates = capabilities.opus_bitrates;
+        if (
+          !appState.availableOpusBitrates.includes(appState.selectedOpusBitrate)
+        ) {
+          appState.selectedOpusBitrate = appState.availableOpusBitrates[0];
+        }
+      }
+      if (
+        Array.isArray(capabilities.wav_sample_rates) &&
+        capabilities.wav_sample_rates.length > 0
+      ) {
+        appState.availableWavSampleRates = capabilities.wav_sample_rates;
+        if (
+          !appState.availableWavSampleRates.includes(
+            appState.selectedWavSampleRate,
+          )
+        ) {
+          appState.selectedWavSampleRate = appState.availableWavSampleRates[0];
+        }
       }
     }
-    const websocketEnabled = Boolean(capabilities.websocket_streaming);
+    const websocketEnabled = capabilities
+      ? Boolean(capabilities.websocket_streaming)
+      : transportInput.querySelector('option[value="ws"]')?.disabled !== true;
     const wsOption = transportInput.querySelector('option[value="ws"]');
-    if (wsOption) {
+    if (wsOption && capabilities) {
       wsOption.disabled = !websocketEnabled;
     }
     if (transportInput.value === "ws" && !websocketEnabled) {
       transportInput.value = "ndjson";
     }
-    appState.pitchShiftingAvailable = capabilities.pitch_shifting !== false;
-    if (
-      Number.isFinite(capabilities.max_pitch_semitones) &&
-      capabilities.max_pitch_semitones > 0
-    ) {
-      appState.maxPitchSemitones = capabilities.max_pitch_semitones;
+    if (capabilities) {
+      appState.pitchShiftingAvailable = capabilities.pitch_shifting !== false;
+      if (
+        Number.isFinite(capabilities.max_pitch_semitones) &&
+        capabilities.max_pitch_semitones > 0
+      ) {
+        appState.maxPitchSemitones = capabilities.max_pitch_semitones;
+      }
     }
     updatePitchControlAvailability();
     refreshCustomSelect(transportInput);
@@ -240,6 +249,10 @@ export async function loadHealth(options = {}) {
       typeof health.provider_error === "string" ? health.provider_error : null;
     const runtimeError =
       typeof health.runtime_error === "string" ? health.runtime_error : null;
+    const runtimeActivityState =
+      typeof health?.runtime_activity?.state === "string"
+        ? health.runtime_activity.state
+        : null;
     updateQueueMonitorLayout(activeProvider);
     const processGroupVramMb = Number(health?.gpu?.process_group_vram_used_mb);
     const processVramMb = Number(health?.gpu?.process_vram_used_mb);
@@ -259,6 +272,7 @@ export async function loadHealth(options = {}) {
         providerFallback,
         providerError,
         runtimeError,
+        runtimeActivityState,
       );
       if (!quiet && providerFallback && activeProvider) {
         setStatus("Ready for synthesis with CPU fallback.", true);
@@ -277,6 +291,7 @@ export async function loadHealth(options = {}) {
       providerFallback,
       providerError,
       runtimeError,
+      runtimeActivityState,
     );
     if (runtimeError && !quiet) {
       setStatus(`Runtime unavailable: ${runtimeError}`, true);
@@ -291,7 +306,7 @@ export async function loadHealth(options = {}) {
     }
     updateQueueMonitorLayout(null);
     gpuVram.textContent = "--";
-    setSystemStatus(false, false);
+    setSystemStatus(false, false, null, false, null, null, null);
     if (!quiet) {
       setStatus("Unable to reach the backend.", true);
     }

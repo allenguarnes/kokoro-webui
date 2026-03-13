@@ -168,6 +168,22 @@ class RuntimeSelectionTests(unittest.TestCase):
         self.assertFalse(status.provider_fallback)
         self.assertIsNone(status.provider_error)
 
+    def test_initialize_false_does_not_bootstrap_runtime_session(self) -> None:
+        fake_ort = FakeOrt(["CUDAExecutionProvider", "CPUExecutionProvider"])
+        with (
+            patch.object(runtime, "KokoroRuntime", FakeKokoroFactory()),
+            patch.object(runtime, "ort", fake_ort),
+            patch.object(runtime, "MODEL_PATH", self.existing_path),
+            patch.object(runtime, "VOICES_PATH", self.existing_path),
+            patch.object(runtime, "get_runtime_provider_mode", return_value="auto"),
+            patch.object(runtime, "get_runtime_provider_strict", return_value=False),
+        ):
+            status = runtime.get_runtime_status(initialize=False)
+
+        self.assertEqual(status.active_providers, ["CUDAExecutionProvider"])
+        self.assertEqual(fake_ort.requests, [])
+        self.assertFalse(runtime.runtime_bootstrapped())
+
     def test_auto_falls_back_to_cpu_when_cuda_session_fails(self) -> None:
         fake_ort = FakeOrt(
             ["CUDAExecutionProvider", "CPUExecutionProvider"],

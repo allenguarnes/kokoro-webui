@@ -256,6 +256,10 @@ def clear_runtime_caches() -> None:
     get_runtime_bootstrap.cache_clear()
 
 
+def runtime_bootstrapped() -> bool:
+    return get_runtime_bootstrap.cache_info().currsize > 0
+
+
 def kokoro_runtime_available() -> bool:
     return KokoroRuntime is not None
 
@@ -273,12 +277,50 @@ def get_available_runtime_providers() -> list[str]:
         return []
 
 
-def get_runtime_status() -> RuntimeStatus:
+def _predict_runtime_status_without_initialization(
+    *,
+    requested_provider: ProviderMode,
+    available_providers: list[str],
+) -> RuntimeStatus:
+    attempted_providers = _resolve_attempted_providers(
+        requested_provider,
+        available_providers,
+    )
+    if requested_provider == "cpu":
+        active_providers = [_CPU_PROVIDER]
+    elif _CUDA_PROVIDER in available_providers:
+        active_providers = [_CUDA_PROVIDER]
+    elif requested_provider == "cuda" and get_runtime_provider_strict():
+        active_providers = []
+    else:
+        active_providers = [_CPU_PROVIDER]
+
+    provider_fallback = requested_provider in {"auto", "cuda"} and active_providers == [
+        _CPU_PROVIDER
+    ]
+    return RuntimeStatus(
+        requested_provider=requested_provider,
+        attempted_providers=attempted_providers,
+        available_providers=available_providers,
+        active_providers=active_providers,
+        provider_fallback=provider_fallback,
+        provider_error=None,
+        runtime_error=None,
+    )
+
+
+def get_runtime_status(*, initialize: bool = True) -> RuntimeStatus:
+    available_providers = get_available_runtime_providers()
+    requested_provider = get_runtime_provider_mode()
+    if not initialize and not runtime_bootstrapped():
+        return _predict_runtime_status_without_initialization(
+            requested_provider=requested_provider,
+            available_providers=available_providers,
+        )
+
     try:
         return get_runtime_bootstrap().status
     except Exception as exc:
-        available_providers = get_available_runtime_providers()
-        requested_provider = get_runtime_provider_mode()
         attempted_providers = _resolve_attempted_providers(
             requested_provider, available_providers
         )
@@ -354,11 +396,17 @@ def _resolve_group_gpu_usage(
     return group_used_bytes, sorted(group_member_pids)
 
 
-def get_current_process_gpu_usage() -> GpuProcessUsage:
+def get_current_process_gpu_usage(
+    *, active_provider: str | None = None
+) -> GpuProcessUsage:
     pid = os.getpid()
     process_group_id = _safe_get_process_group_id(pid)
-    active_provider = get_active_runtime_provider()
-    if not _is_gpu_runtime_provider(active_provider):
+    resolved_active_provider = (
+        active_provider
+        if active_provider is not None
+        else get_active_runtime_provider()
+    )
+    if not _is_gpu_runtime_provider(resolved_active_provider):
         return GpuProcessUsage(
             pid=pid,
             available=False,

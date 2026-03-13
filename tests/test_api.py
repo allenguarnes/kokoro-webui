@@ -252,6 +252,7 @@ class ApiIntegrationTests(unittest.TestCase):
                     group_member_pids=[4242, 5000],
                 ),
             ),
+            patch.object(runtime, "runtime_bootstrapped", return_value=True),
             patch.object(audio, "ffmpeg_supports_rubberband", return_value=True),
             patch.object(runtime, "websocket_runtime_available", return_value=True),
         ):
@@ -272,6 +273,10 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(gpu["process_group_vram_used_mb"], 96.0)
         self.assertEqual(gpu["process_group_member_pids"], [4242, 5000])
         self.assertEqual(gpu["source"], "nvml")
+        runtime_activity = cast(dict[str, object], payload["runtime_activity"])
+        self.assertEqual(runtime_activity["state"], "idling")
+        self.assertTrue(cast(bool, runtime_activity["loaded"]))
+        self.assertIn("idle_seconds", runtime_activity)
         queue = cast(dict[str, object], payload["queue"])
         worker_limit = cast(int, queue["worker_limit"])
         queue_limit = cast(int, queue["queue_limit"])

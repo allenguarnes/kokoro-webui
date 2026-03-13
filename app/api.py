@@ -60,7 +60,7 @@ def create_app() -> FastAPI:
     ws_session_token_ttl_sec = config.get_websocket_session_token_ttl_seconds()
     ws_session_token_max_tokens = config.get_websocket_session_token_max_tokens()
     requested_provider = config.get_runtime_provider_mode()
-    runtime_status = runtime.get_runtime_status()
+    runtime_status = runtime.get_runtime_status(initialize=False)
     active_runtime_provider = (
         runtime_status.active_providers[0] if runtime_status.active_providers else None
     )
@@ -83,12 +83,56 @@ def create_app() -> FastAPI:
     synthesis_scheduler = SynthesisScheduler(
         policy=scheduler_policy,
     )
+    runtime_idle_unload_seconds = config.get_runtime_idle_unload_seconds()
+    idle_unload_check_seconds = (
+        min(10.0, max(1.0, runtime_idle_unload_seconds / 2))
+        if runtime_idle_unload_seconds > 0
+        else 0.0
+    )
+    last_synthesis_activity_at = time.monotonic()
+
+    async def maybe_unload_runtime_for_idle() -> None:
+        nonlocal last_synthesis_activity_at
+        if runtime_idle_unload_seconds <= 0:
+            return
+        if not runtime.runtime_bootstrapped():
+            return
+        metrics = synthesis_scheduler.snapshot()
+        if metrics.active_jobs > 0 or metrics.queued_jobs > 0:
+            return
+        idle_seconds = time.monotonic() - last_synthesis_activity_at
+        if idle_seconds < runtime_idle_unload_seconds:
+            return
+        runtime.clear_runtime_caches()
+        last_synthesis_activity_at = time.monotonic()
+
+    async def runtime_idle_maintenance_loop(stop_event: asyncio.Event) -> None:
+        if runtime_idle_unload_seconds <= 0:
+            return
+        while not stop_event.is_set():
+            try:
+                _ = await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=idle_unload_check_seconds,
+                )
+                break
+            except TimeoutError:
+                await maybe_unload_runtime_for_idle()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        idle_stop_event = asyncio.Event()
+        idle_task: asyncio.Task[None] | None = None
+        if runtime_idle_unload_seconds > 0:
+            idle_task = asyncio.create_task(
+                runtime_idle_maintenance_loop(idle_stop_event)
+            )
         try:
             yield
         finally:
+            idle_stop_event.set()
+            if idle_task is not None:
+                await idle_task
             synthesis_scheduler.shutdown()
 
     app = FastAPI(title="Kokoro WebUI", lifespan=lifespan)
@@ -364,6 +408,39 @@ def create_app() -> FastAPI:
             "queue_wait_samples": metrics.queue_wait_samples,
         }
 
+    def runtime_activity_payload() -> dict[str, object]:
+        metrics = synthesis_scheduler.snapshot()
+        loaded = runtime.runtime_bootstrapped()
+        if metrics.active_jobs > 0 or metrics.queued_jobs > 0:
+            state = "active"
+        elif loaded:
+            state = "idling"
+        else:
+            state = "unloaded"
+        idle_seconds = max(0.0, time.monotonic() - last_synthesis_activity_at)
+        idle_unload_after_seconds = (
+            runtime_idle_unload_seconds if runtime_idle_unload_seconds > 0 else None
+        )
+        idle_unload_remaining_seconds = (
+            max(0.0, runtime_idle_unload_seconds - idle_seconds)
+            if runtime_idle_unload_seconds > 0 and loaded
+            else None
+        )
+        return {
+            "state": state,
+            "loaded": loaded,
+            "active_jobs": metrics.active_jobs,
+            "queued_jobs": metrics.queued_jobs,
+            "idle_seconds": round(idle_seconds, 2),
+            "idle_unload_enabled": runtime_idle_unload_seconds > 0,
+            "idle_unload_after_seconds": idle_unload_after_seconds,
+            "idle_unload_remaining_seconds": (
+                round(idle_unload_remaining_seconds, 2)
+                if isinstance(idle_unload_remaining_seconds, float)
+                else None
+            ),
+        }
+
     def scheduler_payload() -> dict[str, object]:
         return {
             "requested_provider": scheduler_policy.requested_provider,
@@ -392,14 +469,22 @@ def create_app() -> FastAPI:
         *args: P.args,
         **kwargs: P.kwargs,
     ) -> T:
-        return await synthesis_scheduler.run_interactive(function, *args, **kwargs)
+        nonlocal last_synthesis_activity_at
+        try:
+            return await synthesis_scheduler.run_interactive(function, *args, **kwargs)
+        finally:
+            last_synthesis_activity_at = time.monotonic()
 
     async def run_stream_synthesis_task(
         function: Callable[P, T],
         *args: P.args,
         **kwargs: P.kwargs,
     ) -> T:
-        return await synthesis_scheduler.run_stream(function, *args, **kwargs)
+        nonlocal last_synthesis_activity_at
+        try:
+            return await synthesis_scheduler.run_stream(function, *args, **kwargs)
+        finally:
+            last_synthesis_activity_at = time.monotonic()
 
     async def synthesize_chunk_async(
         payload: SynthesisRequest, text: str
@@ -468,8 +553,15 @@ def create_app() -> FastAPI:
         if not config.VOICES_PATH.exists():
             missing.append(str(config.VOICES_PATH.name))
 
-        runtime_status = runtime.get_runtime_status()
-        gpu_usage = runtime.get_current_process_gpu_usage()
+        runtime_status = runtime.get_runtime_status(initialize=False)
+        active_provider = (
+            runtime_status.active_providers[0]
+            if runtime_status.active_providers
+            else None
+        )
+        gpu_usage = runtime.get_current_process_gpu_usage(
+            active_provider=active_provider
+        )
 
         return JSONResponse(
             {
@@ -494,6 +586,7 @@ def create_app() -> FastAPI:
                     "source": gpu_usage.source,
                     "error": gpu_usage.error,
                 },
+                "runtime_activity": runtime_activity_payload(),
                 "queue": queue_payload(),
             }
         )

@@ -219,6 +219,7 @@ The app auto-loads `.env` (if present).
 | `KOKORO_FORMATS` | all supported formats | Optional comma-separated subset of enabled output formats, for example `wav`, `pcm`, or `wav,pcm,opus` |
 | `KOKORO_PROVIDER` | `auto` | Runtime selection: `auto`, `cpu`, or `cuda` |
 | `KOKORO_STRICT_PROVIDER` | `0` | Fail startup instead of falling back when requested provider cannot initialize |
+| `KOKORO_RUNTIME_IDLE_UNLOAD_SEC` | `0` | Unload runtime session after N idle seconds (`0` disables idle unload) |
 | `KOKORO_SYNTH_WORKERS` | `2` on CPU, `1` on auto/cuda | Cap concurrent synthesis jobs in the dedicated worker pool |
 | `KOKORO_SYNTH_QUEUE` | `workers * 4` | Queue depth for admitted synthesis jobs waiting behind active workers |
 | `KOKORO_ALLOW_EXPERIMENTAL_CUDA_CONCURRENCY` | `0` | Allow `KOKORO_SYNTH_WORKERS > 1` when the runtime is explicitly forced to `cuda` |
@@ -252,6 +253,8 @@ KOKORO_FFMPEG_TIMEOUT_SEC=20
 # KOKORO_FORMATS=wav,pcm,opus
 KOKORO_PROVIDER=auto
 KOKORO_STRICT_PROVIDER=0
+# Optional: unload runtime session after N idle seconds (0 disables idle unload).
+# KOKORO_RUNTIME_IDLE_UNLOAD_SEC=120
 # Optional synthesis concurrency cap. Defaults to 2 on CPU, 1 on auto/cuda.
 # KOKORO_SYNTH_WORKERS=2
 # Optional queue depth for admitted synthesis jobs waiting behind active workers.
@@ -267,6 +270,8 @@ KOKORO_STRICT_PROVIDER=0
 `KOKORO_SYNTH_QUEUE` controls how many additional synthesis jobs can wait behind the active workers before the server starts rejecting overload with `503`. That is useful once the app is serving multiple users instead of only local, single-user traffic.
 
 `/api/health` also reports queue wait-time metrics so you can tell the difference between idle, busy, and saturated behavior.
+
+`KOKORO_RUNTIME_IDLE_UNLOAD_SEC` can reduce idle GPU VRAM residency by clearing the runtime cache after inactivity. The next synthesis request will pay a cold-start cost while the runtime session is rebuilt.
 
 If `KOKORO_FORMATS` is narrowed to a single value, the Web UI locks the format control to that server-configured format.
 

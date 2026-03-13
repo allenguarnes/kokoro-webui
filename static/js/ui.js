@@ -86,6 +86,15 @@ function isGpuProvider(activeProvider) {
   );
 }
 
+function formatRuntimeActivityLabel(runtimeActivityState) {
+  const labels = {
+    active: "Active",
+    idling: "Idle",
+    unloaded: "Unloaded",
+  };
+  return labels[runtimeActivityState] || null;
+}
+
 export function setSystemStatus(
   runtimeReady,
   websocketReady,
@@ -93,14 +102,19 @@ export function setSystemStatus(
   providerFallback = false,
   providerError = null,
   runtimeError = null,
+  runtimeActivityState = null,
 ) {
   const providerLabel = formatProviderLabel(activeProvider);
+  const activityLabel = formatRuntimeActivityLabel(runtimeActivityState);
   const details = [
     `Runtime: ${runtimeReady ? "Ready" : "Unavailable"},`,
     `WebSocket: ${websocketReady ? "Ready" : "Unavailable"},`,
   ];
   if (activeProvider) {
     details.push(`Provider: ${activeProvider}`);
+  }
+  if (activityLabel) {
+    details.push(`Activity: ${activityLabel}.`);
   }
   if (providerFallback) {
     details.push("GPU fallback: active.");
@@ -120,12 +134,13 @@ export function setSystemStatus(
       ? "status-widget status-widget-ok"
       : "status-widget status-widget-warn";
 
-  providerBadge.textContent = providerLabel;
-  providerBadge.title = `Active runtime provider: ${providerLabel}`;
-  providerBadge.setAttribute(
-    "aria-label",
-    `Active runtime provider: ${providerLabel}`,
-  );
+  providerBadge.textContent = activityLabel
+    ? `${providerLabel} · ${activityLabel}`
+    : providerLabel;
+  providerBadge.title = activityLabel
+    ? `Active runtime provider: ${providerLabel}. Runtime activity: ${activityLabel}.`
+    : `Active runtime provider: ${providerLabel}`;
+  providerBadge.setAttribute("aria-label", providerBadge.title);
   providerBadge.className = "runtime-badge";
   if (!activeProvider) {
     providerBadge.classList.add("runtime-badge-idle");

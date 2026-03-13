@@ -60,6 +60,7 @@ DEFAULT_TRUST_PROXY_HEADERS = False
 DEFAULT_WS_AUTH_HANDSHAKE_TIMEOUT_SEC = 5.0
 DEFAULT_WS_SESSION_TOKEN_TTL_SEC = 30.0
 DEFAULT_WS_SESSION_TOKEN_MAX_TOKENS = 1024
+DEFAULT_RUNTIME_IDLE_UNLOAD_SEC = 0.0
 
 
 def parse_bool_env(value: str | None, *, default: bool = False) -> bool:
@@ -331,6 +332,24 @@ def get_runtime_provider_mode() -> ProviderMode:
 
 def get_runtime_provider_strict() -> bool:
     return parse_bool_env(os.getenv("KOKORO_STRICT_PROVIDER"), default=False)
+
+
+def get_runtime_idle_unload_seconds() -> float:
+    raw_timeout = os.getenv(
+        "KOKORO_RUNTIME_IDLE_UNLOAD_SEC", str(DEFAULT_RUNTIME_IDLE_UNLOAD_SEC)
+    ).strip()
+    try:
+        timeout = float(raw_timeout)
+    except ValueError as exc:
+        raise RuntimeError(
+            "KOKORO_RUNTIME_IDLE_UNLOAD_SEC must be a non-negative number, "
+            + f"got {raw_timeout!r}."
+        ) from exc
+    if timeout < 0:
+        raise RuntimeError(
+            "KOKORO_RUNTIME_IDLE_UNLOAD_SEC must be 0 or greater, " + f"got {timeout}."
+        )
+    return timeout
 
 
 def get_runtime_cuda_lib_dir() -> str | None:
