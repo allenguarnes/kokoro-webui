@@ -262,16 +262,7 @@ class RuntimeSelectionTests(unittest.TestCase):
                 return_value="CUDAExecutionProvider",
             ),
             patch("app.runtime.os.getpid", return_value=4242),
-            patch(
-                "app.runtime.os.getpgid",
-                side_effect=lambda process_pid: (
-                    55
-                    if process_pid in {4242, 5000}
-                    else 66
-                    if process_pid == 7777
-                    else 99
-                ),
-            ),
+            patch("app.runtime.os.getpgid", side_effect=_fake_getpgid_with_group_55),
         ):
             usage = runtime.get_current_process_gpu_usage()
 
@@ -321,12 +312,7 @@ class RuntimeSelectionTests(unittest.TestCase):
                 return_value="CUDAExecutionProvider",
             ),
             patch("app.runtime.os.getpid", return_value=4242),
-            patch(
-                "app.runtime.os.getpgid",
-                side_effect=lambda process_pid: (
-                    77 if process_pid in {4242, 5000} else 11
-                ),
-            ),
+            patch("app.runtime.os.getpgid", side_effect=_fake_getpgid_with_group_77),
         ):
             usage = runtime.get_current_process_gpu_usage()
 
@@ -334,6 +320,18 @@ class RuntimeSelectionTests(unittest.TestCase):
         self.assertEqual(usage.used_bytes, 0)
         self.assertEqual(usage.group_used_bytes, 256 * 1024 * 1024)
         self.assertEqual(usage.group_member_pids, [5000])
+
+
+def _fake_getpgid_with_group_55(process_pid: int) -> int:
+    if process_pid in {4242, 5000}:
+        return 55
+    if process_pid == 7777:
+        return 66
+    return 99
+
+
+def _fake_getpgid_with_group_77(process_pid: int) -> int:
+    return 77 if process_pid in {4242, 5000} else 11
 
 
 if __name__ == "__main__":
