@@ -2,415 +2,198 @@
 
 Base URL: `http://127.0.0.1:8000`
 
-This server exposes two API groups:
+Kokoro WebUI provides two API groups:
 
-- Native Kokoro WebUI routes under `/api/*` plus `ws://.../ws/*`
-- OpenAI-compatible routes under `/v1/*`
+- **Native API** - Full-featured endpoints under `/api/*` and `ws://.../ws/*`
+- **OpenAI-compatible API** - Drop-in replacement for OpenAI's `/v1/audio/speech`
+
+## Quick Reference
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/health` | GET | Check server status and queue |
+| `/api/capabilities` | GET | List voices, formats, and limits |
+| `/api/speak` | POST | Generate single audio file |
+| `/api/speak-stream` | POST | Stream audio as NDJSON |
+| `/ws/speak-stream` | WS | Stream audio over WebSocket |
+| `/v1/audio/speech` | POST | OpenAI-compatible endpoint |
+
+For practical examples, see [examples/README.md](../examples/).
 
 ## Authentication
 
-- Auth is optional and controlled by server configuration.
-- When `KOKORO_REQUIRE_AUTH=1`, all non-static API routes require an API key.
-- HTTP routes accept either `Authorization: Bearer <key>` or `X-API-Key: <key>`.
-- `WS /ws/speak-stream` accepts the bearer header during handshake for non-browser clients.
-- The built-in Web UI uses `POST /api/ws-token` to issue a short-lived one-time token and sends that `ws_token` in the first WebSocket message instead of the long-lived API key.
-- Query-string API keys are intentionally not supported.
-- Repeated auth failures are throttled per client identity and return `429` with a `Retry-After` header.
-- `GET /api/public-config` is intentionally public so the built-in Web UI can discover whether auth is required before calling protected routes.
-- The built-in Web UI keeps the API key in memory only. Reloading the page requires entering it again.
+Authentication is optional. When `KOKORO_REQUIRE_AUTH=1` is set:
 
-## Quick Links
+- HTTP routes accept `Authorization: Bearer <key>` or `X-API-Key: <key>`
+- WebSocket accepts the bearer header during handshake
+- The built-in Web UI uses short-lived session tokens instead of the API key
+- Query string API keys are not supported (security)
 
-### Native Endpoints
+Failed auth attempts are rate-limited per client. After too many failures, you'll get `429 Too Many Requests` with a `Retry-After` header.
 
-- [Authentication](#authentication)
-- [`GET /api/public-config`](#get-apipublic-config)
-- [Common Native Fields](#common-native-fields)
-- [`GET /api/health`](#get-apihealth)
-- [`GET /api/capabilities`](#get-apicapabilities)
-- [`POST /api/speak`](#post-apispeak)
-- [`POST /api/chunk-plan`](#post-apichunk-plan)
-- [`POST /api/speak-stream`](#post-apispeak-stream)
-- [`WS /ws/speak-stream`](#ws-wsspeak-stream)
-
-### OpenAI-Compatible Endpoints
-
-- [OpenAI Compatibility](#openai-compatibility)
-- [`GET /v1/models`](#get-v1models)
-- [`GET /v1/models/{model_id}`](#get-v1modelsmodel_id)
-- [`POST /v1/audio/speech`](#post-v1audiospeech)
-
-### Examples
-
-- [Curl Examples](#curl-examples)
+See [CONFIGURATION.md](../CONFIGURATION.md) for details on setting up authentication.
 
 ## Native Endpoints
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/public-config` | Public UI bootstrap config |
-| `GET` | `/api/health` | Readiness and queue status |
-| `GET` | `/api/capabilities` | Runtime capabilities, voices, formats, and limits |
-| `POST` | `/api/speak` | Render one audio response |
-| `POST` | `/api/chunk-plan` | Return chunk metadata without audio |
-| `POST` | `/api/speak-stream` | Stream chunked audio over NDJSON |
-| `WS` | `/ws/speak-stream` | Stream chunked audio over WebSocket |
+### Common Fields
 
-## Common Native Fields
-
-These fields are shared across the native synthesis routes.
+These fields work across most native synthesis endpoints:
 
 | Field | Type | Required | Notes |
-| --- | --- | --- | --- |
-| `text` | string | yes | `1..2500` chars |
+|-------|------|----------|-------|
+| `text` | string | yes | 1 to 2500 characters |
 | `voice` | string | no | Default: `af_heart` |
-| `speed` | number | no | Range: `0.5..1.8`, default `1.0` |
-| `pitch` | number | no | Range: `-6.0..6.0` semitones, default `0.0` |
-| `lang` | string | no | One of `en-us`, `en-gb`, `fr-fr`, `ja`, `ko`, `cmn` |
-| `format` | string | no | Server-enabled format such as `pcm`, `wav`, or `opus`. If omitted, the server uses its first enabled format. |
-| `opus_bitrate` | string | no | One of `16k`, `24k`, `32k`, `48k` |
-| `wav_sample_rate` | string | no | One of `native`, `16000`, `22050`, `24000`, `44100`, `48000` |
+| `speed` | number | no | 0.5 to 1.8, default 1.0 |
+| `pitch` | number | no | -6.0 to 6.0 semitones, default 0.0 |
+| `format` | string | no | `pcm`, `wav`, or `opus` (server-dependent) |
+| `opus_bitrate` | string | no | `16k`, `24k`, `32k`, or `48k` |
+| `wav_sample_rate` | string | no | `native`, `16000`, `22050`, `24000`, `44100`, `48000` |
 
 Notes:
 
-- `pitch: 0.0` is a no-op and skips backend pitch-shift processing.
-- Pitch shifting depends on `ffmpeg` with the `rubberband` filter.
-- `opus_bitrate` matters only when `format` is `opus`.
-- `wav_sample_rate` matters when `format` is `wav` or `pcm`.
-- `/api/capabilities.formats` is the authoritative list of formats enabled on this server.
+- `pitch: 0.0` skips pitch processing entirely (faster)
+- Pitch shifting requires ffmpeg with rubberband filter
+- Check `/api/capabilities` to see which formats your server supports
 
-### `GET /api/public-config`
+### GET /api/health
 
-Returns the minimum public configuration needed by the built-in Web UI before authentication.
+Returns server status, queue information, and runtime health.
 
-### Response
-
-```json
-{
-  "web_ui_enabled": true,
-  "auth_required": true,
-  "auth_scheme": "bearer",
-  "websocket_auth": "header-or-session-token"
-}
-```
-
-### `POST /api/ws-token`
-
-Issue a short-lived one-time WebSocket session token. This is mainly used by the built-in Web UI when auth is enabled.
-
-Headers:
-
-- `Authorization: Bearer <api-key>` or `X-API-Key: <api-key>`
-
-Response body:
-
-```json
-{
-  "token": "base64url-token",
-  "token_type": "ws",
-  "expires_in": 30
-}
-```
-
-### `GET /api/health`
-
-Returns lightweight readiness and queue status.
-
-### Response
+**Example response:**
 
 ```json
 {
   "ok": true,
   "missing": [],
   "active_provider": "CPUExecutionProvider",
-  "active_providers": ["CPUExecutionProvider"],
-  "provider_fallback": false,
-  "provider_error": null,
-  "runtime_error": null,
   "gpu": {
-    "process_pid": 41234,
-    "available": true,
-    "process_vram_used_bytes": 201326592,
-    "process_vram_used_mb": 192.0,
-    "source": "nvml",
-    "error": null
+    "available": false,
+    "process_vram_used_mb": 0
   },
   "queue": {
     "worker_limit": 2,
     "queue_limit": 8,
-    "capacity_limit": 10,
-    "reserved_jobs": 0,
     "active_jobs": 0,
     "queued_jobs": 0,
-    "available_slots": 10,
-    "admitted_jobs_total": 24,
-    "completed_jobs_total": 24,
-    "rejected_jobs_total": 0,
-    "queue_wait_last_ms": 0.21,
-    "queue_wait_avg_ms": 0.11,
-    "queue_wait_max_ms": 1.48,
-    "queue_wait_samples": 24
+    "available_slots": 10
   }
 }
 ```
 
-### Field Notes
+Key fields:
 
-| Field | Meaning |
-| --- | --- |
-| `ok` | `true` when runtime and model assets are available |
-| `missing` | Missing dependency or asset names |
-| `active_provider` | Currently active provider, if available |
-| `provider_fallback` | Whether runtime fell back from the requested provider |
-| `runtime_error` | Runtime bootstrap failure, if any |
-| `gpu` | Per-process GPU memory for the current server process when NVML is available and the runtime is using a GPU provider |
-| `queue` | Current scheduler capacity, rejection counters, and queue-wait timing |
+- `ok` - `true` when everything is working
+- `missing` - List of missing dependencies or assets
+- `active_provider` - Current runtime (CPU, CUDA, etc.)
+- `queue` - Current load and capacity
 
-### `GET /api/capabilities`
+### GET /api/capabilities
 
-Returns the full runtime and configuration surface used by the Web UI.
+Returns detailed information about available features.
 
-### Response
+**Example response:**
 
 ```json
 {
-  "model_path": "/abs/path/models/kokoro-v1.0.onnx",
-  "voices_path": "/abs/path/models/voices-v1.0.bin",
-  "voices": ["af_heart", "af_sarah"],
+  "voices": ["af_heart", "af_sarah", "am_michael"],
   "formats": ["wav", "opus", "pcm"],
-  "opus_bitrates": ["16k", "24k", "32k", "48k"],
-  "wav_sample_rates": ["native", "16000", "22050", "24000", "44100", "48000"],
-  "requested_provider": "auto",
-  "attempted_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
-  "available_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
-  "active_provider": "CPUExecutionProvider",
-  "active_providers": ["CPUExecutionProvider"],
-  "provider_fallback": true,
-  "provider_error": "Failed to load CUDA runtime.",
-  "runtime_error": null,
   "pitch_shifting": true,
   "synthesis_workers": 2,
-  "synthesis_queue_limit": 8,
-  "scheduler": {
-    "requested_provider": "auto",
-    "active_provider": "CPUExecutionProvider",
-    "runtime_kind": "gpu",
-    "execution_model": "shared-runtime",
-    "supported_execution_models": ["shared-runtime"],
-    "planned_execution_models": ["session-pool"],
-    "worker_limit": 2,
-    "queue_limit": 8,
-    "interactive_reserve_slots": 1,
-    "prefers_serial_workers": true,
-    "experimental_gpu_concurrency": true,
-    "concurrency_note": "GPU-preferred mode currently shares one runtime session; keep workers at 1 unless benchmarked.",
-    "warning": "GPU-preferred mode currently shares one runtime session. If this resolves to CUDA, KOKORO_SYNTH_WORKERS > 1 is an experimental tuning path."
-  },
-  "max_pitch_semitones": 6.0,
-  "streaming": true,
-  "websocket_streaming": true,
-  "queue": {
-    "worker_limit": 2,
-    "queue_limit": 8,
-    "capacity_limit": 10,
-    "interactive_reserve_slots": 1,
-    "stream_capacity_limit": 9,
-    "reserved_jobs": 0,
-    "active_jobs": 0,
-    "queued_jobs": 0,
-    "available_slots": 10,
-    "admitted_jobs_total": 24,
-    "completed_jobs_total": 24,
-    "rejected_jobs_total": 0,
-    "queue_wait_last_ms": 0.21,
-    "queue_wait_avg_ms": 0.11,
-    "queue_wait_max_ms": 1.48,
-    "queue_wait_samples": 24
-  }
+  "websocket_streaming": true
 }
 ```
 
-### Field Notes
+Use this to populate UI controls or validate requests.
 
-| Field | Meaning |
-| --- | --- |
-| `voices` | Available Kokoro voice IDs |
-| `pitch_shifting` | Whether backend pitch shift is available |
-| `websocket_streaming` | Whether the runtime can serve WebSocket streaming |
-| `synthesis_workers` | Number of active synthesis worker threads |
-| `synthesis_queue_limit` | Number of queued jobs allowed behind active workers |
-| `scheduler` | Provider-aware scheduling policy currently used by the backend |
-| `queue.queue_wait_*` | Recent and cumulative wait-time indicators for admitted jobs |
+### POST /api/speak
 
-### `POST /api/speak`
+Generate a single audio file from text.
 
-Generates one audio response.
-
-### Request
+**Request:**
 
 ```json
 {
-  "text": "The future sounds calmer when it is rendered locally.",
+  "text": "Hello world",
   "voice": "af_heart",
   "speed": 1.0,
-  "pitch": -2.0,
-  "lang": "en-us",
-  "format": "wav",
-  "wav_sample_rate": "native"
+  "pitch": 0.0,
+  "format": "wav"
 }
 ```
 
-### Success Response
+**Response:**
 
-Returns audio bytes directly.
+Returns raw audio bytes:
 
-- `audio/pcm` when `format` is `pcm`
-- `audio/wav` when `format` is `wav`
-- `audio/ogg` when `format` is `opus`
+- `audio/pcm` for `format: pcm`
+- `audio/wav` for `format: wav`
+- `audio/ogg` for `format: opus`
 
-### Response Headers
+Response headers include metadata:
 
-| Header | Meaning |
-| --- | --- |
-| `Content-Disposition` | Inline filename |
-| `X-Audio-Bytes` | Encoded audio byte length |
-| `X-Audio-Format` | `pcm`, `wav`, or `opus` |
-| `X-Sample-Rate` | Final sample rate |
+| Header | Description |
+|--------|-------------|
+| `X-Audio-Format` | Format used |
+| `X-Sample-Rate` | Sample rate in Hz |
 | `X-Audio-Duration` | Duration in seconds |
-| `X-Opus-Bitrate` | Populated for Opus responses |
-| `X-Wav-Sample-Rate` | Populated for WAV responses |
 
-### Error Response
+**Errors:**
 
-Status: `400`
+- `400` - Invalid request (bad voice, format not supported, etc.)
+- `503` - Server overloaded (queue full)
 
-```json
-{
-  "detail": "Pitch shifting failed: ..."
-}
-```
+### POST /api/speak-stream
 
-### `POST /api/chunk-plan`
+Stream audio chunks as they're generated using NDJSON (Newline Delimited JSON).
 
-Returns how the server would split text before synthesis.
+**Request:**
 
-### Request
+Same as `/api/speak`, plus optional:
 
-```json
-{
-  "text": "Good evening. This is a longer passage. It will be split by sentence boundaries.",
-  "target_chunk_chars": 360,
-  "include_text": false
-}
-```
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `target_chunk_chars` | integer | 360 | Target characters per chunk (80-2000) |
 
-### Request Fields
+**Response:**
 
-| Field | Type | Required | Notes |
-| --- | --- | --- | --- |
-| `text` | string | yes | `1..2500` chars |
-| `target_chunk_chars` | integer | no | Range: `80..2000`, default `360` |
-| `include_text` | boolean | no | Include chunk text in the response |
+Content-Type: `application/x-ndjson`
 
-### Response
+Each line is a JSON object with a `type` field:
 
-```json
-{
-  "chunks": [
-    {
-      "index": 0,
-      "char_count": 67,
-      "word_count": 12,
-      "sentence_count": 2
-    }
-  ],
-  "count": 1,
-  "lengths": [67],
-  "target_chunk_chars": 360
-}
-```
-
-If `include_text` is `true`, each chunk object also includes `text`.
-
-### `POST /api/speak-stream`
-
-Streams chunked synthesis over NDJSON.
-
-### Request
-
-Uses all native synthesis fields plus `target_chunk_chars`.
-
-```json
-{
-  "text": "Long text here.",
-  "voice": "af_heart",
-  "speed": 1.0,
-  "pitch": 2.0,
-  "lang": "en-us",
-  "format": "opus",
-  "opus_bitrate": "32k",
-  "target_chunk_chars": 360
-}
-```
-
-### Additional Field
-
-| Field | Type | Required | Notes |
-| --- | --- | --- | --- |
-| `target_chunk_chars` | integer | no | Range: `80..2000`, default `360` |
-
-### Response Type
-
-`application/x-ndjson`
-
-Each line is one JSON object with a `type`.
-
-### `meta` Message
+**Meta message** (first):
 
 ```json
 {
   "type": "meta",
   "total_chunks": 3,
-  "format": "opus",
-  "opus_bitrate": "32k",
-  "wav_sample_rate": null,
-  "pitch": 2.0,
-  "target_chunk_chars": 360
+  "format": "wav"
 }
 ```
 
-### `chunk` Message
+**Chunk message** (one per audio chunk):
 
 ```json
 {
   "type": "chunk",
   "chunk_index": 0,
   "total_chunks": 3,
-  "text": "First chunk.",
-  "pitch": 2.0,
-  "bytes": 12234,
-  "sample_rate": 24000,
+  "text": "First sentence.",
   "duration_sec": 1.28,
-  "synth_ms": 85.41,
-  "format": "opus",
-  "opus_bitrate": "32k",
-  "wav_sample_rate": null,
-  "mime_type": "audio/ogg",
   "audio_base64": "..."
 }
 ```
 
-### `error` Message
+**Error message** (if a chunk fails):
 
 ```json
 {
   "type": "error",
-  "detail": "Pitch shifting failed: ...",
+  "detail": "Pitch shifting failed",
   "chunk_index": 1
 }
 ```
 
-### `done` Message
+**Done message** (last):
 
 ```json
 {
@@ -419,56 +202,103 @@ Each line is one JSON object with a `type`.
 }
 ```
 
-### `WS /ws/speak-stream`
+### WS /ws/speak-stream
 
-Streams the same message types as `/api/speak-stream`, but over WebSocket.
+WebSocket endpoint for real-time streaming.
 
-### Client Flow
+**Usage:**
 
 1. Connect to `ws://127.0.0.1:8000/ws/speak-stream`
-2. Send one JSON text message matching the `/api/speak-stream` request body
-3. Read `meta`, `chunk`, `error`, and `done` messages as JSON text frames
+2. Send a JSON message with synthesis parameters
+3. Receive messages in the same format as NDJSON streaming
 
-### Example Client Payload
+**Example client payload:**
 
 ```json
 {
-  "text": "Long text here.",
+  "text": "WebSocket streaming example",
   "voice": "af_heart",
-  "speed": 1.0,
-  "pitch": -1.5,
-  "lang": "en-us",
   "format": "wav",
-  "wav_sample_rate": "native",
   "target_chunk_chars": 360
 }
 ```
 
-### Message Types
+WebSocket is ideal for real-time applications where you want to start playing audio before the full text is synthesized.
 
-The server sends the same `meta`, `chunk`, `error`, and `done` shapes documented for `/api/speak-stream`.
+## OpenAI-Compatible Endpoints
 
-## OpenAI Compatibility
+Kokoro WebUI implements the OpenAI audio speech API, making it a drop-in replacement for applications that use OpenAI's TTS.
 
-Most OpenAI-compatible clients expect the base URL to already include `/v1`, for example:
+**Base URL:** `http://127.0.0.1:8000/v1`
 
-- `http://127.0.0.1:8000/v1`
+### POST /v1/audio/speech
 
-That is usually the correct setting for external integrations. If you point those clients at `http://127.0.0.1:8000` instead, many of them will append `/models` or `/audio/speech` on their own and miss the compatibility routes.
+OpenAI-compatible speech generation.
 
-If auth is enabled, use the same bearer key you use for the native API.
+**Request:**
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/v1/models` | OpenAI-compatible model list |
-| `GET` | `/v1/models/{model_id}` | OpenAI-compatible model metadata |
-| `POST` | `/v1/audio/speech` | OpenAI-compatible speech generation |
+```json
+{
+  "model": "kokoro",
+  "input": "Hello from the compatible endpoint",
+  "voice": "af_heart",
+  "response_format": "wav",
+  "speed": 1.0
+}
+```
 
-### `GET /v1/models`
+**Fields:**
 
-OpenAI-compatible model list.
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `model` | string | yes | Ignored (accepted for compatibility) |
+| `input` | string | yes | Text to synthesize (1-4096 chars) |
+| `voice` | string | yes | Voice ID, or with pitch suffix like `af_heart+2.0` |
+| `response_format` | string | no | `pcm`, `wav`, or `opus` |
+| `speed` | number | no | 0.25-4.0 (but Kokoro only supports 0.5-1.8) |
 
-### Response
+**Pitch with OpenAI API:**
+
+The OpenAI API doesn't have a `pitch` field, so we use voice suffixes:
+
+- `af_heart` - Normal pitch (0.0)
+- `af_heart+2.0` - Raise pitch 2 semitones
+- `af_heart-1.5` - Lower pitch 1.5 semitones
+
+Suffix must be between -6.0 and +6.0.
+
+**Response:**
+
+Returns raw audio bytes:
+
+- `wav` and `pcm` stream progressively (chunked transfer encoding)
+- `opus` returns after full render
+
+**Headers:**
+
+| Header | Description |
+|--------|-------------|
+| `X-OpenAI-Compatible` | Always `kokoro` |
+| `X-Audio-Format` | Format used |
+
+**Errors:**
+
+Returns OpenAI-compatible error format:
+
+```json
+{
+  "error": {
+    "message": "speed must be between 0.5 and 1.8 for Kokoro",
+    "type": "invalid_request_error"
+  }
+}
+```
+
+### GET /v1/models
+
+Returns available models (just `kokoro`).
+
+**Response:**
 
 ```json
 {
@@ -477,97 +307,44 @@ OpenAI-compatible model list.
     {
       "id": "kokoro",
       "object": "model",
-      "created": 0,
       "owned_by": "kokoro-webui"
     }
   ]
 }
 ```
 
-### `GET /v1/models/{model_id}`
+### GET /v1/models/{model_id}
 
-Returns metadata for `kokoro`.
+Returns metadata for a specific model.
 
-### Success Response
+**Response:**
 
 ```json
 {
   "id": "kokoro",
   "object": "model",
-  "created": 0,
   "owned_by": "kokoro-webui"
 }
 ```
 
-### Not Found Response
+## Error Handling
 
-Status: `404`
+All endpoints return consistent error formats:
+
+**Native API errors:**
+
+```json
+{
+  "detail": "Voice 'invalid_voice' not found"
+}
+```
+
+**OpenAI-compatible errors:**
 
 ```json
 {
   "error": {
-    "message": "The model 'other-model' does not exist.",
-    "type": "invalid_request_error",
-    "param": null,
-    "code": "model_not_found"
-  }
-}
-```
-
-### `POST /v1/audio/speech`
-
-OpenAI-compatible speech generation.
-
-### Request
-
-```json
-{
-  "model": "kokoro",
-  "input": "The future sounds calmer when it is rendered locally.",
-  "voice": "af_heart",
-  "response_format": "wav",
-  "speed": 1.0
-}
-```
-
-### Request Fields
-
-| Field | Type | Required | Notes |
-| --- | --- | --- | --- |
-| `model` | string | yes | Accepted for compatibility, currently ignored |
-| `input` | string | yes | `1..4096` chars |
-| `voice` | string or object | yes | String voice ID, optional suffixed form like `af_heart+2.0`, or object form like `{ "id": "af_heart-2.0" }` |
-| `response_format` | string | no | Server-enabled format such as `pcm`, `wav`, or `opus`. If omitted, the server uses its first enabled format. |
-| `speed` | number | no | Accepted range `0.25..4.0`, but values outside `0.5..1.8` are rejected by the Kokoro adapter |
-| `instructions` | string or null | no | Accepted but currently unused |
-| `stream_format` | string or null | no | `sse` is not supported |
-
-### Success Response
-
-Returns audio bytes directly.
-
-- `audio/pcm` when `response_format` is `pcm`
-- `audio/wav` when `response_format` is `wav`
-- `audio/ogg` when `response_format` is `opus`
-
-For `wav` and `pcm`, the server writes the response progressively with HTTP chunked transfer encoding so clients can start playback before the full render finishes. That matches the common OpenAI `/v1/audio/speech` streaming pattern more closely. `opus` still returns after the full render is ready.
-
-### Response Headers
-
-| Header | Meaning |
-| --- | --- |
-| `X-OpenAI-Compatible` | Always `kokoro` |
-| `X-Audio-Format` | `pcm`, `wav`, or `opus` |
-| `X-Sample-Rate` | Final sample rate |
-
-### Error Response
-
-Status: `400`
-
-```json
-{
-  "error": {
-    "message": "speed must be between 0.5 and 1.8 for Kokoro.",
+    "message": "Voice 'invalid_voice' not found",
     "type": "invalid_request_error",
     "param": null,
     "code": null
@@ -575,114 +352,65 @@ Status: `400`
 }
 ```
 
-Notes:
+**Common status codes:**
 
-- This compatibility route does not expose a separate `pitch` field. Use the `voice` suffix forms `af_heart+2.0` or `af_heart-2.0` instead.
-- The suffix is optional. `af_heart` implies `0.0` pitch shift and skips post-processing.
-- The signed voice suffix must stay within `-6.0..+6.0` semitones.
-- This compatibility route does not expose native `lang`, `opus_bitrate`, `wav_sample_rate`, or `target_chunk_chars`.
-- `stream_format: "sse"` returns an error.
+| Code | Meaning |
+|------|---------|
+| 400 | Bad request (invalid parameters) |
+| 401 | Unauthorized (auth required but missing) |
+| 429 | Too many requests (rate limited) |
+| 503 | Service unavailable (queue full) |
 
-## Curl Examples
+## Using with OpenAI Clients
 
-### Health
+### Official Python client
 
-```bash
-curl http://127.0.0.1:8000/api/health
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="not-needed"  # Or your API key if auth is enabled
+)
+
+response = client.audio.speech.create(
+    model="kokoro",
+    input="Hello world",
+    voice="af_heart",
+    response_format="wav"
+)
+
+response.stream_to_file("output.wav")
 ```
 
-### Single WAV Render
+### LangChain
 
-```bash
-curl -X POST http://127.0.0.1:8000/api/speak \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "text": "Local TTS stays fast when the interface stays honest.",
-    "voice": "af_heart",
-    "speed": 1.0,
-    "pitch": -1.0,
-    "lang": "en-us",
-    "format": "wav",
-    "wav_sample_rate": "native"
-  }' \
-  --output output.wav
+```python
+from langchain_community.tools import OpenAITTS
+
+tts = OpenAITTS(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="not-needed"
+)
+
+audio = tts.invoke({
+    "input": "Hello from LangChain",
+    "voice": "af_heart"
+})
 ```
 
-### NDJSON Stream
+## More Examples
 
-```bash
-curl -N -X POST http://127.0.0.1:8000/api/speak-stream \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "text": "First sentence. Second sentence. Third sentence.",
-    "voice": "af_heart",
-    "speed": 1.0,
-    "pitch": 1.5,
-    "lang": "en-us",
-    "format": "opus",
-    "opus_bitrate": "32k",
-    "target_chunk_chars": 120
-  }'
-```
+For complete examples in multiple languages (curl, Python, JavaScript), see [examples/README.md](../examples/).
 
-### OpenAI-Compatible Speech
+## Differences from OpenAI
 
-```bash
-curl -X POST http://127.0.0.1:8000/v1/audio/speech \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "kokoro",
-    "input": "This request uses the OpenAI-compatible endpoint.",
-    "voice": "af_heart+1.5",
-    "response_format": "wav",
-    "speed": 1.0
-  }' \
-  --output openai-output.wav
-```
+While we aim for compatibility, there are some differences:
 
-### OpenAI-Compatible Streaming WAV
+1. **No SSE streaming** - `stream_format: "sse"` returns an error
+2. **Pitch via suffix** - Use `voice+2.0` instead of a separate pitch field
+3. **Speed limits** - Kokoro only supports 0.5x to 1.8x speed
+4. **Model ignored** - The `model` field is accepted but ignored
+5. **Native features missing** - No access to `lang`, `opus_bitrate`, or `target_chunk_chars` via OpenAI endpoints
 
-```bash
-curl http://127.0.0.1:8000/v1/audio/speech \
-  -H "Authorization: Bearer 1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "kokoro",
-    "input": "Good evening, and welcome. Tonight I want to speak about calm systems, patient work, and the quiet value of doing things well.",
-    "voice": "af_heart",
-    "response_format": "wav",
-    "speed": 1.0
-  }' | ffplay -i -
-```
-
-### OpenAI-Compatible Streaming PCM
-
-```bash
-curl http://127.0.0.1:8000/v1/audio/speech \
-  -H "Authorization: Bearer 1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "kokoro",
-    "input": "Good evening, and welcome. Tonight I want to speak about calm systems, patient work, and the quiet value of doing things well.",
-    "voice": "af_heart",
-    "response_format": "pcm",
-    "speed": 1.0
-  }' | ffplay -f s16le -ar 24000 -ch_layout mono -i -
-```
-
-### WebSocket Stream
-
-This example uses [`websocat`](https://github.com/vi/websocat).
-
-```bash
-printf '%s\n' '{
-  "text": "First sentence. Second sentence. Third sentence.",
-  "voice": "af_heart",
-  "speed": 1.0,
-  "pitch": 0.0,
-  "lang": "en-us",
-  "format": "wav",
-  "wav_sample_rate": "native",
-  "target_chunk_chars": 120
-}' | websocat ws://127.0.0.1:8000/ws/speak-stream
-```
+For full access to all features, use the native `/api/*` endpoints.
