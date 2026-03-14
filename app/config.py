@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 from pathlib import Path
 from typing import Literal, cast
@@ -181,6 +182,37 @@ def get_trust_proxy_headers() -> bool:
         os.getenv("KOKORO_TRUST_PROXY_HEADERS"),
         default=DEFAULT_TRUST_PROXY_HEADERS,
     )
+
+
+def get_trusted_proxy_ips() -> frozenset[str]:
+    raw = os.getenv("KOKORO_TRUSTED_PROXY_IPS", "").strip()
+    if not raw:
+        return frozenset()
+    ips: set[str] = set()
+    for part in raw.split(","):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        try:
+            ipaddress.ip_address(cleaned)
+            ips.add(cleaned)
+        except ValueError:
+            try:
+                ipaddress.ip_network(cleaned, strict=False)
+                ips.add(cleaned)
+            except ValueError:
+                raise RuntimeError(
+                    f"Invalid IP address or network in KOKORO_TRUSTED_PROXY_IPS: {cleaned!r}"
+                )
+    return frozenset(ips)
+
+
+def validate_proxy_config() -> None:
+    if get_trust_proxy_headers() and not get_trusted_proxy_ips():
+        raise RuntimeError(
+            "KOKORO_TRUST_PROXY_HEADERS=1 requires KOKORO_TRUSTED_PROXY_IPS to be set. "
+            "Configure the trusted proxy IPs (e.g., 127.0.0.1) to prevent header spoofing."
+        )
 
 
 def get_websocket_auth_handshake_timeout_seconds() -> float:

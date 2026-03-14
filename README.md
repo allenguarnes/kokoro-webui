@@ -221,7 +221,8 @@ The app auto-loads `.env` (if present).
 | `KOKORO_AUTH_FAILURE_LIMIT` | `5` | Max failed auth attempts per client within the throttle window before `429` responses begin |
 | `KOKORO_AUTH_FAILURE_WINDOW_SEC` | `60` | Auth failure throttle window in seconds |
 | `KOKORO_AUTH_FAILURE_MAX_BUCKETS` | `4096` | Upper bound for in-memory auth-failure buckets |
-| `KOKORO_TRUST_PROXY_HEADERS` | `0` | Trust `X-Forwarded-For` / `X-Real-IP` for auth-throttle client identity (enable only behind a trusted proxy) |
+| `KOKORO_TRUST_PROXY_HEADERS` | `0` | Trust `X-Forwarded-For` / `X-Real-IP` for auth-throttle client identity. Requires `KOKORO_TRUSTED_PROXY_IPS` to be set. |
+| `KOKORO_TRUSTED_PROXY_IPS` | unset | Comma-separated list of trusted proxy IPs or CIDRs (e.g., `127.0.0.1,10.0.0.0/8`). Required when `KOKORO_TRUST_PROXY_HEADERS=1`. The trusted proxy must overwrite `X-Real-IP` with the actual client IP - passing through client-supplied values allows spoofing. IPv4-mapped IPv6 (e.g., `::ffff:127.0.0.1`) is treated as a separate identity from its IPv4 counterpart. |
 | `KOKORO_WS_AUTH_HANDSHAKE_TIMEOUT_SEC` | `5` | Timeout for the first WebSocket auth payload before closing the connection |
 | `KOKORO_WS_SESSION_TOKEN_TTL_SEC` | `30` | Lifetime in seconds for one-time WebSocket session tokens issued to the built-in Web UI |
 | `KOKORO_WS_SESSION_TOKEN_MAX_TOKENS` | `1024` | Upper bound for in-memory pending WebSocket session tokens |
@@ -268,6 +269,8 @@ KOKORO_REQUIRE_AUTH=0
 # Trust X-Forwarded-For / X-Real-IP for auth-throttle identity.
 # Keep disabled unless running behind a trusted proxy.
 # KOKORO_TRUST_PROXY_HEADERS=0
+# Comma-separated list of trusted proxy IPs (required when TRUST_PROXY_HEADERS is enabled).
+# KOKORO_TRUSTED_PROXY_IPS=127.0.0.1
 # WebSocket auth handshake timeout in seconds.
 # KOKORO_WS_AUTH_HANDSHAKE_TIMEOUT_SEC=5
 # KOKORO_ALLOWED_ORIGINS=http://127.0.0.1:8000,http://localhost:8000

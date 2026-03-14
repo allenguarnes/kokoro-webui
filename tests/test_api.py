@@ -469,6 +469,19 @@ class ApiIntegrationTests(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_status_stream_hub_wait_for_refresh_consumes_signal(self) -> None:
+        async def run_test() -> None:
+            hub = create_status_stream_hub()
+
+            hub.request_refresh()
+            result1 = await hub.wait_for_refresh(0.1)
+            self.assertTrue(result1)
+
+            result2 = await hub.wait_for_refresh(0.1)
+            self.assertFalse(result2)
+
+        asyncio.run(run_test())
+
     def test_health_stream_requires_auth_when_enabled(self) -> None:
         with (
             patch.object(config, "get_require_auth", return_value=True),
@@ -959,6 +972,11 @@ class ApiIntegrationTests(unittest.TestCase):
             patch.object(config, "get_require_auth", return_value=True),
             patch.object(config, "get_api_key", return_value="secret-key"),
             patch.object(config, "get_trust_proxy_headers", return_value=True),
+            patch.object(
+                config,
+                "get_trusted_proxy_ips",
+                return_value=frozenset({"127.0.0.1", "::1"}),
+            ),
             patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk),
         ):
             test_app = api.create_app()
@@ -999,6 +1017,11 @@ class ApiIntegrationTests(unittest.TestCase):
             patch.object(config, "get_require_auth", return_value=True),
             patch.object(config, "get_api_key", return_value="secret-key"),
             patch.object(config, "get_trust_proxy_headers", return_value=True),
+            patch.object(
+                config,
+                "get_trusted_proxy_ips",
+                return_value=frozenset({"127.0.0.1", "::1"}),
+            ),
             patch.object(audio, "synthesize_chunk", side_effect=make_rendered_chunk),
         ):
             test_app = api.create_app()
@@ -1115,6 +1138,11 @@ class ApiIntegrationTests(unittest.TestCase):
             patch.object(config, "get_auth_failure_limit", return_value=1),
             patch.object(config, "get_auth_failure_window_seconds", return_value=60.0),
             patch.object(config, "get_trust_proxy_headers", return_value=True),
+            patch.object(
+                config,
+                "get_trusted_proxy_ips",
+                return_value=frozenset({"127.0.0.1"}),
+            ),
         ):
             test_app = api.create_app()
 
@@ -1154,6 +1182,361 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(first.status_code, 401)
         self.assertEqual(second.status_code, 401)
         self.assertEqual(third.status_code, 429)
+
+    def test_auth_throttle_ignores_forwarded_for_when_proxy_not_trusted(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(config, "get_auth_failure_limit", return_value=1),
+            patch.object(config, "get_auth_failure_window_seconds", return_value=60.0),
+            patch.object(config, "get_trust_proxy_headers", return_value=True),
+            patch.object(config, "get_trusted_proxy_ips", return_value=frozenset()),
+            patch.object(config, "validate_proxy_config", return_value=None),
+        ):
+            test_app = api.create_app()
+
+            async def run_test() -> tuple[httpx.Response, httpx.Response]:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    first = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "1.1.1.1",
+                        },
+                    )
+                    second = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "2.2.2.2",
+                        },
+                    )
+                    return first, second
+
+            first, second = asyncio.run(run_test())
+
+        self.assertEqual(first.status_code, 401)
+        self.assertEqual(second.status_code, 429)
+
+    def test_auth_throttle_trusts_rightmost_untrusted_in_chain(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(config, "get_auth_failure_limit", return_value=1),
+            patch.object(config, "get_auth_failure_window_seconds", return_value=60.0),
+            patch.object(config, "get_trust_proxy_headers", return_value=True),
+            patch.object(
+                config, "get_trusted_proxy_ips", return_value=frozenset({"127.0.0.1"})
+            ),
+            patch.object(config, "validate_proxy_config", return_value=None),
+        ):
+            test_app = api.create_app()
+
+            async def run_test() -> tuple[httpx.Response, httpx.Response]:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    first = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "1.1.1.1, 127.0.0.1",
+                        },
+                    )
+                    second = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "1.1.1.1, 127.0.0.1",
+                        },
+                    )
+                    return first, second
+
+            first, second = asyncio.run(run_test())
+
+        self.assertEqual(first.status_code, 401)
+        self.assertEqual(second.status_code, 429)
+
+    def test_auth_throttle_uses_cidr_trusted_proxy(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(config, "get_auth_failure_limit", return_value=1),
+            patch.object(config, "get_auth_failure_window_seconds", return_value=60.0),
+            patch.object(config, "get_trust_proxy_headers", return_value=True),
+            patch.object(
+                config, "get_trusted_proxy_ips", return_value=frozenset({"127.0.0.1/8"})
+            ),
+            patch.object(config, "validate_proxy_config", return_value=None),
+        ):
+            test_app = api.create_app()
+
+            async def run_test() -> tuple[httpx.Response, httpx.Response]:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    first = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "1.1.1.1",
+                        },
+                    )
+                    second = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "1.1.1.1",
+                        },
+                    )
+                    return first, second
+
+            first, second = asyncio.run(run_test())
+
+        self.assertEqual(first.status_code, 401)
+        self.assertEqual(second.status_code, 429)
+
+    def test_config_validation_rejects_missing_trusted_ips(self) -> None:
+        with patch.object(config, "get_trust_proxy_headers", return_value=True):
+            with patch.object(
+                config, "get_trusted_proxy_ips", return_value=frozenset()
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    config.validate_proxy_config()
+                self.assertIn("KOKORO_TRUSTED_PROXY_IPS", str(ctx.exception))
+
+    def test_config_validation_accepts_valid_ips(self) -> None:
+        with patch.object(config, "get_trust_proxy_headers", return_value=False):
+            config.validate_proxy_config()
+        with patch.object(config, "get_trust_proxy_headers", return_value=True):
+            with patch.object(
+                config, "get_trusted_proxy_ips", return_value=frozenset({"127.0.0.1"})
+            ):
+                config.validate_proxy_config()
+
+    def test_config_validation_rejects_invalid_ip(self) -> None:
+        with patch.object(config, "get_trust_proxy_headers", return_value=True):
+            with patch.object(
+                config, "get_trusted_proxy_ips", side_effect=RuntimeError("Invalid IP")
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    config.validate_proxy_config()
+                self.assertIn("Invalid IP", str(ctx.exception))
+
+    def test_auth_throttle_rejects_malformed_forwarded_header(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(config, "get_auth_failure_limit", return_value=1),
+            patch.object(config, "get_auth_failure_window_seconds", return_value=60.0),
+            patch.object(config, "get_trust_proxy_headers", return_value=True),
+            patch.object(
+                config, "get_trusted_proxy_ips", return_value=frozenset({"127.0.0.1"})
+            ),
+            patch.object(config, "validate_proxy_config", return_value=None),
+        ):
+            test_app = api.create_app()
+
+            async def run_test() -> tuple[httpx.Response, httpx.Response]:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    first = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "not-an-ip, 127.0.0.1",
+                        },
+                    )
+                    second = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "also-not-an-ip, 127.0.0.1",
+                        },
+                    )
+                    return first, second
+
+            first, second = asyncio.run(run_test())
+
+        self.assertEqual(first.status_code, 401)
+        self.assertEqual(second.status_code, 429)
+
+    def test_auth_throttle_canonicalizes_ipv6(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(config, "get_auth_failure_limit", return_value=1),
+            patch.object(config, "get_auth_failure_window_seconds", return_value=60.0),
+            patch.object(config, "get_trust_proxy_headers", return_value=True),
+            patch.object(
+                config, "get_trusted_proxy_ips", return_value=frozenset({"127.0.0.1"})
+            ),
+            patch.object(config, "validate_proxy_config", return_value=None),
+        ):
+            test_app = api.create_app()
+
+            async def run_test() -> tuple[httpx.Response, httpx.Response]:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    first = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "2001:db8::1",
+                        },
+                    )
+                    second = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "2001:0db8:0000:0000:0000:0000:0000:0001",
+                        },
+                    )
+                    return first, second
+
+            first, second = asyncio.run(run_test())
+
+        self.assertEqual(first.status_code, 401)
+        self.assertEqual(second.status_code, 429)
+
+    def test_auth_throttle_uses_real_ip_header(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(config, "get_auth_failure_limit", return_value=1),
+            patch.object(config, "get_auth_failure_window_seconds", return_value=60.0),
+            patch.object(config, "get_trust_proxy_headers", return_value=True),
+            patch.object(
+                config, "get_trusted_proxy_ips", return_value=frozenset({"127.0.0.1"})
+            ),
+            patch.object(config, "validate_proxy_config", return_value=None),
+        ):
+            test_app = api.create_app()
+
+            async def run_test() -> tuple[httpx.Response, httpx.Response]:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    first = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Real-IP": "1.1.1.1",
+                        },
+                    )
+                    second = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Real-IP": "1.1.1.1",
+                        },
+                    )
+                    return first, second
+
+            first, second = asyncio.run(run_test())
+
+        self.assertEqual(first.status_code, 401)
+        self.assertEqual(second.status_code, 429)
+
+    def test_auth_throttle_rejects_malformed_real_ip(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(config, "get_auth_failure_limit", return_value=1),
+            patch.object(config, "get_auth_failure_window_seconds", return_value=60.0),
+            patch.object(config, "get_trust_proxy_headers", return_value=True),
+            patch.object(
+                config, "get_trusted_proxy_ips", return_value=frozenset({"127.0.0.1"})
+            ),
+            patch.object(config, "validate_proxy_config", return_value=None),
+        ):
+            test_app = api.create_app()
+
+            async def run_test() -> tuple[httpx.Response, httpx.Response]:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    first = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Real-IP": "not-an-ip",
+                        },
+                    )
+                    second = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Real-IP": "also-invalid",
+                        },
+                    )
+                    return first, second
+
+            first, second = asyncio.run(run_test())
+
+        self.assertEqual(first.status_code, 401)
+        self.assertEqual(second.status_code, 429)
+
+    def test_auth_throttle_ipv4_mapped_ipv6_trusted_proxy(self) -> None:
+        with (
+            patch.object(config, "get_require_auth", return_value=True),
+            patch.object(config, "get_api_key", return_value="secret-key"),
+            patch.object(config, "get_auth_failure_limit", return_value=1),
+            patch.object(config, "get_auth_failure_window_seconds", return_value=60.0),
+            patch.object(config, "get_trust_proxy_headers", return_value=True),
+            patch.object(
+                config,
+                "get_trusted_proxy_ips",
+                return_value=frozenset({"::ffff:127.0.0.1"}),
+            ),
+            patch.object(config, "validate_proxy_config", return_value=None),
+        ):
+            test_app = api.create_app()
+
+            async def run_test() -> tuple[httpx.Response, httpx.Response]:
+                transport = httpx.ASGITransport(app=test_app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    first = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "1.1.1.1, ::ffff:127.0.0.1",
+                        },
+                    )
+                    second = await client.get(
+                        "/api/health",
+                        headers={
+                            "Authorization": "Bearer invalid",
+                            "X-Forwarded-For": "2.2.2.2, ::ffff:127.0.0.1",
+                        },
+                    )
+                    return first, second
+
+            first, second = asyncio.run(run_test())
+
+        self.assertEqual(first.status_code, 401)
+        self.assertEqual(second.status_code, 429)
 
     def test_websocket_auth_handshake_timeout_closes_connection(self) -> None:
         with (

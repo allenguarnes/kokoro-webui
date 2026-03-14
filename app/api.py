@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import re
 import secrets
@@ -49,6 +50,7 @@ class HeaderLookup(Protocol):
 
 
 def create_app() -> FastAPI:
+    config.validate_proxy_config()
     web_ui_enabled = config.get_web_ui_enabled()
     require_auth = config.get_require_auth()
     configured_api_key = config.get_api_key()
@@ -57,6 +59,19 @@ def create_app() -> FastAPI:
     auth_failure_window_sec = config.get_auth_failure_window_seconds()
     auth_failure_max_buckets = config.get_auth_failure_max_buckets()
     trust_proxy_headers = config.get_trust_proxy_headers()
+    trusted_proxy_ips = config.get_trusted_proxy_ips()
+    trusted_proxy_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    trusted_proxy_addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for trusted in trusted_proxy_ips:
+        try:
+            if "/" in trusted:
+                trusted_proxy_networks.append(
+                    ipaddress.ip_network(trusted, strict=False)
+                )
+            else:
+                trusted_proxy_addresses.append(ipaddress.ip_address(trusted))
+        except ValueError:
+            pass
     ws_auth_handshake_timeout_sec = (
         config.get_websocket_auth_handshake_timeout_seconds()
     )
@@ -347,20 +362,52 @@ def create_app() -> FastAPI:
         cleaned = (selected or "").strip()
         return cleaned or "unknown-client"
 
-    def get_forwarded_host(headers: object) -> str | None:
+    def get_forwarded_host(client_ip: str | None, headers: object) -> str | None:
         if not trust_proxy_headers:
+            return None
+        if client_ip is None:
+            return None
+        try:
+            client_addr = ipaddress.ip_address(client_ip)
+        except ValueError:
+            return None
+        is_trusted = client_addr in trusted_proxy_addresses or any(
+            client_addr in net for net in trusted_proxy_networks
+        )
+        if not is_trusted:
             return None
         if not isinstance(headers, HeaderLookup):
             return None
         get_header = headers.get
         forwarded_for = (get_header("X-Forwarded-For", "") or "").strip()
         if forwarded_for:
-            first = forwarded_for.split(",", 1)[0].strip()
-            if first:
-                return first
+            parts = [p.strip() for p in forwarded_for.split(",") if p.strip()]
+            has_malformed = False
+            for ip in parts:
+                try:
+                    ipaddress.ip_address(ip)
+                except ValueError:
+                    has_malformed = True
+                    break
+            if has_malformed:
+                return None
+            for ip in reversed(parts):
+                try:
+                    ip_addr = ipaddress.ip_address(ip)
+                except ValueError:
+                    continue
+                is_from_trusted = ip_addr in trusted_proxy_addresses or any(
+                    ip_addr in net for net in trusted_proxy_networks
+                )
+                if not is_from_trusted:
+                    return str(ip_addr)
         real_ip = (get_header("X-Real-IP", "") or "").strip()
         if real_ip:
-            return real_ip
+            try:
+                addr = ipaddress.ip_address(real_ip)
+                return str(addr)
+            except ValueError:
+                return None
         return None
 
     def auth_bucket_id(source_id: str, credential_hint: str | None = None) -> str:
@@ -426,7 +473,9 @@ def create_app() -> FastAPI:
         return api_key_header or None
 
     def extract_http_client_id(request: Request) -> str:
-        forwarded_host = get_forwarded_host(request.headers)
+        forwarded_host = get_forwarded_host(
+            request.client.host if request.client else None, request.headers
+        )
         return auth_identifier_from_host(
             request.client.host if request.client else None,
             forwarded_host,
@@ -550,7 +599,9 @@ def create_app() -> FastAPI:
         return None, None
 
     def extract_websocket_client_id(websocket: WebSocket) -> str:
-        forwarded_host = get_forwarded_host(websocket.headers)
+        forwarded_host = get_forwarded_host(
+            websocket.client.host if websocket.client else None, websocket.headers
+        )
         return auth_identifier_from_host(
             websocket.client.host if websocket.client else None,
             forwarded_host,

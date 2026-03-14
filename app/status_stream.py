@@ -56,8 +56,7 @@ class InMemoryStatusStreamHub:
             await asyncio.wait_for(self._refresh_event.wait(), timeout=timeout_seconds)
         except TimeoutError:
             return False
-        finally:
-            self._refresh_event.clear()
+        self._refresh_event.clear()
         return True
 
     async def publish_snapshot(self, snapshot: dict[str, object]) -> bool:
